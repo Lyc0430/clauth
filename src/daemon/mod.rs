@@ -115,9 +115,25 @@ const FETCH_LOCK_FILE: &str = "usage-fetch.lock";
 /// lease is never freed — pre-existing (the retired probe keyed on the same
 /// main-loop freshness). Do not read this deadline as
 /// covering the fetch path itself.
+///
+/// A SUSPENDED process (Modern Standby/S0ix, S3, a VM pause, SIGSTOP) freezes
+/// the loop but not the wall clock, so a freeze reads as a wedge on wall time
+/// alone; the watchdog therefore charges a poll that overshot its window by
+/// more than [`WATCHDOG_POLL_SLACK`] no running time
+/// ([`watchdog_unaccounted`]) and judges the gap on time the loop actually
+/// had. A legal slow tick (up to this deadline minus `TICK` of budget)
+/// survives a freeze mid-tick, and a loop that wedges before or after the
+/// resume still aborts within the deadline of running time. Ceiling: a box
+/// that cannot run the watchdog thread for one poll plus the slack at a
+/// stretch degrades stall detection with the thread itself.
 const WATCHDOG_DEADLINE: Duration = Duration::from_secs(30);
 /// How often the watchdog re-checks the tick heartbeat.
 const WATCHDOG_POLL: Duration = Duration::from_secs(10);
+/// How far past [`WATCHDOG_POLL`] a poll may run before it reads as
+/// interrupted (a suspend, a wall-clock jump) rather than as scheduling
+/// jitter. Below the slack only the overshoot is unaccounted; at or past it
+/// the whole poll charges no running time.
+const WATCHDOG_POLL_SLACK: Duration = Duration::from_secs(1);
 
 /// One watchdog evaluation: if the main loop last completed a tick more than
 /// `deadline_ms` ago, invoke `on_stall`. Production passes `std::process::abort`;
@@ -127,6 +143,45 @@ fn watchdog_check(last_tick_ms: u64, now_ms: u64, deadline_ms: u64, on_stall: im
     if last_tick_ms != 0 && now_ms.saturating_sub(last_tick_ms) > deadline_ms {
         on_stall();
     }
+}
+
+/// The wall time one poll leaves unaccounted: past [`WATCHDOG_POLL_SLACK`] the
+/// poll was interrupted by a suspend or a wall-clock jump and charges no
+/// running time at all (the loop froze with the clock); a poll near its
+/// window charges the window, its scheduling jitter excluded. Pure so the
+/// accounting is unit-testable.
+fn watchdog_unaccounted(elapsed_ms: u64, poll_ms: u64) -> u64 {
+    if elapsed_ms > poll_ms.saturating_add(WATCHDOG_POLL_SLACK.as_millis() as u64) {
+        elapsed_ms
+    } else {
+        elapsed_ms.saturating_sub(poll_ms)
+    }
+}
+
+/// One watchdog round: fold this poll's unaccounted time into the total and
+/// run the stall check against the running-time clock (`now - unaccounted`).
+/// Returns the updated total. Pure so the absorb-and-check composition is
+/// unit-testable; production passes `std::process::abort` as `on_stall`.
+fn watchdog_step(
+    last_tick_ms: u64,
+    slept_from_ms: u64,
+    now_ms: u64,
+    unaccounted_ms: u64,
+    poll_ms: u64,
+    deadline_ms: u64,
+    on_stall: impl FnOnce(),
+) -> u64 {
+    let unaccounted = unaccounted_ms.saturating_add(watchdog_unaccounted(
+        now_ms.saturating_sub(slept_from_ms),
+        poll_ms,
+    ));
+    watchdog_check(
+        last_tick_ms,
+        now_ms.saturating_sub(unaccounted),
+        deadline_ms,
+        on_stall,
+    );
+    unaccounted
 }
 
 /// Whether the next drain must be skipped this tick: the tick's shared window
@@ -991,11 +1046,24 @@ impl Daemon {
         let spawned = std::thread::Builder::new()
             .name("clauth-daemon-watchdog".into())
             .spawn(move || {
+                let mut unaccounted_ms: u64 = 0;
                 loop {
+                    let slept_from = crate::usage::now_ms();
                     std::thread::sleep(WATCHDOG_POLL);
-                    watchdog_check(
+                    // A suspend/resume freezes this thread with the main loop
+                    // while the wall clock keeps running; watchdog_step
+                    // charges the overshot poll no running time, so the first
+                    // post-resume check judges the pre-freeze heartbeat on
+                    // time the loop actually had. The heartbeat is untouched:
+                    // the main loop re-stamps on its next tick, and a loop
+                    // that wedges before or after the resume still aborts
+                    // within the deadline of running time.
+                    unaccounted_ms = watchdog_step(
                         heartbeat.load(Ordering::Relaxed),
+                        slept_from,
                         crate::usage::now_ms(),
+                        unaccounted_ms,
+                        WATCHDOG_POLL.as_millis() as u64,
                         WATCHDOG_DEADLINE.as_millis() as u64,
                         || {
                             logline!(
