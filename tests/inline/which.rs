@@ -735,7 +735,8 @@ fn json_tier_agrees_with_the_status_json_surface() {
     let resolved = ("kerry".to_string(), Source::RefreshMatch);
 
     let which = json_view(&config, Some(&resolved));
-    let status = crate::daemon::build_status(&config, 60_000, None, false);
+    let status =
+        serde_json::to_value(crate::daemon::build_status(&config, 60_000, None, false)).unwrap();
 
     assert_eq!(which["tier"], "Free", "fixture control: the cached tier");
     assert_eq!(
@@ -774,7 +775,8 @@ fn json_base_url_carries_a_third_partys_endpoint() {
     let resolved = ("deepseek".to_string(), Source::CredentialLessActive);
 
     let value = json_view(&config, Some(&resolved));
-    let status = crate::daemon::build_status(&config, 60_000, None, false);
+    let status =
+        serde_json::to_value(crate::daemon::build_status(&config, 60_000, None, false)).unwrap();
 
     assert_eq!(value["base_url"], "https://api.deepseek.com/anthropic");
     assert!(

@@ -8,7 +8,6 @@
 use super::*;
 use crate::lockorder::RankedMutex;
 use crate::profile::{AppState, ClaudeCredentials, OAuthToken, Profile, profile_dir};
-use crate::runtime::open_pid_file;
 use crate::usage::is_idle;
 
 /// Read an ENTIRE HTTP request (headers + any `Content-Length` body) off a
@@ -95,20 +94,6 @@ fn single_profile_config(name: &str, refresh_token: &str) -> AppConfig {
 
 use crate::testutil::HomeSandbox;
 
-/// Simulate a live `clauth start` session for `name`: a locked marker in its
-/// sessions dir reads as alive via `has_live_session`. The caller must hold the
-/// returned file for as long as the session should read as live — dropping it
-/// releases the flock.
-fn arm_live_session(name: &str) -> std::fs::File {
-    let sessions = profile_dir(&crate::profile::ProfileName::from(name))
-        .expect("profile_dir")
-        .join("sessions");
-    std::fs::create_dir_all(&sessions).expect("create sessions dir");
-    let file = open_pid_file(&sessions.join("test-pid")).expect("open pid file");
-    file.lock().expect("lock pid file");
-    file
-}
-
 #[test]
 fn no_live_session_included_with_force_false() {
     let config = single_profile_config("test-oauth-no-session-force-false", "rt-abc");
@@ -128,9 +113,9 @@ fn no_live_session_included_with_force_true() {
 
 #[test]
 fn live_session_included_when_force_false() {
-    let _home = HomeSandbox::new();
+    let home = HomeSandbox::new();
     let name = "test-oauth-live-session-guard";
-    let file = arm_live_session(name);
+    let file = crate::testutil::arm_live_session(home.home(), name);
 
     let config = single_profile_config(name, "rt-ghi");
     let candidates = rotation_candidates(&config, false);
@@ -149,9 +134,9 @@ fn live_session_included_when_force_false() {
 
 #[test]
 fn live_session_included_with_force_true() {
-    let _home = HomeSandbox::new();
+    let home = HomeSandbox::new();
     let name = "test-oauth-live-session-force";
-    let file = arm_live_session(name);
+    let file = crate::testutil::arm_live_session(home.home(), name);
 
     let config = single_profile_config(name, "rt-jkl");
     let candidates = rotation_candidates(&config, true);
@@ -522,9 +507,9 @@ fn gate_valid_token_ready_without_refresh() {
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn gate_refreshes_an_expiring_token_under_a_live_session() {
-    let _home = HomeSandbox::new();
+    let home = HomeSandbox::new();
     let name = "test-gate-live-session";
-    let file = arm_live_session(name);
+    let file = crate::testutil::arm_live_session(home.home(), name);
     let handle = Arc::new(RankedMutex::new(oauth_config(
         name,
         Some("rt-old"),
@@ -562,9 +547,9 @@ fn gate_refreshes_an_expiring_token_under_a_live_session() {
 #[cfg(target_os = "macos")]
 #[test]
 fn gate_installs_as_is_under_a_live_session_on_macos() {
-    let _home = HomeSandbox::new();
+    let home = HomeSandbox::new();
     let name = "test-gate-live-session-macos";
-    let file = arm_live_session(name);
+    let file = crate::testutil::arm_live_session(home.home(), name);
     let handle = Arc::new(RankedMutex::new(oauth_config(
         name,
         Some("rt-old"),
@@ -2796,8 +2781,11 @@ fn gate_refuses_a_mint_inside_ccs_refresh_window() {
 // HTTP call, so nothing that stops short of answering that call can see it.
 
 /// A live-session profile whose stored pair the leg would spend.
-fn live_rotate_fixture(name: &str) -> (crate::profile::ConfigHandle, std::fs::File) {
-    let pid = arm_live_session(name);
+fn live_rotate_fixture(
+    home: &std::path::Path,
+    name: &str,
+) -> (crate::profile::ConfigHandle, std::fs::File) {
+    let pid = crate::testutil::arm_live_session(home, name);
     (
         crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name)),
         pid,
@@ -2819,7 +2807,7 @@ fn rotate_one_inner_rotates_under_a_live_session() {
         )
     });
     let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
-    let (config, pid) = live_rotate_fixture(name);
+    let (config, pid) = live_rotate_fixture(home.home(), name);
     let activity: ActivityStore = Arc::new(RankedMutex::new(std::collections::HashMap::new()));
     let (tx, rx) = mpsc::channel();
 
@@ -2862,7 +2850,7 @@ fn rotate_one_inner_does_not_rotate_under_a_live_session_on_macos() {
         )
     });
     let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
-    let (config, pid) = live_rotate_fixture(name);
+    let (config, pid) = live_rotate_fixture(home.home(), name);
     let activity: ActivityStore = Arc::new(RankedMutex::new(std::collections::HashMap::new()));
     let (tx, rx) = mpsc::channel();
 

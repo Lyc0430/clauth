@@ -658,8 +658,8 @@ fn status_feed_json(
     // ordering: a non-daemon publish carries a daemon's OLD stamp over entries
     // built now, which is the point — stamp freshness must keep meaning
     // "a daemon wrote this", never "some process did".
-    if let (Some(field), Some(stamp)) = (body.get_mut("generated_at"), generated_at) {
-        *field = serde_json::json!(stamp);
+    if let Some(stamp) = generated_at {
+        body.generated_at = stamp.to_string();
     }
     match serde_json::to_vec_pretty(&body) {
         Ok(json) => Some(json),

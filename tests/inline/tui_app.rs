@@ -1224,23 +1224,6 @@ fn pure_oauth_logout_clears_the_credentials() {
     assert_eq!(p.base_url, None, "no endpoint appears out of a log out");
 }
 
-/// Simulate a live `clauth start` session for `name`: a locked pid file in its
-/// sessions dir reads as alive via `has_live_session` (mirrors the fixture in
-/// `tests/inline/actions.rs::delete_refuses_live_session_unless_forced`). The
-/// caller must keep the returned file alive for as long as the session should
-/// read as live — dropping it releases the flock.
-fn arm_live_session(home: &std::path::Path, name: &str) -> std::fs::File {
-    let sessions = home
-        .join(".clauth")
-        .join("profiles")
-        .join(name)
-        .join("sessions");
-    std::fs::create_dir_all(&sessions).expect("mkdir sessions");
-    let pid = crate::runtime::open_pid_file(&sessions.join("99999")).expect("open pid");
-    pid.lock().expect("lock pid");
-    pid
-}
-
 /// A live-session delete must not dead-end on the guard's refusal toast: it
 /// arms a confirm modal instead, leaving the profile untouched until confirmed.
 #[test]
@@ -1250,7 +1233,7 @@ fn perform_delete_with_live_session_arms_a_confirm_modal() {
     let home = crate::testutil::HomeSandbox::new();
 
     let mut app = app_with(vec![Profile::new("busy".to_string(), None, None)]);
-    let _pid_guard = arm_live_session(home.home(), "busy");
+    let _pid_guard = crate::testutil::arm_live_session(home.home(), "busy");
 
     perform_delete(&mut app, &crate::profile::ProfileName::from("busy"));
     assert!(
@@ -1439,7 +1422,7 @@ fn disabled_row_toggle_is_inert_with_a_live_session() {
     let home = crate::testutil::HomeSandbox::new();
 
     let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
-    let _pid_guard = arm_live_session(home.home(), "acct");
+    let _pid_guard = crate::testutil::arm_live_session(home.home(), "acct");
     app.profile_cursor = 0;
     app.config_draft = Some(build_draft_existing(
         &app,
@@ -2709,7 +2692,7 @@ fn rotate_tokens_with_live_session_arms_the_rotate_confirm() {
 
     let mut app = app_with(vec![Profile::new("busy".to_string(), None, None)]);
     app.profile_cursor = 0;
-    let _pid_guard = arm_live_session(home.home(), "busy");
+    let _pid_guard = crate::testutil::arm_live_session(home.home(), "busy");
 
     dispatch_action_menu_action(&mut app, ActionMenuAction::RotateTokens);
     let confirm = app
@@ -2741,7 +2724,7 @@ fn rotate_tokens_with_live_session_arms_an_acknowledge_notice_on_macos() {
 
     let mut app = app_with(vec![Profile::new("busy".to_string(), None, None)]);
     app.profile_cursor = 0;
-    let _pid_guard = arm_live_session(home.home(), "busy");
+    let _pid_guard = crate::testutil::arm_live_session(home.home(), "busy");
 
     dispatch_action_menu_action(&mut app, ActionMenuAction::RotateTokens);
     let confirm = app
@@ -2783,7 +2766,7 @@ fn confirming_a_rotate_under_a_live_session_is_refused_on_macos() {
 
     let mut app = app_with(vec![Profile::new("busy".to_string(), None, None)]);
     app.profile_cursor = 0;
-    let _pid_guard = arm_live_session(home.home(), "busy");
+    let _pid_guard = crate::testutil::arm_live_session(home.home(), "busy");
 
     run_confirm_action(&mut app, ConfirmAction::RotateOne("busy".to_string()));
     join_test_workers();
@@ -2834,7 +2817,7 @@ fn confirming_a_rotate_under_a_live_session_reaches_the_rotate() {
 
     let mut app = app_with(vec![Profile::new("busy".to_string(), None, None)]);
     app.profile_cursor = 0;
-    let _pid_guard = arm_live_session(home.home(), "busy");
+    let _pid_guard = crate::testutil::arm_live_session(home.home(), "busy");
 
     run_confirm_action(&mut app, ConfirmAction::RotateOne("busy".to_string()));
     // Before any assertion, and above all before `home` drops.

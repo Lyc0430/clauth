@@ -102,17 +102,27 @@ fn iso_from_ms(ms: u64) -> String {
     epoch_secs_to_iso((ms / 1000) as i64)
 }
 
-/// The `fallback` object for a profile, or `None` when it is not a chain member.
-/// `armed` = in the chain AND currently active (the account auto-switch would
-/// rotate away from). `position` is 1-based.
-fn fallback_json(config: &AppConfig, p: &Profile) -> Option<serde_json::Value> {
+/// The `fallback` object for a profile: chain membership (`position` is
+/// 1-based), the utilization threshold auto-switch rotates away at, and whether
+/// this member is currently armed (`armed` = in the chain AND active). Field
+/// order is the published key order.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct Fallback {
+    pub(crate) position: usize,
+    pub(crate) threshold: f64,
+    pub(crate) armed: bool,
+}
+
+/// The chain-membership object for a profile, or `None` when it is not a chain
+/// member.
+fn fallback(config: &AppConfig, p: &Profile) -> Option<Fallback> {
     let name = &p.name;
     let pos = config.state.fallback_chain.iter().position(|n| n == name)?;
-    Some(serde_json::json!({
-        "position": pos + 1,
-        "threshold": crate::fallback::threshold_for(p),
-        "armed": config.is_active(name),
-    }))
+    Some(Fallback {
+        position: pos + 1,
+        threshold: crate::fallback::threshold_for(p),
+        armed: config.is_active(name),
+    })
 }
 
 /// Per-profile auth health for `status.json`. `broken` (last refresh rejected
@@ -147,6 +157,13 @@ fn auth_status_str(config: &AppConfig, p: &Profile, now_ms: i64) -> &'static str
 pub(crate) struct QueueEntry {
     pub(crate) position: usize,
     pub(crate) next_open_at: Option<String>,
+}
+
+/// The third-party availability object (`available`), for api-key accounts
+/// whose figures live in `third_party_cache.json`; `None` for OAuth accounts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ThirdPartyAvailability {
+    pub(crate) available: bool,
 }
 
 /// One `profiles[]` entry of the published `status.json` body — the shape both
@@ -207,14 +224,14 @@ pub(crate) struct ProfileEntry {
     pub(crate) bell_threshold: Option<f64>,
     /// The chain-membership object (`position` / `threshold` / `armed`), `None`
     /// when not a chain member.
-    pub(crate) fallback: Option<serde_json::Value>,
+    pub(crate) fallback: Option<Fallback>,
     /// The 5h/7d usage rows: an OAuth account's own windows, or an api-key
     /// account's provider-derived ones. Empty when the cache behind them
     /// holds none.
     pub(crate) windows: Vec<Window>,
     /// The third-party availability object (`available`), `None` for OAuth
     /// accounts.
-    pub(crate) third_party: Option<serde_json::Value>,
+    pub(crate) third_party: Option<ThirdPartyAvailability>,
 }
 
 /// The per-profile entries [`build_status`] publishes — typed, so a reader
@@ -463,8 +480,11 @@ pub(crate) fn build_profile_entries(
             // endpoint while `fetched_at` beside it dated that account's provider
             // cache: one object, two answers about the same file.
             let third_party = if p.usage_cache_is_third_party() {
-                load_profile_cache::<ThirdPartyStats>(name, THIRD_PARTY_CACHE_FILE)
-                    .map(|s| serde_json::json!({ "available": s.is_available }))
+                load_profile_cache::<ThirdPartyStats>(name, THIRD_PARTY_CACHE_FILE).map(|s| {
+                    ThirdPartyAvailability {
+                        available: s.is_available,
+                    }
+                })
             } else {
                 None
             };
@@ -494,12 +514,25 @@ pub(crate) fn build_profile_entries(
                         next_open_at: next_queue_open.map(iso_from_ms),
                     }),
                 bell_threshold: p.bell_threshold,
-                fallback: fallback_json(config, p),
+                fallback: fallback(config, p),
                 windows: published_windows(name),
                 third_party,
             }
         })
         .collect()
+}
+
+/// The full `status.json` body. Field order is the published key order, and
+/// each `Option` field emits a present key holding `null` when absent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct StatusBody {
+    pub(crate) schema: u64,
+    pub(crate) generated_at: String,
+    pub(crate) active_profile: Option<String>,
+    pub(crate) pending_switch: Option<String>,
+    pub(crate) wrap_off: bool,
+    pub(crate) refresh_interval_ms: u64,
+    pub(crate) profiles: Vec<ProfileEntry>,
 }
 
 /// Build the full `status.json` body. `interval_ms` is the live refresh interval
@@ -510,21 +543,21 @@ pub(crate) fn build_status(
     interval_ms: u64,
     live: Option<&LiveSignals>,
     include_disabled: bool,
-) -> serde_json::Value {
+) -> StatusBody {
     let profiles = build_profile_entries(config, interval_ms, live, include_disabled);
     // Stamped after the entries build (each entry reads its own clock) so
     // `generated_at` never precedes the instant a per-entry verdict was judged at.
     let now = now_ms();
 
-    serde_json::json!({
-        "schema": SCHEMA_VERSION,
-        "generated_at": iso_from_ms(now),
-        "active_profile": config.state.active_profile.as_deref(),
-        "pending_switch": live.and_then(|s| s.pending_switch),
-        "wrap_off": config.state.switch_off_when_spent,
-        "refresh_interval_ms": interval_ms,
-        "profiles": profiles,
-    })
+    StatusBody {
+        schema: SCHEMA_VERSION,
+        generated_at: iso_from_ms(now),
+        active_profile: config.state.active_profile.as_deref().map(str::to_string),
+        pending_switch: live.and_then(|s| s.pending_switch).map(str::to_string),
+        wrap_off: config.state.switch_off_when_spent,
+        refresh_interval_ms: interval_ms,
+        profiles,
+    }
 }
 
 #[cfg(test)]

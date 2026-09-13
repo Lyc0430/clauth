@@ -894,6 +894,24 @@ pub(crate) fn write_usage_history(
     std::fs::write(&path, body).expect("write history");
 }
 
+/// Simulate a live `clauth start` session for `name`: a locked pid file in the
+/// profile's sessions dir under `home` reads as alive via
+/// `runtime::has_live_session`. The caller must keep the returned file alive for
+/// as long as the session should read as live — dropping it releases the flock.
+/// The explicit `home` pins the marker inside the caller's [`HomeSandbox`], the
+/// same tree `profile_dir` resolves under that sandbox.
+pub(crate) fn arm_live_session(home: &Path, name: &str) -> std::fs::File {
+    let sessions = home
+        .join(".clauth")
+        .join("profiles")
+        .join(name)
+        .join("sessions");
+    std::fs::create_dir_all(&sessions).expect("mkdir sessions");
+    let pid = crate::runtime::open_pid_file(&sessions.join("test-pid")).expect("open pid");
+    pid.lock().expect("lock pid");
+    pid
+}
+
 /// Put `names` in the on-disk profile list without creating profile content.
 /// For fixtures that drive legs which re-read the record — the cache-write
 /// gate, the acquire gate — but do not need per-profile files. Idempotent.

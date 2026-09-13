@@ -4,9 +4,26 @@
 //! These exercise the single-shot path (`live = None`, freshness/next-refresh
 //! from cache mtime) against a `HomeSandbox` so no real `~/.clauth` is touched.
 
+use std::collections::HashMap;
+
 use super::*;
-use crate::profile::{AppConfig, AppState, ClaudeCredentials, OAuthToken, Profile, save_profile};
+use crate::profile::{
+    AppConfig, AppState, ClaudeCredentials, OAuthToken, Profile, ProfileName, save_profile,
+};
+use crate::profile_json::Window;
 use crate::testutil::HomeSandbox;
+use crate::usage::{FetchLeg, FetchStatus};
+
+/// The typed body as a `Value`, for the tests that assert published values;
+/// key order and byte shape are pinned by the `*_bytes` tests.
+fn status_value(
+    config: &AppConfig,
+    interval_ms: u64,
+    live: Option<&LiveSignals>,
+    include_disabled: bool,
+) -> serde_json::Value {
+    serde_json::to_value(build_status(config, interval_ms, live, include_disabled)).unwrap()
+}
 
 fn oauth_profile(name: &str) -> Profile {
     let mut p = Profile::new(name.to_string(), None, None);
@@ -33,7 +50,7 @@ fn build_status_top_level_shape_and_active() {
     config.state.active_profile = Some("work".into());
     config.state.refresh_interval_ms = 300_000;
 
-    let v = build_status(&config, config.state.refresh_interval_ms, None, false);
+    let v = status_value(&config, config.state.refresh_interval_ms, None, false);
 
     assert_eq!(v["schema"], SCHEMA_VERSION);
     assert_eq!(v["active_profile"], "work");
@@ -122,7 +139,7 @@ fn build_status_fallback_membership_and_armed() {
     config.state.active_profile = Some("a".into());
     config.state.fallback_chain = vec!["a".into(), "b".into()];
 
-    let v = build_status(&config, 300_000, None, false);
+    let v = status_value(&config, 300_000, None, false);
     let profiles = v["profiles"].as_array().unwrap();
 
     let a = profiles.iter().find(|p| p["name"] == "a").unwrap();
@@ -150,7 +167,7 @@ fn build_status_hides_disabled_by_default_and_shows_with_include_disabled() {
         profiles: vec![oauth_profile("on"), off],
     };
 
-    let hidden = build_status(&config, 300_000, None, false);
+    let hidden = status_value(&config, 300_000, None, false);
     let hidden_names: Vec<&str> = hidden["profiles"]
         .as_array()
         .unwrap()
@@ -163,7 +180,7 @@ fn build_status_hides_disabled_by_default_and_shows_with_include_disabled() {
         "a disabled account must not appear in the default feed"
     );
 
-    let shown = build_status(&config, 300_000, None, true);
+    let shown = status_value(&config, 300_000, None, true);
     let mut shown_names: Vec<&str> = shown["profiles"]
         .as_array()
         .unwrap()
@@ -193,7 +210,7 @@ fn build_status_keeps_a_disabled_active_visible_so_active_profile_never_dangles(
     };
     config.state.active_profile = Some("active-off".into());
 
-    let v = build_status(&config, 300_000, None, false);
+    let v = status_value(&config, 300_000, None, false);
     let names: Vec<&str> = v["profiles"]
         .as_array()
         .unwrap()
@@ -241,7 +258,7 @@ fn build_status_auth_status_ok_expired_broken() {
     };
     config.set_auth_broken(&crate::profile::ProfileName::from("broken"), true);
 
-    let v = build_status(&config, 300_000, None, false);
+    let v = status_value(&config, 300_000, None, false);
     let profiles = v["profiles"].as_array().unwrap();
     let get = |n: &str| profiles.iter().find(|p| p["name"] == n).unwrap();
     assert_eq!(get("ok")["auth_status"], "ok");
@@ -276,7 +293,7 @@ fn build_status_auth_status_types_the_hybrid_on_its_credential() {
         profiles: vec![hybrid, api_key_only],
     };
 
-    let v = build_status(&config, 300_000, None, false);
+    let v = status_value(&config, 300_000, None, false);
     let profiles = v["profiles"].as_array().unwrap();
     let get = |n: &str| profiles.iter().find(|p| p["name"] == n).unwrap();
     assert_eq!(
@@ -303,7 +320,7 @@ fn build_status_pending_switch_reflects_live_signal() {
     let empty_streaks = std::collections::HashMap::new();
 
     // single-shot (no daemon) → pending_switch is present-but-null.
-    let none = build_status(&config, 300_000, None, false);
+    let none = status_value(&config, 300_000, None, false);
     assert!(
         none.get("pending_switch").is_some(),
         "pending_switch key is always present"
@@ -319,7 +336,7 @@ fn build_status_pending_switch_reflects_live_signal() {
         queue_anchor: None,
         queue_blocked: &[],
     };
-    let v = build_status(&config, 300_000, Some(&live), false);
+    let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(v["pending_switch"], "home");
     assert_eq!(
         v["schema"], SCHEMA_VERSION,
@@ -372,7 +389,7 @@ fn build_status_auto_start_queue_positions_and_null_cases() {
             .clone()
     };
 
-    let v = build_status(&config, 300_000, Some(&live), false);
+    let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(queue_of(&v, "a")["position"], 1);
     assert_eq!(queue_of(&v, "b")["position"], 2);
     // Round-trip rather than a formatted literal, so the pin is on the
@@ -399,13 +416,13 @@ fn build_status_auto_start_queue_positions_and_null_cases() {
         queue_anchor: None,
         ..live
     };
-    let v = build_status(&config, 300_000, Some(&cold), false);
+    let v = status_value(&config, 300_000, Some(&cold), false);
     assert_eq!(queue_of(&v, "a")["position"], 1);
     assert!(queue_of(&v, "a")["next_open_at"].is_null());
 
     // Null case 3: the toggle off is a real off switch on the feed too.
     config.state.auto_start_queue = false;
-    let v = build_status(&config, 300_000, Some(&live), false);
+    let v = status_value(&config, 300_000, Some(&live), false);
     for name in ["a", "b", "c"] {
         assert!(queue_of(&v, name).is_null());
     }
@@ -445,7 +462,7 @@ fn build_status_third_party_freshness_from_its_own_cache() {
     );
 
     // Single-shot: freshness from the third-party cache mtime (just written).
-    let v = build_status(&config, 300_000, None, false);
+    let v = status_value(&config, 300_000, None, false);
     let p = &v["profiles"].as_array().unwrap()[0];
     assert_eq!(p["fetch_status"], "Fresh");
     assert!(!p["fetched_at"].is_null());
@@ -466,7 +483,7 @@ fn build_status_third_party_freshness_from_its_own_cache() {
         queue_anchor: None,
         queue_blocked: &[],
     };
-    let v = build_status(&config, 300_000, Some(&live), false);
+    let v = status_value(&config, 300_000, Some(&live), false);
     let p = &v["profiles"].as_array().unwrap()[0];
     assert_eq!(
         p["fetch_status"], "Fresh",
@@ -505,7 +522,7 @@ fn build_status_nulls_next_refresh_for_a_spent_skipped_account() {
     );
 
     // Toggle OFF → skipped-spent → next_refresh_at nulled.
-    let off = build_status(&config(false), 300_000, None, false);
+    let off = status_value(&config(false), 300_000, None, false);
     let p = &off["profiles"].as_array().unwrap()[0];
     assert!(
         p["next_refresh_at"].is_null(),
@@ -513,7 +530,7 @@ fn build_status_nulls_next_refresh_for_a_spent_skipped_account() {
     );
 
     // Toggle ON (default) → still polled → derived countdown present.
-    let on = build_status(&config(true), 300_000, None, false);
+    let on = status_value(&config(true), 300_000, None, false);
     let p = &on["profiles"].as_array().unwrap()[0];
     assert!(
         !p["next_refresh_at"].is_null(),
@@ -557,7 +574,7 @@ fn build_status_nulls_a_past_derived_next_refresh() {
         std::time::SystemTime::now() - std::time::Duration::from_millis(2 * interval_ms),
     );
 
-    let v = build_status(&config, interval_ms, None, false);
+    let v = status_value(&config, interval_ms, None, false);
     let p = &v["profiles"].as_array().unwrap()[0];
     assert!(
         p["next_refresh_at"].is_null(),
@@ -604,7 +621,7 @@ fn build_status_does_not_re_age_a_plan_only_rewrite() {
     let age_ms = 4 * interval_ms;
     body(Some(crate::usage::now_ms() - age_ms));
 
-    let v = build_status(&config, interval_ms, None, false);
+    let v = status_value(&config, interval_ms, None, false);
     let row = &v["profiles"].as_array().unwrap()[0];
     assert_eq!(
         row["fetch_status"], "Cached",
@@ -631,7 +648,7 @@ fn build_status_does_not_re_age_a_plan_only_rewrite() {
     // Control: same file, stamp moved to now — a real fetch. Fresh, countdown
     // armed: the derivation still reads a live fetch correctly.
     body(Some(crate::usage::now_ms()));
-    let v = build_status(&config, interval_ms, None, false);
+    let v = status_value(&config, interval_ms, None, false);
     let row = &v["profiles"].as_array().unwrap()[0];
     assert_eq!(
         row["fetch_status"], "Fresh",
@@ -654,7 +671,7 @@ fn build_status_does_not_re_age_a_plan_only_rewrite() {
         &path,
         std::time::SystemTime::now() - std::time::Duration::from_millis(2 * interval_ms),
     );
-    let v = build_status(&config, interval_ms, None, false);
+    let v = status_value(&config, interval_ms, None, false);
     assert_eq!(
         v["profiles"].as_array().unwrap()[0]["fetch_status"],
         "Cached",
@@ -720,7 +737,7 @@ fn build_status_keeps_a_generic_api_key_countdown_over_a_maxed_oauth_cache() {
     );
 
     // Single-shot: derived off the third-party cache's mtime, not suppressed.
-    let single = build_status(&config, 300_000, None, false);
+    let single = status_value(&config, 300_000, None, false);
     let p = &single["profiles"].as_array().unwrap()[0];
     assert!(
         !p["next_refresh_at"].is_null(),
@@ -747,7 +764,7 @@ fn build_status_keeps_a_generic_api_key_countdown_over_a_maxed_oauth_cache() {
         queue_anchor: None,
         queue_blocked: &[],
     };
-    let v = build_status(&config, 300_000, Some(&live), false);
+    let v = status_value(&config, 300_000, Some(&live), false);
     let p = &v["profiles"].as_array().unwrap()[0];
     assert_eq!(
         p["next_refresh_at"], "2100-01-01T00:00:00+00:00",
@@ -785,7 +802,7 @@ fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
     };
 
     // single-shot (no daemon / no streaks) → stale is present-and-false.
-    let none = build_status(&config, 300_000, None, false);
+    let none = status_value(&config, 300_000, None, false);
     assert_eq!(
         none["schema"], SCHEMA_VERSION,
         "stale is additive — no bump of its own"
@@ -815,7 +832,7 @@ fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
         queue_anchor: None,
         queue_blocked: &[],
     };
-    let v = build_status(&config, 300_000, Some(&live), false);
+    let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(
         stale_of("work", &v),
         true,
@@ -840,7 +857,7 @@ fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
         queue_anchor: None,
         queue_blocked: &[],
     };
-    let v = build_status(&config, 300_000, Some(&live), false);
+    let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(
         stale_of("work", &v),
         false,
@@ -891,14 +908,14 @@ fn build_status_stale_flags_an_overdue_cache_on_the_single_shot_path() {
     };
     // Fresh and at-threshold → not stale; past it → stale on the single-shot.
     write(42.0, threshold_secs - 60);
-    let v = build_status(&config, 90_000, None, false);
+    let v = status_value(&config, 90_000, None, false);
     assert_eq!(
         stale_of("work", &v),
         false,
         "a cache younger than the threshold is not stale"
     );
     write(42.0, threshold_secs + 60);
-    let v = build_status(&config, 90_000, None, false);
+    let v = status_value(&config, 90_000, None, false);
     assert_eq!(
         stale_of("work", &v),
         true,
@@ -929,7 +946,7 @@ fn build_status_stale_flags_an_overdue_cache_on_the_single_shot_path() {
                 ..Default::default()
             },
         );
-        let v = build_status(&config, 90_000, None, false);
+        let v = status_value(&config, 90_000, None, false);
         let row = v["profiles"].as_array().unwrap()[0].clone();
         assert_eq!(row["stale"], true, "{case}: an undatable body reads stale");
         assert_eq!(
@@ -960,7 +977,7 @@ fn build_status_stale_flags_an_overdue_cache_on_the_single_shot_path() {
             ..Default::default()
         },
     );
-    let v = build_status(&config, 90_000, None, false);
+    let v = status_value(&config, 90_000, None, false);
     let row = v["profiles"].as_array().unwrap()[0].clone();
     assert_eq!(
         row["windows"].as_array().map(Vec::len),
@@ -977,7 +994,7 @@ fn build_status_stale_flags_an_overdue_cache_on_the_single_shot_path() {
     // age arm: its figure cannot change by polling, so age distrusts nothing.
     config.state.refresh_spent_accounts = false;
     write(100.0, threshold_secs + 60);
-    let v = build_status(&config, 90_000, None, false);
+    let v = status_value(&config, 90_000, None, false);
     assert_eq!(
         stale_of("work", &v),
         false,
@@ -990,7 +1007,7 @@ fn build_status_stale_flags_an_overdue_cache_on_the_single_shot_path() {
     // too — the source derives the exemption only under
     // `!refresh_spent_accounts && windows_maxed`.
     write(42.0, threshold_secs + 60);
-    let v = build_status(&config, 90_000, None, false);
+    let v = status_value(&config, 90_000, None, false);
     assert_eq!(
         stale_of("work", &v),
         true,
@@ -998,7 +1015,7 @@ fn build_status_stale_flags_an_overdue_cache_on_the_single_shot_path() {
     );
     config.state.refresh_spent_accounts = true;
     write(100.0, threshold_secs + 60);
-    let v = build_status(&config, 90_000, None, false);
+    let v = status_value(&config, 90_000, None, false);
     assert_eq!(
         stale_of("work", &v),
         true,
@@ -1022,7 +1039,7 @@ fn build_status_stale_flags_an_overdue_cache_on_the_single_shot_path() {
         queue_anchor: None,
         queue_blocked: &[],
     };
-    let v = build_status(&config, 90_000, Some(&live), false);
+    let v = status_value(&config, 90_000, Some(&live), false);
     assert_eq!(
         stale_of("work", &v),
         true,
@@ -1065,7 +1082,7 @@ fn build_status_publishes_the_third_party_legs_own_status() {
         queue_anchor: None,
         queue_blocked: &[],
     };
-    let v = build_status(&config, 300_000, Some(&live), false);
+    let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(
         v["profiles"][0]["fetch_status"], "AuthExpired",
         "a dead console session must not read as never-fetched",
@@ -1086,7 +1103,7 @@ fn build_status_publishes_the_third_party_legs_own_status() {
         queue_anchor: None,
         queue_blocked: &[],
     };
-    let v = build_status(&config, 300_000, Some(&live), false);
+    let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(v["profiles"][0]["fetch_status"], "RateLimited");
 }
 
@@ -1115,7 +1132,7 @@ fn build_status_prefers_the_oauth_leg_when_both_stores_carry_a_name() {
         queue_anchor: None,
         queue_blocked: &[],
     };
-    let v = build_status(&config, 300_000, Some(&live), false);
+    let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(v["profiles"][0]["fetch_status"], "Fresh");
 }
 
@@ -1164,7 +1181,7 @@ fn build_status_reports_a_recorded_dead_credential_without_a_daemon() {
         },
     );
     let dead = config_of(profile("dead-token"));
-    let v = build_status(&dead, 300_000, None, false);
+    let v = status_value(&dead, 300_000, None, false);
     assert_eq!(
         v["profiles"][0]["fetch_status"], "Fresh",
         "precondition: the mtime derivation alone calls a warm cache Fresh",
@@ -1175,7 +1192,7 @@ fn build_status_reports_a_recorded_dead_credential_without_a_daemon() {
         .expect("a console-credentialed profile has a fingerprint");
     crate::profile_cache::write_auth_expired(&crate::profile::ProfileName::from("qwen"), fp);
 
-    let v = build_status(&dead, 300_000, None, false);
+    let v = status_value(&dead, 300_000, None, false);
     assert_eq!(
         v["profiles"][0]["fetch_status"], "AuthExpired",
         "no daemon, warm cache, dead session — must not read as a live measurement",
@@ -1184,7 +1201,7 @@ fn build_status_reports_a_recorded_dead_credential_without_a_daemon() {
     // A re-login changes the credential, so the record stops applying on its
     // own. THIS is what makes persisting it safe.
     let relogged = config_of(profile("fresh-token"));
-    let v = build_status(&relogged, 300_000, None, false);
+    let v = status_value(&relogged, 300_000, None, false);
     assert_eq!(
         v["profiles"][0]["fetch_status"], "Fresh",
         "a record for a credential the profile no longer holds is inert",
@@ -1205,7 +1222,7 @@ fn build_status_leaves_a_never_fetched_profile_unknown() {
         },
         profiles: vec![p],
     };
-    let v = build_status(&config, 300_000, None, false);
+    let v = status_value(&config, 300_000, None, false);
     assert!(
         v["profiles"][0]["fetch_status"].is_null(),
         "no cache and no verdict is unknown, not a status",
@@ -1253,7 +1270,7 @@ fn build_status_rolling_token_is_the_sidecar_content_not_the_config_flag() {
         .unwrap(),
     )
     .unwrap();
-    let v = build_status(&config_with_flag(true), 300_000, None, false);
+    let v = status_value(&config_with_flag(true), 300_000, None, false);
     assert_eq!(
         v["profiles"][0]["rolling_token"], false,
         "a degraded profile must publish the mint it is actually on"
@@ -1269,7 +1286,7 @@ fn build_status_rolling_token_is_the_sidecar_content_not_the_config_flag() {
         .unwrap(),
     )
     .unwrap();
-    let v = build_status(&config_with_flag(false), 300_000, None, false);
+    let v = status_value(&config_with_flag(false), 300_000, None, false);
     assert_eq!(
         v["profiles"][0]["rolling_token"], true,
         "what sessions actually hold outranks the flag in both directions"
@@ -1313,7 +1330,7 @@ fn build_status_rolling_token_is_false_for_a_misfill() {
         serde_json::to_vec_pretty(&misfill).unwrap(),
     )
     .unwrap();
-    let v = build_status(&config, 300_000, None, false);
+    let v = status_value(&config, 300_000, None, false);
     assert_eq!(
         v["profiles"][0]["rolling_token"], false,
         "a mis-fill is the state the split exists to detect, not a rolling token"
@@ -1345,7 +1362,7 @@ fn published_entries_deserialize_into_the_typed_contract() {
         },
     );
 
-    let v = build_status(&config, 300_000, None, false);
+    let v = status_value(&config, 300_000, None, false);
     let entries: Vec<ProfileEntry> = serde_json::from_value(v["profiles"].clone()).unwrap();
     assert_eq!(entries.len(), 1);
     let entry = &entries[0];
@@ -1423,7 +1440,7 @@ fn build_status_auto_start_queue_drops_switch_grade_kick_blocked_members() {
         queue_anchor: Some(anchor),
         queue_blocked: &blocked,
     };
-    let v = build_status(&config, 300_000, Some(&live), false);
+    let v = status_value(&config, 300_000, Some(&live), false);
     assert!(
         queue_of(&v, "b").is_null(),
         "a kick-blocked member holds no published slot, as it holds none in the election"
@@ -1471,7 +1488,7 @@ fn build_status_auto_start_queue_drops_switch_grade_kick_blocked_members() {
             next_retry: far_ahead,
         },
     );
-    let v = build_status(&config, 300_000, None, false);
+    let v = status_value(&config, 300_000, None, false);
     assert!(
         queue_of(&v, "b").is_null(),
         "`status --json` reads the same block off `kick_block.json`"
@@ -1482,4 +1499,700 @@ fn build_status_auto_start_queue_drops_switch_grade_kick_blocked_members() {
         2,
         "a burst 429 is not switch-grade and never costs a queue slot"
     );
+}
+
+/// Byte-parity pin for the `fallback` object: key order, `None` → `null`,
+/// `Some` → the object, and a threshold with more significant digits than `f32`
+/// carries so a narrowing of the field changes the bytes.
+#[test]
+fn fallback_object_matches_legacy_json_bytes() {
+    let typed = Some(Fallback {
+        position: 1,
+        threshold: 92.345678901,
+        armed: true,
+    });
+    assert_eq!(
+        serde_json::to_string(&typed).unwrap(),
+        r#"{"position":1,"threshold":92.345678901,"armed":true}"#,
+    );
+
+    let none: Option<Fallback> = None;
+    assert_eq!(serde_json::to_string(&none).unwrap(), "null");
+}
+
+/// Byte-parity pin for the third-party availability object, `Some` and `None`.
+#[test]
+fn third_party_availability_matches_legacy_json_bytes() {
+    let typed = Some(ThirdPartyAvailability { available: true });
+    let legacy = serde_json::json!({"available": true});
+    assert_eq!(
+        serde_json::to_string(&typed).unwrap(),
+        serde_json::to_string(&legacy).unwrap(),
+    );
+
+    let none: Option<ThirdPartyAvailability> = None;
+    assert_eq!(serde_json::to_string(&none).unwrap(), "null");
+}
+
+/// Byte-parity pin for the full body including `profiles[]`: field order equals
+/// the published key order, `Option` fields emit a present `null` when absent,
+/// and one entry pins every optional field `Some` while another pins them
+/// `None`/empty.
+#[test]
+fn status_body_matches_legacy_json_bytes() {
+    let body = StatusBody {
+        schema: 2,
+        generated_at: "2026-09-13T00:00:00Z".to_string(),
+        active_profile: Some("work".to_string()),
+        pending_switch: Some("later".to_string()),
+        wrap_off: true,
+        refresh_interval_ms: 300_000,
+        profiles: vec![
+            ProfileEntry {
+                name: "all-some".into(),
+                active: true,
+                rolling_token: true,
+                provider: "anthropic".to_string(),
+                base_url: Some("https://api.anthropic.com".to_string()),
+                tier: Some("Max 5x".to_string()),
+                has_live_session: true,
+                auth_status: "ok".to_string(),
+                fetch_status: Some("Fresh".to_string()),
+                stale: true,
+                fetched_at: Some("2026-09-13T00:00:00Z".to_string()),
+                next_refresh_at: Some("2026-09-13T00:05:00Z".to_string()),
+                auto_start: true,
+                auto_start_queue: Some(QueueEntry {
+                    position: 1,
+                    next_open_at: Some("2026-09-13T00:05:00Z".to_string()),
+                }),
+                bell_threshold: Some(92.345678901),
+                fallback: Some(Fallback {
+                    position: 1,
+                    threshold: 92.345678901,
+                    armed: true,
+                }),
+                windows: vec![
+                    Window {
+                        label: "5h".to_string(),
+                        utilization_pct: 42.123456789,
+                        resets_at: Some("2026-09-13T05:00:00Z".to_string()),
+                    },
+                    Window {
+                        label: "7d".to_string(),
+                        utilization_pct: 13.123456789,
+                        resets_at: None,
+                    },
+                ],
+                third_party: Some(ThirdPartyAvailability { available: true }),
+            },
+            ProfileEntry {
+                name: "all-none".into(),
+                active: false,
+                rolling_token: false,
+                provider: "anthropic".to_string(),
+                base_url: None,
+                tier: None,
+                has_live_session: false,
+                auth_status: "ok".to_string(),
+                fetch_status: None,
+                stale: false,
+                fetched_at: None,
+                next_refresh_at: None,
+                auto_start: false,
+                auto_start_queue: None,
+                bell_threshold: None,
+                fallback: None,
+                windows: vec![],
+                third_party: None,
+            },
+            ProfileEntry {
+                name: "null-stamp".into(),
+                active: false,
+                rolling_token: false,
+                provider: "anthropic".to_string(),
+                base_url: None,
+                tier: None,
+                has_live_session: false,
+                auth_status: "ok".to_string(),
+                fetch_status: None,
+                stale: false,
+                fetched_at: None,
+                next_refresh_at: None,
+                auto_start: true,
+                auto_start_queue: Some(QueueEntry {
+                    position: 2,
+                    next_open_at: None,
+                }),
+                bell_threshold: None,
+                fallback: None,
+                windows: vec![],
+                third_party: None,
+            },
+        ],
+    };
+    let expected = concat!(
+        r#"{"schema":2,"generated_at":"2026-09-13T00:00:00Z","active_profile":"work","#,
+        r#""pending_switch":"later","wrap_off":true,"refresh_interval_ms":300000,"profiles":["#,
+        r#"{"name":"all-some","active":true,"rolling_token":true,"provider":"anthropic","#,
+        r#""base_url":"https://api.anthropic.com","tier":"Max 5x","has_live_session":true,"#,
+        r#""auth_status":"ok","fetch_status":"Fresh","stale":true,"fetched_at":"2026-09-13T00:00:00Z","#,
+        r#""next_refresh_at":"2026-09-13T00:05:00Z","auto_start":true,"#,
+        r#""auto_start_queue":{"position":1,"next_open_at":"2026-09-13T00:05:00Z"},"#,
+        r#""bell_threshold":92.345678901,"fallback":{"position":1,"threshold":92.345678901,"armed":true},"#,
+        r#""windows":[{"label":"5h","utilization_pct":42.123456789,"resets_at":"2026-09-13T05:00:00Z"},"#,
+        r#"{"label":"7d","utilization_pct":13.123456789,"resets_at":null}],"#,
+        r#""third_party":{"available":true}},"#,
+        r#"{"name":"all-none","active":false,"rolling_token":false,"provider":"anthropic","#,
+        r#""base_url":null,"tier":null,"has_live_session":false,"auth_status":"ok","#,
+        r#""fetch_status":null,"stale":false,"fetched_at":null,"next_refresh_at":null,"#,
+        r#""auto_start":false,"auto_start_queue":null,"bell_threshold":null,"fallback":null,"#,
+        r#""windows":[],"third_party":null},"#,
+        r#"{"name":"null-stamp","active":false,"rolling_token":false,"provider":"anthropic","#,
+        r#""base_url":null,"tier":null,"has_live_session":false,"auth_status":"ok","#,
+        r#""fetch_status":null,"stale":false,"fetched_at":null,"next_refresh_at":null,"#,
+        r#""auto_start":true,"auto_start_queue":{"position":2,"next_open_at":null},"#,
+        r#""bell_threshold":null,"fallback":null,"windows":[],"third_party":null}]}"#,
+    );
+    assert_eq!(serde_json::to_string(&body).unwrap(), expected);
+
+    let body = StatusBody {
+        schema: 2,
+        generated_at: "2026-09-13T00:00:00Z".to_string(),
+        active_profile: None,
+        pending_switch: None,
+        wrap_off: false,
+        refresh_interval_ms: 60_000,
+        profiles: vec![],
+    };
+    let expected = concat!(
+        r#"{"schema":2,"generated_at":"2026-09-13T00:00:00Z","active_profile":null,"#,
+        r#""pending_switch":null,"wrap_off":false,"refresh_interval_ms":60000,"profiles":[]}"#,
+    );
+    assert_eq!(serde_json::to_string(&body).unwrap(), expected);
+}
+
+/// The single-shot `next_open_at` must be the history-derived anchor's stamp,
+/// not a `null` and not a live-anchor leftover. Its own test rather than the
+/// canary's presence guard, so a `None => None` regression at the single-shot
+/// match arm fails as a value mismatch, not a fixture message.
+#[test]
+fn status_body_derives_the_single_shot_queue_anchor_from_usage_history() {
+    let _home = HomeSandbox::new();
+    let now_secs = crate::usage::now_epoch_secs();
+    let mut p = Profile::new("anchor-history".to_string(), None, None);
+    p.auto_start = true;
+    p.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "anchor-history-access".to_string(),
+            refresh_token: Some("anchor-history-refresh".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: Some("max".to_string()),
+            ..OAuthToken::default_extra()
+        }),
+    });
+    save_profile(&p).unwrap();
+    crate::profile::save_app_state(&AppState {
+        profiles: vec![p.name.clone()],
+        auto_start_queue: true,
+        ..AppState::default()
+    })
+    .unwrap();
+
+    // Two polls 90s apart over one unchanged 5h window, written through the
+    // real history writer: the span pass confirms an open, so the anchor
+    // derives from the series rather than reading as cold history.
+    let window = |utilization: f64, hours: i64| crate::usage::UsageWindow {
+        utilization,
+        resets_at: Some(crate::usage::epoch_secs_to_iso(now_secs + hours * 3600)),
+    };
+    let reading = |utilization: f64| crate::usage::UsageInfo {
+        five_hour: Some(window(utilization, 3)),
+        ..Default::default()
+    };
+    let first = reading(40.0);
+    crate::profile::append_usage_sample_at(&p.name, None, &first, (now_secs - 150) as u64 * 1000);
+    crate::profile::append_usage_sample_at(
+        &p.name,
+        Some(&first),
+        &reading(42.0),
+        (now_secs - 60) as u64 * 1000,
+    );
+
+    let config = crate::profile::load_config().unwrap();
+    let interval_ms = 300_000u64;
+    let members = crate::usage::auto_start_queue_members(&config, &[]);
+    let anchor = crate::usage::history_anchor(
+        &config
+            .profiles
+            .iter()
+            .map(|p| p.name.clone())
+            .collect::<Vec<_>>(),
+    );
+    let expected = crate::usage::next_queue_open_secs(anchor, members.len(), interval_ms)
+        .map(crate::usage::epoch_secs_to_iso);
+
+    let body = build_status(&config, interval_ms, None, false);
+    let queue = body
+        .profiles
+        .iter()
+        .find(|e| e.name.as_str() == "anchor-history")
+        .and_then(|e| e.auto_start_queue.as_ref())
+        .expect("queue member publishes its slot");
+    assert_eq!(
+        queue.next_open_at, expected,
+        "the single-shot queue stamp must be the history anchor plus the queue gap"
+    );
+    assert!(
+        expected.is_some(),
+        "history never anchored the queue (test would be vacuous)"
+    );
+}
+
+/// Threat-model design defect 4: "`status.json` carries no secret" was asserted,
+/// never enforced against the serialized body. Plant a unique marker in every
+/// credential slot a real writer fills and write every cache the builder reads,
+/// then prove no marker reaches the typed body (single-shot or live-signal), the
+/// feed, or the file the writer publishes.
+#[test]
+fn status_body_never_leaks_a_credential() {
+    let home = HomeSandbox::new();
+    let now = crate::usage::now_ms() as i64;
+
+    // One marker per slot, so an assertion message names the slot a leak came
+    // from instead of blaming a shared string.
+    let oauth_access = "clauth-canary-oauth-access-7f3a";
+    let oauth_refresh = "clauth-canary-oauth-refresh-7f3a";
+    let oauth_extra = "clauth-canary-oauth-extra-7f3a";
+    let api_key = "clauth-canary-api-key-7f3a";
+    let console = "clauth-canary-console-7f3a";
+    let env_auth = "clauth-canary-env-auth-7f3a";
+    let env_second = "clauth-canary-env-second-7f3a";
+    let session = "clauth-canary-session-7f3a";
+    let mcp = "clauth-canary-mcp-7f3a";
+    let kick_access = "clauth-canary-kick-access-7f3a";
+    let kick_refresh = "clauth-canary-kick-refresh-7f3a";
+
+    let mut oauth = Profile::new("canary-oauth".to_string(), None, None);
+    oauth.auto_start = true;
+    let mut oauth_token = OAuthToken {
+        access_token: oauth_access.to_string(),
+        refresh_token: Some(oauth_refresh.to_string()),
+        expires_at: Some(now),
+        scopes: None,
+        subscription_type: Some("max".to_string()),
+        extra: serde_json::Map::new(),
+    };
+    oauth_token
+        .extra
+        .insert("canaryExtraKey".to_string(), serde_json::json!(oauth_extra));
+    oauth.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(oauth_token),
+    });
+    save_profile(&oauth).unwrap();
+
+    let mut api = Profile::new(
+        "canary-api".to_string(),
+        Some("https://api.anthropic.com".to_string()),
+        Some(api_key.to_string()),
+    );
+    api.console = Some(crate::profile::ConsoleCredential {
+        token: console.to_string(),
+        site: crate::profile::ConsoleSite::Domestic,
+        region: "cn-beijing".to_string(),
+    });
+    api.env
+        .insert("ANTHROPIC_AUTH_TOKEN".to_string(), env_auth.to_string());
+    api.env
+        .insert("CLAUTH_CANARY_ENV".to_string(), env_second.to_string());
+    save_profile(&api).unwrap();
+
+    // A second queue member, so the kick block below excludes a planted name
+    // from the single-shot queue while `canary-oauth` keeps its slot.
+    let mut kick = Profile::new("canary-kick".to_string(), None, None);
+    kick.auto_start = true;
+    kick.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: kick_access.to_string(),
+            refresh_token: Some(kick_refresh.to_string()),
+            expires_at: Some(now),
+            scopes: None,
+            subscription_type: Some("max".to_string()),
+            ..OAuthToken::default_extra()
+        }),
+    });
+    save_profile(&kick).unwrap();
+
+    // The setup-token capture slot, written through its own persistence fn.
+    crate::claude::write_session_token(&oauth.name, session, now).unwrap();
+
+    // The MCP park writer persists only for a profile the on-disk record
+    // carries (`write_profile_cache` checks profiles.toml), so register both
+    // profiles before planting. The active profile, the fallback chain and the
+    // auto-start queue put a planted name on the builder's active, chain and
+    // queue arms.
+    crate::profile::save_app_state(&AppState {
+        active_profile: Some(oauth.name.clone()),
+        profiles: vec![oauth.name.clone(), api.name.clone(), kick.name.clone()],
+        fallback_chain: vec![oauth.name.clone(), api.name.clone()],
+        auto_start_queue: true,
+        ..AppState::default()
+    })
+    .unwrap();
+
+    // The durable dead-credential verdict and a live session for the planted
+    // api-key profile, so the builder's `recorded_expired` and
+    // `has_live_session` arms run over a planted name (each carries its own
+    // presence guard below). Both land after `save_app_state` — the record's
+    // writer checks `profiles.toml`, and the session dir resolves under this
+    // sandbox.
+    let api_fp = crate::usage::profile_credential_fingerprint(&api).expect("api fingerprint");
+    crate::profile_cache::write_auth_expired(&api.name, api_fp);
+    let _api_live = crate::testutil::arm_live_session(home.home(), "canary-api");
+
+    // The parked MCP logins slot, written through its real park writer.
+    let mcp_store = crate::profile::clauth_dir()
+        .unwrap()
+        .join("canary-mcp-store.json");
+    std::fs::write(
+        &mcp_store,
+        serde_json::json!({ "mcpOAuth": { "linear": { "accessToken": mcp } } }).to_string(),
+    )
+    .unwrap();
+    crate::claude::park_mcp_logins_from_store(&oauth.name, &mcp_store);
+    let parked = crate::profile_cache::load_profile_cache::<serde_json::Value>(
+        &oauth.name,
+        crate::profile_cache::MCP_LOGINS_FILE,
+    )
+    .expect("park writer landed the mcpOAuth block");
+
+    // Every cache the builder reads, written through the crate's real writers
+    // with ordinary content, so each cache-gated branch runs over a planted
+    // profile. Two history polls 90s apart over one 5h window are what the
+    // single-shot queue anchor derives from.
+    let now_secs = crate::usage::now_epoch_secs();
+    let window = |utilization: f64, hours: i64| crate::usage::UsageWindow {
+        utilization,
+        resets_at: Some(crate::usage::epoch_secs_to_iso(now_secs + hours * 3600)),
+    };
+    let reading = |utilization: f64| crate::usage::UsageInfo {
+        plan: Some(crate::usage::PlanInfo {
+            tier: crate::usage::PlanTier::Pro,
+            subscription_status: Some("active".to_string()),
+        }),
+        five_hour: Some(window(utilization, 3)),
+        seven_day: Some(window(13.0, 72)),
+        fetched_at: Some((now - 60_000) as u64),
+        ..Default::default()
+    };
+    crate::profile_cache::write_profile_cache(
+        &oauth.name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &reading(42.0),
+    );
+    let first = reading(40.0);
+    crate::profile::append_usage_sample_at(
+        &oauth.name,
+        None,
+        &first,
+        (now_secs - 150) as u64 * 1000,
+    );
+    crate::profile::append_usage_sample_at(
+        &oauth.name,
+        Some(&first),
+        &reading(42.0),
+        (now_secs - 60) as u64 * 1000,
+    );
+    crate::profile_cache::write_profile_cache(
+        &api.name,
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &crate::providers::ThirdPartyStats {
+            is_available: true,
+            rows: vec![],
+            bars: vec![crate::providers::UsageBar {
+                label: crate::usage::LABEL_5H.to_string(),
+                pct: 25.0,
+                resets_at: Some(crate::usage::epoch_secs_to_iso(now_secs + 2 * 3600)),
+                used: None,
+                total: None,
+            }],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+    crate::profile_cache::write_profile_cache(
+        &kick.name,
+        crate::profile_cache::KICK_BLOCK_CACHE_FILE,
+        &crate::usage::KickBlock {
+            streak: 2,
+            rejected: true,
+            until: Some(now_secs + 3600),
+            next_retry: now_secs + 3600,
+        },
+    );
+
+    // Reload through the crate's own config loader, so the builder reads what the
+    // loader fills from disk rather than the hand-built profiles.
+    let config = crate::profile::load_config().unwrap();
+
+    let body_none = build_status(&config, 300_000, None, true);
+    let body_none_str =
+        String::from_utf8_lossy(&serde_json::to_vec_pretty(&body_none).unwrap()).into_owned();
+
+    // Live-signal path: non-empty maps for both planted names, a stuck 429
+    // streak, a pending switch naming one, a queue anchor and a blocked list,
+    // so a leak that fires only for the active profile or only under live
+    // signals is caught.
+    let oauth_p = config
+        .profiles
+        .iter()
+        .find(|p| p.name.as_str() == "canary-oauth")
+        .unwrap();
+    let api_p = config
+        .profiles
+        .iter()
+        .find(|p| p.name.as_str() == "canary-api")
+        .unwrap();
+    let status_map = HashMap::from([("canary-oauth".to_string(), FetchStatus::RateLimited)]);
+    let third_party_map = HashMap::from([("canary-api".to_string(), FetchStatus::Cached)]);
+    let next_refresh_map = HashMap::from([
+        (
+            FetchLeg::for_profile(oauth_p).key(oauth_p.name.clone()),
+            now as u64,
+        ),
+        (
+            FetchLeg::for_profile(api_p).key(api_p.name.clone()),
+            now as u64,
+        ),
+    ]);
+    let streaks_map = HashMap::from([("canary-oauth".to_string(), u32::MAX)]);
+    let blocked: Vec<ProfileName> = vec!["canary-api".into()];
+    let live = LiveSignals {
+        status: &status_map,
+        third_party_status: &third_party_map,
+        next_refresh: &next_refresh_map,
+        streaks: &streaks_map,
+        pending_switch: Some("canary-api"),
+        queue_anchor: Some(now / 1000),
+        queue_blocked: &blocked,
+    };
+    let body_live = build_status(&config, 300_000, Some(&live), true);
+    let body_live_str =
+        String::from_utf8_lossy(&serde_json::to_vec_pretty(&body_live).unwrap()).into_owned();
+
+    let feed = crate::daemon::status_feed_json(&config, Some(&live), Some("2026-09-13T00:00:00Z"))
+        .unwrap();
+    let feed_str = String::from_utf8_lossy(&feed).into_owned();
+
+    // And the literal file that writer publishes.
+    crate::daemon::write_status_json(&feed);
+    let published =
+        std::fs::read(crate::profile::clauth_dir().unwrap().join("status.json")).unwrap();
+    let published_str = String::from_utf8_lossy(&published).into_owned();
+
+    // Each cache must reach its branch, or its part of the canary proves nothing.
+    let entry = |body: &StatusBody, name: &str| {
+        body.profiles
+            .iter()
+            .find(|e| e.name.as_str() == name)
+            .cloned()
+            .expect("planted profile published")
+    };
+    let oauth_entry = entry(&body_none, "canary-oauth");
+    assert!(
+        oauth_entry.fetched_at.is_some() && !oauth_entry.windows.is_empty(),
+        "usage cache never reached the build (canary would be vacuous)"
+    );
+    assert_eq!(
+        oauth_entry.tier,
+        crate::usage::PlanTier::Pro.short_label(),
+        "cached plan never reached the build (canary would be vacuous)"
+    );
+    assert!(
+        oauth_entry
+            .auto_start_queue
+            .is_some_and(|q| q.next_open_at.is_some()),
+        "usage history never anchored the single-shot queue (canary would be vacuous)"
+    );
+    let api_entry = entry(&body_none, "canary-api");
+    assert!(
+        api_entry.third_party.is_some() && !api_entry.windows.is_empty(),
+        "third-party cache never reached the build (canary would be vacuous)"
+    );
+    assert_eq!(
+        api_entry.fetch_status.as_deref(),
+        Some("AuthExpired"),
+        "recorded dead-credential verdict never reached the build (canary would be vacuous)"
+    );
+    assert!(
+        api_entry.has_live_session,
+        "live session never reached the build (canary would be vacuous)"
+    );
+    assert!(
+        entry(&body_none, "canary-kick").auto_start_queue.is_none()
+            && entry(&body_live, "canary-kick").auto_start_queue.is_some(),
+        "kick block never reached the single-shot build (canary would be vacuous)"
+    );
+
+    // Each slot's marker as the reloaded state carries it: a marker missing
+    // here would make its absence from the outputs prove nothing.
+    let login_of = |name: &str| {
+        let p = config
+            .profiles
+            .iter()
+            .find(|p| p.name.as_str() == name)
+            .unwrap();
+        let login = p
+            .credentials
+            .as_ref()
+            .and_then(|c| c.claude_ai_oauth.as_ref());
+        serde_json::to_string(login.unwrap()).unwrap()
+    };
+    let planted = [
+        login_of("canary-oauth"),
+        login_of("canary-kick"),
+        format!(
+            "{:?} {:?} {:?}",
+            api_p.api_key,
+            api_p.console.as_ref().map(|c| &c.token),
+            api_p.env
+        ),
+        crate::claude::sidecar_summary(&oauth_p.name)
+            .map(|(_, t)| t.access_token)
+            .unwrap_or_default(),
+        parked.to_string(),
+    ]
+    .join("\n");
+
+    let markers: [(&str, &str); 11] = [
+        ("oauth access_token", oauth_access),
+        ("oauth refresh_token", oauth_refresh),
+        ("oauth extra", oauth_extra),
+        ("kick oauth access_token", kick_access),
+        ("kick oauth refresh_token", kick_refresh),
+        ("api_key", api_key),
+        ("console token", console),
+        ("env ANTHROPIC_AUTH_TOKEN", env_auth),
+        ("env second key", env_second),
+        ("session token", session),
+        ("parked mcp login", mcp),
+    ];
+    for (slot, marker) in markers {
+        assert!(
+            planted.contains(marker),
+            "{slot} marker never reached its slot (canary would be vacuous)"
+        );
+        assert!(
+            !body_none_str.contains(marker),
+            "{slot} marker leaked into the single-shot body"
+        );
+        assert!(
+            !body_live_str.contains(marker),
+            "{slot} marker leaked into the live-signal body"
+        );
+        assert!(
+            !feed_str.contains(marker),
+            "{slot} marker leaked into the feed"
+        );
+        assert!(
+            !published_str.contains(marker),
+            "{slot} marker leaked into the published status.json"
+        );
+    }
+
+    // The apiKeyHelper command CC runs per request, built through the crate's
+    // real settings builder for a planted api-key profile, then asserted absent
+    // from every output.
+    let settings = crate::claude::build_claude_settings_json(None, api_p, &[]).unwrap();
+    let helper = serde_json::from_str::<serde_json::Value>(&settings).unwrap()["apiKeyHelper"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        !helper.is_empty(),
+        "apiKeyHelper was not built (canary would be vacuous)"
+    );
+    // Every output is JSON, so a leaked helper appears escaped: a Windows exe
+    // path carries backslashes and may carry quotes.
+    let escaped = serde_json::to_string(&helper).unwrap();
+    let helper = &escaped[1..escaped.len() - 1];
+    assert!(
+        !body_none_str.contains(helper),
+        "apiKeyHelper leaked into the single-shot body"
+    );
+    assert!(
+        !body_live_str.contains(helper),
+        "apiKeyHelper leaked into the live-signal body"
+    );
+    assert!(
+        !feed_str.contains(helper),
+        "apiKeyHelper leaked into the feed"
+    );
+    assert!(
+        !published_str.contains(helper),
+        "apiKeyHelper leaked into the published status.json"
+    );
+
+    // Re-publish with the api-key profile ACTIVE: the api-key slots (api key,
+    // console bearer, env) ride the active-only branch, so the oauth-active
+    // bodies above prove nothing about a leak gated on `config.is_active`.
+    crate::profile::save_app_state(&AppState {
+        active_profile: Some(api.name.clone()),
+        profiles: vec![oauth.name.clone(), api.name.clone(), kick.name.clone()],
+        fallback_chain: vec![oauth.name.clone(), api.name.clone()],
+        auto_start_queue: true,
+        ..AppState::default()
+    })
+    .unwrap();
+    let config_api_active = crate::profile::load_config().unwrap();
+    let feed_api_active = crate::daemon::status_feed_json(
+        &config_api_active,
+        Some(&live),
+        Some("2026-09-13T00:00:00Z"),
+    )
+    .unwrap();
+    crate::daemon::write_status_json(&feed_api_active);
+    let published_api_active =
+        std::fs::read(crate::profile::clauth_dir().unwrap().join("status.json")).unwrap();
+    let api_active_surfaces = [
+        (
+            "api-active single-shot body",
+            String::from_utf8_lossy(
+                &serde_json::to_vec_pretty(&build_status(&config_api_active, 300_000, None, true))
+                    .unwrap(),
+            )
+            .into_owned(),
+        ),
+        (
+            "api-active live-signal body",
+            String::from_utf8_lossy(
+                &serde_json::to_vec_pretty(&build_status(
+                    &config_api_active,
+                    300_000,
+                    Some(&live),
+                    true,
+                ))
+                .unwrap(),
+            )
+            .into_owned(),
+        ),
+        (
+            "api-active feed",
+            String::from_utf8_lossy(&feed_api_active).into_owned(),
+        ),
+        (
+            "api-active published status.json",
+            String::from_utf8_lossy(&published_api_active).into_owned(),
+        ),
+    ];
+    for (slot, marker) in markers {
+        for (surface, text) in &api_active_surfaces {
+            assert!(
+                !text.contains(marker),
+                "{slot} marker leaked into the {surface}"
+            );
+        }
+    }
 }
