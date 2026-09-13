@@ -24,6 +24,7 @@ Scope note: by default the daemon carries **no external surface at all**: it pub
   - A real holder keeps its lock for life, so anything that clears on a retry was a reader.
 - **Watchdog**: a wedged tick can freeze the single-threaded loop. The cross-process state flock a tick may block on is capped at 25 s, so a flock-blocked tick times out and retries rather than hanging.
   - If no tick completes in 30 s at all, the daemon `abort()`s for a clean supervisor restart, freeing the usage lease.
+  - A suspended process (Modern Standby, S3, a VM pause) freezes the loop but not the clock; the watchdog charges a poll that overshot its window no running time, so the heartbeat gap is judged on time the loop actually had — a suspend/resume never reads as a stalled tick, and a loop that wedges before or after the resume still aborts.
   - A legit keychain switch sits inside both margins: on macOS it reads the Keychain item and writes it back, each of those killed at 10 s.
   - Everything one flock hold spends in `security` is capped at 20 s no matter how many reads and writes it makes.
 - **Log hygiene**: every daemon-visible stderr line carries an ISO-8601 UTC prefix, enabled only in daemon mode. An interactive terminal instead diverts its lines to `~/.clauth/clauth.log` so a background thread never paints over the TUI; a redirected or piped stderr keeps the bare line.
@@ -36,6 +37,19 @@ Scope note: by default the daemon carries **no external surface at all**: it pub
   - The rest hydrate from the shared disk caches instead of double-polling the usage API, double-rotating the single-use refresh chain, or re-deciding switches.
   - The lease is first-come and held for the process lifetime, no preemption, so the switch-decider never thrashes between processes; a waiter takes it over within one tick of the holder exiting (flock auto-release).
   - The daemon normally boots first and holds it, but a TUI already fetching keeps the lease until it closes, and the daemon then hydrates while still publishing `status.json` every tick.
+
+## Supervising the daemon on Windows
+
+clauth ships no supervisor. A macOS launchd unit with `KeepAlive` restarts the daemon, and a Linux systemd unit does the same; Windows has no built-in supervisor for a plain user program, so a daemon that exits stays down and `~/.clauth/status.json` freezes at its last write.
+
+Two ways to keep it up:
+
+- Run it from a spawner that restarts it whenever the process ends (a loop that re-runs `clauth daemon` each time the child exits; a crash releases the singleton lock, so the next run claims it cleanly).
+- A Scheduled Task that fires `clauth daemon` every few minutes: the singleton lock makes the redundant start exit 0 with `already running (pid <n>)`, so repeating the task while one is up changes nothing.
+
+`clauth daemon --status` answers whether one is running without spawning anything (exit 1 = none up), so a spawner can gate on it.
+
+Either way, a reader of the frozen feed detects a dead daemon from `generated_at`: the stamp is rewritten every tick, so a stamp much older than `refresh_interval_ms` means the daemon is gone, stuck, or the machine was asleep. Show the last-known numbers with a stale cue, never as current truth.
 
 ## REST API (`--listen`)
 
