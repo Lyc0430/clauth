@@ -709,10 +709,12 @@ fn an_untagged_response_carries_no_etag() {
 }
 
 /// The table promises phrases only "for the statuses this server actually
-/// emits": no route or error constructor answers 403 — auth failures are 401,
-/// refusals 409 — so an arm for it is that doc quietly false. It must fall to
-/// the fallback phrase instead.
+/// emits": nothing answers 418, so an arm for it would make that doc quietly
+/// false, and it falls to the fallback phrase. The pairing redemption's 201 and
+/// the capability check's 403 are emitted, so they carry theirs.
 #[test]
 fn a_status_no_route_emits_has_no_reason_phrase() {
-    assert_eq!(reason_phrase(403), "Unknown");
+    assert_eq!(reason_phrase(418), "Unknown");
+    assert_eq!(reason_phrase(201), "Created");
+    assert_eq!(reason_phrase(403), "Forbidden");
 }

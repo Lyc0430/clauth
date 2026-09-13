@@ -155,16 +155,16 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
             // feed and the switch to another machine. The bullet said that while
             // this list named none of it, so the routes, their auth, and the TLS
             // listener under them all counted as uncovered.
-            "every_route_requires_the_token",
+            "every_route_but_pair_refuses_an_unpaired_caller",
             "only_the_api_v1_prefix_is_served",
             "an_unknown_path_is_404_and_a_wrong_method_is_405",
             "status_serves_the_on_disk_feed_verbatim",
             "all_equals_one_reads_the_live_stores",
             "switch_relinks_and_reports_the_previous_account",
             "a_second_concurrent_switch_is_refused_immediately",
-            "rotating_the_token_revokes_the_old_one",
-            "a_fresh_token_file_records_the_control_tier",
-            "an_unknown_tier_refuses_rather_than",
+            "a_revoked_device_is_refused_on_its_next_request",
+            "a_view_device_is_refused_every_control_route",
+            "an_unknown_tier_device_is_refused_while_the_others_work",
             "the_connection_cap_admits_up_to_the_limit",
             "a_content_length_that_is_not_bare_digits",
             "cert_source_is_explicit_only_when_both_files_are_named",

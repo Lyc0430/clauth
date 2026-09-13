@@ -360,9 +360,8 @@ fn an_edited_cert_dir_is_honored_across_restarts() {
     );
 }
 
-/// The deliberate divergence from `auth_token.json`, which silently replaces a
-/// file it cannot parse: serving certificates out of a directory the operator
-/// thinks they moved away from is worse than refusing to start.
+/// Serving certificates out of a directory the operator thinks they moved away
+/// from is worse than refusing to start.
 #[test]
 fn a_malformed_tls_config_refuses_rather_than_reverting_to_the_default() {
     let _home = HomeSandbox::new();
@@ -387,8 +386,8 @@ fn a_malformed_tls_config_refuses_rather_than_reverting_to_the_default() {
     );
 }
 
-/// Same downgrade rule as `auth_token.json`: a newer schema is read, not
-/// rejected, because the one field this build needs is a path either way.
+/// A newer schema is read, not rejected, because the one field this build
+/// needs is a path either way.
 #[test]
 fn a_newer_schema_is_still_read() {
     let _home = HomeSandbox::new();

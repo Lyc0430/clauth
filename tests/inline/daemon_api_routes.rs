@@ -19,7 +19,12 @@ use crate::profile::{
 };
 use crate::testutil::HomeSandbox;
 
+/// The bearer of the control device every context below pairs.
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+/// The device [`TOKEN`] authenticates as.
+const DEVICE: &str = "test";
+/// The bearer of a second device, which the tests that need one pair.
+const OTHER_TOKEN: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
 
 fn creds(access: &str) -> ClaudeCredentials {
     ClaudeCredentials {
@@ -60,11 +65,14 @@ fn seeded_config() -> ConfigHandle {
     }))
 }
 
+/// A context over `config`, with [`TOKEN`] paired as the control device
+/// [`DEVICE`].
 fn ctx_with(config: ConfigHandle) -> std::sync::Arc<ApiContext> {
+    seed_device(DEVICE, Tier::Control, TOKEN);
     let status_path = crate::profile::clauth_dir()
         .expect("clauth dir")
         .join("status.json");
-    ApiContext::new(config, status_path, AuthToken::from_plaintext(TOKEN), None)
+    ApiContext::new(config, status_path, None)
 }
 
 /// The same context a running daemon builds: one that can see the scheduler's
@@ -73,15 +81,11 @@ fn ctx_with_live(
     config: ConfigHandle,
     live: crate::daemon::LiveStores,
 ) -> std::sync::Arc<ApiContext> {
+    seed_device(DEVICE, Tier::Control, TOKEN);
     let status_path = crate::profile::clauth_dir()
         .expect("clauth dir")
         .join("status.json");
-    ApiContext::new(
-        config,
-        status_path,
-        AuthToken::from_plaintext(TOKEN),
-        Some(live),
-    )
+    ApiContext::new(config, status_path, Some(live))
 }
 
 /// A request as the HTTP layer would hand it to the router.
@@ -97,6 +101,24 @@ fn req(method: &str, path: &str, bearer: Option<&str>, body: &str) -> Request {
         // Routing does not depend on this; the connection loop owns it.
         keep_alive: true,
     }
+}
+
+fn peer() -> SocketAddr {
+    SocketAddr::from(([192, 0, 2, 7], 50_000))
+}
+
+/// The router as most of these tests drive it: one fixed peer, the answer
+/// alone. A test about which device the answer went to calls [`handle`].
+fn call(ctx: &ApiContext, req: &Request) -> Response {
+    handle(ctx, req, peer()).response
+}
+
+fn seed_device(name: &str, tier: Tier, token: &str) {
+    devices::seed_for_tests(name, tier, token).expect("seed a device");
+}
+
+fn route_path(route: &Route) -> String {
+    format!("{API_PREFIX}{}", route.path)
 }
 
 /// A conditional GET, for the feed's 304 and `?wait` paths.
@@ -127,7 +149,7 @@ fn write_feed(ctx: &ApiContext, body: &str) {
 
 /// The tag the daemon would hand out for what is on disk right now.
 fn current_tag(ctx: &ApiContext) -> String {
-    let resp = handle(ctx, &req("GET", "/api/v1/status", Some(TOKEN), ""));
+    let resp = call(ctx, &req("GET", "/api/v1/status", Some(TOKEN), ""));
     assert_eq!(resp.status, 200);
     resp.etag.clone().expect("a 200 carries an entity tag")
 }
@@ -150,7 +172,7 @@ fn a_wait_returns_as_soon_as_the_feed_changes() {
     });
 
     let started = std::time::Instant::now();
-    let resp = handle(
+    let resp = call(
         &ctx,
         &req_tagged("/api/v1/status?wait=10", Some(TOKEN), &tag),
     );
@@ -198,7 +220,7 @@ fn a_wait_is_not_woken_by_the_timestamp_alone() {
         }
     });
 
-    let resp = handle(
+    let resp = call(
         &ctx,
         &req_tagged("/api/v1/status?wait=2", Some(TOKEN), &tag),
     );
@@ -224,7 +246,7 @@ fn a_conditional_read_without_wait_answers_immediately() {
     let tag = current_tag(&ctx);
 
     let started = std::time::Instant::now();
-    let resp = handle(&ctx, &req_tagged("/api/v1/status", Some(TOKEN), &tag));
+    let resp = call(&ctx, &req_tagged("/api/v1/status", Some(TOKEN), &tag));
     assert_eq!(resp.status, 304);
     assert!(started.elapsed() < std::time::Duration::from_secs(1));
 }
@@ -244,7 +266,7 @@ fn a_zero_wait_conditional_read_reads_before_deciding() {
     // The feed moves; the reader holding the old tag must see it now, not on a
     // hypothetical next poll.
     write_feed(&ctx, &feed("beta", "2026-09-02T06:00:05+00:00"));
-    let resp = handle(
+    let resp = call(
         &ctx,
         &req_tagged("/api/v1/status?wait=0", Some(TOKEN), &held),
     );
@@ -256,7 +278,7 @@ fn a_zero_wait_conditional_read_reads_before_deciding() {
 
     // A reader already current is told nothing changed.
     let now_tag = resp.etag.clone().expect("a 200 carries an entity tag");
-    let resp = handle(
+    let resp = call(
         &ctx,
         &req_tagged("/api/v1/status?wait=0", Some(TOKEN), &now_tag),
     );
@@ -283,7 +305,7 @@ fn a_positive_wait_serves_the_first_reads_freshness_rather_than_parking() {
     write_feed(&ctx, &feed("beta", "2026-09-02T06:00:05+00:00"));
 
     let started = std::time::Instant::now();
-    let resp = handle(
+    let resp = call(
         &ctx,
         &req_tagged("/api/v1/status?wait=10", Some(TOKEN), &held),
     );
@@ -318,7 +340,7 @@ fn a_wait_skips_a_feed_that_does_not_parse() {
         r#"{"schema":1,"generated_at":"2026-09-02T06:00:00+00:00","active_prof"#,
     );
 
-    let resp = handle(
+    let resp = call(
         &ctx,
         &req_tagged("/api/v1/status?wait=1", Some(TOKEN), &tag),
     );
@@ -347,7 +369,7 @@ fn a_plain_get_rebuilds_rather_than_serving_a_torn_feed() {
         r#"{"schema":1,"generated_at":"2026-09-02T06:00:00+00:00","active_prof"#,
     );
 
-    let resp = handle(&ctx, &req_tagged("/api/v1/status", Some(TOKEN), &tag));
+    let resp = call(&ctx, &req_tagged("/api/v1/status", Some(TOKEN), &tag));
     assert_eq!(resp.status, 200, "a torn feed is rebuilt, not skipped");
     // Parsed BEFORE the field asserts, so the pin's red under a regression is
     // the assertion on the answer, not a harness expect unwinding on garbage.
@@ -365,22 +387,309 @@ fn a_plain_get_rebuilds_rather_than_serving_a_torn_feed() {
 
 // ---------------------------------------------------------------- auth
 
-/// Every route, health included. An unauthenticated caller learns only that
-/// something is listening.
+/// The table as shipped, row for row. A route's access is a security decision,
+/// so a change to any row has to change this pin on purpose.
 #[test]
-fn every_route_requires_the_token() {
+fn the_route_table_is_exactly_this() {
+    let rows: Vec<(&str, &str, Access)> = ROUTES
+        .iter()
+        .map(|route| (route.method, route.path, route.access))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            ("GET", "/health", Access::View),
+            ("HEAD", "/health", Access::View),
+            ("GET", "/status", Access::View),
+            ("HEAD", "/status", Access::View),
+            ("POST", "/switch", Access::Control),
+            ("POST", "/pair", Access::None),
+        ]
+    );
+}
+
+/// AU-1: every route but the pairing redemption refuses an unpaired caller and
+/// challenges it, and a path in no row is refused the same way, so an unpaired
+/// caller learns nothing about the table. The rows are picked by identity
+/// rather than by access, so a row that stops asking for a bearer fails here
+/// instead of dropping out of the loop.
+#[test]
+fn every_route_but_pair_refuses_an_unpaired_caller() {
     let _home = HomeSandbox::new();
     let ctx = ctx_with(seeded_config());
+    let unpaired = "f".repeat(64);
 
-    for (method, path) in [
-        ("GET", "/api/v1/health"),
-        ("GET", "/api/v1/status"),
-        ("POST", "/api/v1/switch"),
-    ] {
-        let resp = handle(&ctx, &req(method, path, None, ""));
-        assert_eq!(resp.status, 401, "{method} {path} without a token");
-        assert!(resp.challenge, "{method} {path} must challenge");
+    for route in ROUTES
+        .iter()
+        .filter(|route| (route.method, route.path) != ("POST", "/pair"))
+    {
+        for bearer in [None, Some(unpaired.as_str())] {
+            let resp = call(&ctx, &req(route.method, &route_path(route), bearer, ""));
+            assert_eq!(resp.status, 401, "{} {}", route.method, route.path);
+            assert!(
+                resp.challenge,
+                "{} {} must challenge",
+                route.method, route.path
+            );
+        }
     }
+    for path in [
+        "/api/v1/nope",
+        "/api/v1/health/",
+        "/api/v1//health",
+        "/health",
+        "/",
+    ] {
+        assert_eq!(
+            call(&ctx, &req("GET", path, None, "")).status,
+            401,
+            "{path}"
+        );
+    }
+}
+
+/// The pairing redemption is the one route an unpaired caller reaches, and the
+/// one row that reads no bearer; the same path under another method still
+/// authenticates first.
+#[test]
+fn pair_is_the_one_route_an_unpaired_caller_reaches() {
+    let open: Vec<(&str, &str)> = ROUTES
+        .iter()
+        .filter(|route| route.access == Access::None)
+        .map(|route| (route.method, route.path))
+        .collect();
+    assert_eq!(open, vec![("POST", "/pair")]);
+
+    let _home = HomeSandbox::new();
+    let ctx = ctx_with(seeded_config());
+    let resp = call(
+        &ctx,
+        &req("POST", "/api/v1/pair", None, r#"{"code":"ABCD-2345"}"#),
+    );
+    assert_eq!(resp.status, 403, "no code is live, and the route says so");
+    assert_eq!(
+        body_json(&resp)["error"],
+        serde_json::json!("pairing_refused")
+    );
+    assert_eq!(
+        call(&ctx, &req("GET", "/api/v1/pair", None, "")).status,
+        401
+    );
+    assert_eq!(
+        call(&ctx, &req("GET", "/api/v1/pair", Some(TOKEN), "")).status,
+        405
+    );
+}
+
+/// CT-1: each control route answers 403 to a view device. Derived from the
+/// table, so a new mutating row is covered by being added; the refused switch
+/// moved nothing, and the control device passes the same route.
+#[test]
+fn a_view_device_is_refused_every_control_route() {
+    let _home = HomeSandbox::new();
+    let config = seeded_config();
+    let ctx = ctx_with(std::sync::Arc::clone(&config));
+    seed_device("phone", Tier::View, OTHER_TOKEN);
+
+    let control: Vec<&Route> = ROUTES
+        .iter()
+        .filter(|route| route.access == Access::Control)
+        .collect();
+    assert!(
+        !control.is_empty(),
+        "the table must hold a mutating route for this to guard"
+    );
+    for route in control {
+        let resp = call(
+            &ctx,
+            &req(
+                route.method,
+                &route_path(route),
+                Some(OTHER_TOKEN),
+                r#"{"profile":"beta"}"#,
+            ),
+        );
+        assert_eq!(
+            (resp.status, body_json(&resp)),
+            (
+                403,
+                serde_json::json!({
+                    "ok": false,
+                    "error": "control_required",
+                    "reason": CONTROL_REQUIRED,
+                })
+            ),
+            "{} {}",
+            route.method,
+            route.path
+        );
+    }
+    assert_eq!(
+        config
+            .lock()
+            .expect("config")
+            .state
+            .active_profile
+            .as_deref(),
+        Some("alpha"),
+        "the refused switch moved nothing"
+    );
+    let resp = call(
+        &ctx,
+        &req(
+            "POST",
+            "/api/v1/switch",
+            Some(TOKEN),
+            r#"{"profile":"beta"}"#,
+        ),
+    );
+    assert_eq!(resp.status, 200, "the control device passes the same route");
+}
+
+#[test]
+fn a_view_device_reads_every_view_route() {
+    let _home = HomeSandbox::new();
+    let ctx = ctx_with(seeded_config());
+    seed_device("phone", Tier::View, OTHER_TOKEN);
+    for route in ROUTES.iter().filter(|route| route.access == Access::View) {
+        let resp = call(
+            &ctx,
+            &req(route.method, &route_path(route), Some(OTHER_TOKEN), ""),
+        );
+        assert_eq!(resp.status, 200, "{} {}", route.method, route.path);
+    }
+}
+
+/// A stored tier this build does not know: that device authenticates, every
+/// route refuses it with the fix named, the log says so once, and the other
+/// devices keep working.
+#[test]
+fn an_unknown_tier_device_is_refused_while_the_others_work() {
+    let _home = HomeSandbox::new();
+    let ctx = ctx_with(seeded_config());
+    seed_device("wall", Tier::Unknown("readonly".to_string()), OTHER_TOKEN);
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+
+    for route in ROUTES.iter().filter(|route| route.access != Access::None) {
+        let handled = handle(
+            &ctx,
+            &req(
+                route.method,
+                &route_path(route),
+                Some(OTHER_TOKEN),
+                r#"{"profile":"beta"}"#,
+            ),
+            peer(),
+        );
+        assert_eq!(
+            (handled.response.status, body_json(&handled.response)),
+            (
+                403,
+                serde_json::json!({
+                    "ok": false,
+                    "error": "device_tier_unknown",
+                    "reason": TIER_UNKNOWN,
+                })
+            ),
+            "{} {}",
+            route.method,
+            route.path
+        );
+        assert_eq!(
+            handled.device.as_deref(),
+            Some("wall"),
+            "it authenticated; authorization is what refuses it"
+        );
+    }
+    assert_eq!(
+        call(&ctx, &req("GET", "/api/v1/health", Some(TOKEN), "")).status,
+        200,
+        "the other devices are unaffected"
+    );
+    assert_eq!(
+        lines
+            .snapshot()
+            .iter()
+            .filter(|line| line.contains("carries tier \"readonly\""))
+            .count(),
+        1
+    );
+}
+
+/// TK-5: a revoked device is refused on its very next request, with no
+/// restart, and the other devices keep working.
+#[test]
+fn a_revoked_device_is_refused_on_its_next_request() {
+    let _home = HomeSandbox::new();
+    let ctx = ctx_with(seeded_config());
+    seed_device("phone", Tier::View, OTHER_TOKEN);
+    let health = |bearer: &str| call(&ctx, &req("GET", "/api/v1/health", Some(bearer), "")).status;
+
+    assert_eq!(health(OTHER_TOKEN), 200);
+    devices::revoke("phone").expect("revoke");
+    assert_eq!(health(OTHER_TOKEN), 401);
+    assert_eq!(health(TOKEN), 200);
+}
+
+/// The list is read per request and fails closed: an unreadable one refuses
+/// every request with a 500 said once in the log, never read as an empty list
+/// and never as the last one that parsed.
+#[test]
+fn an_unreadable_device_list_refuses_every_request() {
+    let _home = HomeSandbox::new();
+    let ctx = ctx_with(seeded_config());
+    std::fs::write(
+        crate::profile::clauth_dir()
+            .expect("dir")
+            .join("devices.json"),
+        b"{ not json",
+    )
+    .expect("damage the list");
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+
+    for _ in 0..2 {
+        let resp = call(&ctx, &req("GET", "/api/v1/health", Some(TOKEN), ""));
+        assert_eq!(
+            (resp.status, body_json(&resp)),
+            (500, serde_json::json!({"ok": false, "error": "internal"}))
+        );
+    }
+    assert_eq!(
+        lines
+            .snapshot()
+            .iter()
+            .filter(|line| line.contains("until the device list reads"))
+            .count(),
+        1
+    );
+}
+
+/// The router tells the serve loop which device each answer went to, for the
+/// per-request audit line.
+#[test]
+fn the_router_reports_the_device_it_answered() {
+    let _home = HomeSandbox::new();
+    let ctx = ctx_with(seeded_config());
+    let device = |bearer: Option<&str>, method: &str, path: &str| {
+        handle(&ctx, &req(method, path, bearer, ""), peer()).device
+    };
+    assert_eq!(
+        device(Some(TOKEN), "GET", "/api/v1/health").as_deref(),
+        Some(DEVICE)
+    );
+    assert_eq!(
+        device(Some(TOKEN), "GET", "/api/v1/nope").as_deref(),
+        Some(DEVICE),
+        "a 404 still went to the device"
+    );
+    assert_eq!(device(None, "GET", "/api/v1/health"), None);
+    assert_eq!(
+        device(None, "POST", "/api/v1/pair"),
+        None,
+        "the redemption reads no bearer"
+    );
 }
 
 #[test]
@@ -389,7 +698,7 @@ fn a_wrong_token_is_rejected() {
     let ctx = ctx_with(seeded_config());
     let wrong = "f".repeat(64);
 
-    let resp = handle(&ctx, &req("GET", "/api/v1/health", Some(&wrong), ""));
+    let resp = call(&ctx, &req("GET", "/api/v1/health", Some(&wrong), ""));
     assert_eq!(resp.status, 401);
 }
 
@@ -398,7 +707,7 @@ fn health_reports_the_feed_schema() {
     let _home = HomeSandbox::new();
     let ctx = ctx_with(seeded_config());
 
-    let resp = handle(&ctx, &req("GET", "/api/v1/health", Some(TOKEN), ""));
+    let resp = call(&ctx, &req("GET", "/api/v1/health", Some(TOKEN), ""));
     assert_eq!(resp.status, 200);
     let body = body_json(&resp);
     assert_eq!(body["ok"], serde_json::json!(true));
@@ -415,16 +724,16 @@ fn an_unknown_path_is_404_and_a_wrong_method_is_405() {
     let ctx = ctx_with(seeded_config());
 
     assert_eq!(
-        handle(&ctx, &req("GET", "/api/v1/nope", Some(TOKEN), "")).status,
+        call(&ctx, &req("GET", "/api/v1/nope", Some(TOKEN), "")).status,
         404
     );
     assert_eq!(
-        handle(&ctx, &req("POST", "/api/v1/status", Some(TOKEN), "")).status,
+        call(&ctx, &req("POST", "/api/v1/status", Some(TOKEN), "")).status,
         405,
         "a known path with the wrong verb says which half is wrong"
     );
     assert_eq!(
-        handle(&ctx, &req("GET", "/api/v1/switch", Some(TOKEN), "")).status,
+        call(&ctx, &req("GET", "/api/v1/switch", Some(TOKEN), "")).status,
         405
     );
 }
@@ -439,14 +748,14 @@ fn a_lowercase_verb_is_a_method_error_not_a_silent_match() {
     let _home = HomeSandbox::new();
     let ctx = ctx_with(seeded_config());
 
-    let resp = handle(&ctx, &req("get", "/api/v1/status", Some(TOKEN), ""));
+    let resp = call(&ctx, &req("get", "/api/v1/status", Some(TOKEN), ""));
     assert_eq!(resp.status, 405);
     assert_eq!(
         body_json(&resp)["error"],
         serde_json::json!("method_not_allowed")
     );
 
-    let control = handle(&ctx, &req("GET", "/api/v1/status", Some(TOKEN), ""));
+    let control = call(&ctx, &req("GET", "/api/v1/status", Some(TOKEN), ""));
     assert_eq!(control.status, 200, "the uppercase spelling still serves");
 }
 
@@ -463,16 +772,16 @@ fn head_routes_like_get_at_the_router() {
     let _home = HomeSandbox::new();
     let ctx = ctx_with(seeded_config());
 
-    let resp = handle(&ctx, &req("HEAD", "/api/v1/health", Some(TOKEN), ""));
+    let resp = call(&ctx, &req("HEAD", "/api/v1/health", Some(TOKEN), ""));
     assert_eq!(resp.status, 200);
 
-    let status = handle(&ctx, &req("HEAD", "/api/v1/status", Some(TOKEN), ""));
+    let status = call(&ctx, &req("HEAD", "/api/v1/status", Some(TOKEN), ""));
     assert_eq!(status.status, 200);
 
     // The disabled-accounts query is a GET arm too: its HEAD keeps the ETag a
     // conditional client re-arms from, and a matching If-None-Match answers
     // 304 with the tag.
-    let tagged = handle(&ctx, &req("HEAD", "/api/v1/status?all=1", Some(TOKEN), ""));
+    let tagged = call(&ctx, &req("HEAD", "/api/v1/status?all=1", Some(TOKEN), ""));
     assert_eq!(tagged.status, 200);
     let etag = tagged
         .etag
@@ -481,7 +790,7 @@ fn head_routes_like_get_at_the_router() {
         .to_string();
     let mut conditional = req_tagged("/api/v1/status?all=1", Some(TOKEN), &etag);
     conditional.method = "HEAD".to_string();
-    let not_modified = handle(&ctx, &conditional);
+    let not_modified = call(&ctx, &conditional);
     assert_eq!(not_modified.status, 304);
     assert!(not_modified.etag.is_some(), "the 304 repeats the tag");
 }
@@ -499,14 +808,14 @@ fn only_the_api_v1_prefix_is_served() {
 
     for path in ["/v1/health", "/v1/status", "/health", "/api/health"] {
         assert_eq!(
-            handle(&ctx, &req("GET", path, Some(TOKEN), "")).status,
+            call(&ctx, &req("GET", path, Some(TOKEN), "")).status,
             404,
             "{path} is outside the prefix and must not be served"
         );
     }
 
     assert_eq!(
-        handle(
+        call(
             &ctx,
             &req(
                 "GET",
@@ -549,7 +858,7 @@ fn all_equals_one_reads_the_live_stores_not_a_file_mtime() {
         .insert("beta".to_string(), crate::usage::FetchStatus::AuthExpired);
     let ctx = ctx_with_live(seeded_config(), live);
 
-    let resp = handle(&ctx, &req("GET", "/api/v1/status?all=1", Some(TOKEN), ""));
+    let resp = call(&ctx, &req("GET", "/api/v1/status?all=1", Some(TOKEN), ""));
     assert_eq!(resp.status, 200);
     let body = body_json(&resp);
     let entry = |name: &str| {
@@ -587,7 +896,7 @@ fn status_serves_the_on_disk_feed_verbatim() {
     std::fs::write(&ctx.status_path, feed).expect("seed feed");
     let _ = home;
 
-    let resp = handle(&ctx, &req("GET", "/api/v1/status", Some(TOKEN), ""));
+    let resp = call(&ctx, &req("GET", "/api/v1/status", Some(TOKEN), ""));
     assert_eq!(resp.status, 200);
     assert_eq!(
         String::from_utf8_lossy(&resp.body),
@@ -604,7 +913,7 @@ fn status_falls_back_to_a_built_body_when_the_feed_is_missing() {
     let ctx = ctx_with(seeded_config());
     assert!(!ctx.status_path.exists());
 
-    let resp = handle(&ctx, &req("GET", "/api/v1/status", Some(TOKEN), ""));
+    let resp = call(&ctx, &req("GET", "/api/v1/status", Some(TOKEN), ""));
     assert_eq!(resp.status, 200);
     let body = body_json(&resp);
     assert_eq!(body["active_profile"], serde_json::json!("alpha"));
@@ -630,11 +939,8 @@ fn all_reveals_disabled_accounts_that_the_plain_feed_hides() {
     }
     let ctx = ctx_with(config);
 
-    let plain = body_json(&handle(
-        &ctx,
-        &req("GET", "/api/v1/status", Some(TOKEN), ""),
-    ));
-    let all = body_json(&handle(
+    let plain = body_json(&call(&ctx, &req("GET", "/api/v1/status", Some(TOKEN), "")));
+    let all = body_json(&call(
         &ctx,
         &req("GET", "/api/v1/status?all=1", Some(TOKEN), ""),
     ));
@@ -663,26 +969,26 @@ fn the_all_query_is_tagged_and_answers_304_to_a_matching_tag() {
     let config = seeded_config();
     let ctx = ctx_with(std::sync::Arc::clone(&config));
 
-    let first = handle(&ctx, &req("GET", "/api/v1/status?all=1", Some(TOKEN), ""));
+    let first = call(&ctx, &req("GET", "/api/v1/status?all=1", Some(TOKEN), ""));
     assert_eq!(first.status, 200);
     let tag = first
         .etag
         .clone()
         .expect("the ?all body carries an entity tag");
 
-    let second = handle(&ctx, &req_tagged("/api/v1/status?all=1", Some(TOKEN), &tag));
+    let second = call(&ctx, &req_tagged("/api/v1/status?all=1", Some(TOKEN), &tag));
     assert_eq!(second.status, 304, "an unchanged roster is not resent");
     assert_eq!(second.etag.as_deref(), Some(tag.as_str()));
 
     // The feed moves: the active account changes, so the body a reader could
     // act on changes with it.
     config.lock().expect("config").state.active_profile = Some("beta".into());
-    let third = handle(&ctx, &req_tagged("/api/v1/status?all=1", Some(TOKEN), &tag));
+    let third = call(&ctx, &req_tagged("/api/v1/status?all=1", Some(TOKEN), &tag));
     assert_eq!(third.status, 200, "a moved feed is answered, not 304'd");
     let moved = third.etag.clone().expect("a 200 carries an entity tag");
     assert_ne!(moved, tag, "and the feed's move is visible in the tag");
 
-    let fourth = handle(
+    let fourth = call(
         &ctx,
         &req_tagged("/api/v1/status?all=1", Some(TOKEN), &moved),
     );
@@ -697,7 +1003,7 @@ fn switch_relinks_and_reports_the_previous_account() {
     let config = seeded_config();
     let ctx = ctx_with(std::sync::Arc::clone(&config));
 
-    let resp = handle(
+    let resp = call(
         &ctx,
         &req(
             "POST",
@@ -731,7 +1037,7 @@ fn switch_resolves_the_name_case_insensitively() {
     let _home = HomeSandbox::new();
     let ctx = ctx_with(seeded_config());
 
-    let resp = handle(
+    let resp = call(
         &ctx,
         &req(
             "POST",
@@ -750,7 +1056,7 @@ fn switch_to_an_unknown_profile_is_404_and_changes_nothing() {
     let config = seeded_config();
     let ctx = ctx_with(std::sync::Arc::clone(&config));
 
-    let resp = handle(
+    let resp = call(
         &ctx,
         &req(
             "POST",
@@ -789,7 +1095,7 @@ fn switch_to_a_disabled_profile_is_refused() {
     }
     let ctx = ctx_with(std::sync::Arc::clone(&config));
 
-    let resp = handle(
+    let resp = call(
         &ctx,
         &req(
             "POST",
@@ -816,7 +1122,7 @@ fn a_malformed_switch_body_is_400() {
     let ctx = ctx_with(seeded_config());
 
     for body in ["", "{}", "not json", r#"{"profile":7}"#] {
-        let resp = handle(&ctx, &req("POST", "/api/v1/switch", Some(TOKEN), body));
+        let resp = call(&ctx, &req("POST", "/api/v1/switch", Some(TOKEN), body));
         assert_eq!(resp.status, 400, "body {body:?}");
     }
 }
@@ -845,7 +1151,7 @@ fn a_second_concurrent_switch_is_refused_immediately() {
         });
         held_rx.recv().expect("gate taken");
 
-        let resp = handle(
+        let resp = call(
             &ctx,
             &req(
                 "POST",
@@ -884,7 +1190,7 @@ fn a_poisoned_gate_does_not_wedge_the_switch_route() {
     }));
     assert!(poisoned.is_err(), "precondition: the closure panicked");
 
-    let resp = handle(
+    let resp = call(
         &ctx,
         &req(
             "POST",
@@ -963,7 +1269,7 @@ fn a_switch_to_a_clock_expired_target_does_not_invert_the_lock_order() {
     }
     let ctx = ctx_with(std::sync::Arc::clone(&config));
 
-    let resp = handle(
+    let resp = call(
         &ctx,
         &req(
             "POST",
@@ -1007,7 +1313,7 @@ fn a_failed_switch_reflects_no_home_path() {
     .expect("pose the wedge");
     let ctx = ctx_with(std::sync::Arc::clone(&config));
 
-    let resp = handle(
+    let resp = call(
         &ctx,
         &req(
             "POST",
@@ -1066,7 +1372,7 @@ fn a_failed_switchs_context_reaches_the_log_but_not_the_body() {
     let lines = crate::logline::LogLines::new();
     let _capture = lines.capture_here();
     let ctx = ctx_with(std::sync::Arc::clone(&config));
-    let resp = handle(
+    let resp = call(
         &ctx,
         &req(
             "POST",
@@ -1120,7 +1426,7 @@ fn a_refused_switch_reflects_the_authored_sentence() {
     }
     let ctx = ctx_with(std::sync::Arc::clone(&config));
 
-    let resp = handle(
+    let resp = call(
         &ctx,
         &req(
             "POST",
@@ -1161,7 +1467,7 @@ fn a_target_vanishing_mid_switch_answers_refused_not_failed() {
     }
     let ctx = ctx_with(std::sync::Arc::clone(&config));
 
-    let resp = handle(
+    let resp = call(
         &ctx,
         &req(
             "POST",
@@ -1201,7 +1507,7 @@ fn a_state_lock_timeout_is_503_with_a_path_free_reason() {
     holder.lock().expect("hold the flock");
     crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(100)));
 
-    let resp = handle(
+    let resp = call(
         &ctx,
         &req(
             "POST",
@@ -1227,66 +1533,67 @@ fn a_state_lock_timeout_is_503_with_a_path_free_reason() {
     );
 }
 
-/// `--rotate-token` has to revoke against a RUNNING daemon.
-///
-/// `api::spawn` read the token once into `ApiContext` and nothing re-read it, so
-/// a rotation left the live daemon accepting the old token and 401ing the new
-/// one until restart — the opposite of what `--help`, `wiki/Daemon.md` and
-/// `SECURITY.md` all promise, on the one control that answers a leaked bearer.
+// --------------------------------------------------------------- audit
+
+/// RE-1: the switch's own line names the device that asked.
 #[test]
-fn rotating_the_token_revokes_the_old_one_against_a_live_context() {
+fn a_switch_line_names_the_device() {
     let _home = HomeSandbox::new();
-    let old = crate::daemon::api::token::load_or_create().expect("mint");
-    // The context captures the token exactly as `api::spawn` does.
     let ctx = ctx_with(seeded_config());
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
 
-    let health =
-        |bearer: &str| handle(&ctx, &req("GET", "/api/v1/health", Some(bearer), "")).status;
-    assert_eq!(health(&old), 200, "precondition: the minted token works");
-
-    let new = crate::daemon::api::token::rotate().expect("rotate");
-    assert_ne!(
-        new, old,
-        "precondition: rotation produced a different token"
+    let resp = call(
+        &ctx,
+        &req(
+            "POST",
+            "/api/v1/switch",
+            Some(TOKEN),
+            r#"{"profile":"beta"}"#,
+        ),
     );
-
-    assert_eq!(health(&new), 200, "the new token works without a restart");
-    assert_eq!(health(&old), 401, "and the old one is revoked");
+    assert_eq!(resp.status, 200);
+    assert!(
+        lines
+            .snapshot()
+            .contains(&"clauth api: device 'test' switched to 'beta'".to_string()),
+        "{:#?}",
+        lines.snapshot()
+    );
 }
 
-/// The fallback that keeps a broken deployment serving: an unreadable token file
-/// leaves the daemon on the token it started with rather than 401ing every
-/// client, which would be a worse failure than the one it guards against.
 #[test]
-fn an_unreadable_token_file_keeps_the_spawn_time_token() {
+fn a_refused_switch_line_names_the_device() {
     let _home = HomeSandbox::new();
-    // `ctx_with` seeds the context the way `api::spawn` does, with TOKEN.
-    let ctx = ctx_with(seeded_config());
-    let minted = crate::daemon::api::token::load_or_create().expect("mint");
-    let health =
-        |bearer: &str| handle(&ctx, &req("GET", "/api/v1/health", Some(bearer), "")).status;
+    let config = seeded_config();
+    {
+        let mut cfg = config.lock().expect("config");
+        let beta = cfg
+            .find_mut(&crate::profile::ProfileName::from("beta"))
+            .expect("beta");
+        beta.disabled = true;
+        save_profile(beta).expect("save");
+    }
+    let ctx = ctx_with(std::sync::Arc::clone(&config));
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
 
-    // While the file is readable it is authoritative, so it displaces the
-    // spawn-time token entirely — that is what makes rotation take effect.
-    assert_eq!(
-        health(&minted),
-        200,
-        "precondition: the file's token is live"
+    let resp = call(
+        &ctx,
+        &req(
+            "POST",
+            "/api/v1/switch",
+            Some(TOKEN),
+            r#"{"profile":"beta"}"#,
+        ),
     );
-    assert_eq!(
-        health(TOKEN),
-        401,
-        "precondition: it displaced the spawn token"
-    );
-
-    let path = crate::profile::clauth_dir()
-        .expect("dir")
-        .join("auth_token.json");
-    std::fs::write(&path, b"{ not json").expect("corrupt the file");
-
-    assert_eq!(
-        health(TOKEN),
-        200,
-        "a corrupt file falls back to the spawn-time token, not a lockout"
+    assert_eq!(resp.status, 409);
+    assert!(
+        lines
+            .snapshot()
+            .iter()
+            .any(|line| line.starts_with("clauth api: device 'test' switch to 'beta' refused: ")),
+        "{:#?}",
+        lines.snapshot()
     );
 }

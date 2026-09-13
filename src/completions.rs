@@ -14,7 +14,7 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
     if [ "$COMP_CWORD" -eq 1 ]; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
-        COMPREPLY=( $(compgen -W "${profiles} start login capture delete disable enable rolling-token static-token which list jobs sessions resume info daemon status mcp herdr completions --theme" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "${profiles} start login capture delete disable enable rolling-token static-token which list jobs sessions resume info daemon devices status mcp herdr completions --theme" -- "${cur}") )
     elif [ "$prev" = "--theme" ]; then
         COMPREPLY=( $(compgen -W "full compatible" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "login" ] && [ "${cur:0:2}" = "--" ]; then
@@ -22,7 +22,7 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
     elif [ "${COMP_WORDS[1]}" = "start" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--isolated --with-fallback" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "daemon" ] && [ "${cur:0:2}" = "--" ]; then
-        COMPREPLY=( $(compgen -W "--standby --no-standby --replace --status --listen --cert --key --print-token --rotate-token" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "--standby --no-standby --replace --status --listen --cert --key" -- "${cur}") )
     elif [ "$prev" = "--isolated" ] || [ "$prev" = "--with-fallback" ] || [ "$prev" = "--profile" ]; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
@@ -37,6 +37,10 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
         COMPREPLY=( $(compgen -W "--json --tokens" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "jobs" ]; then
         COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
+    elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "devices" ]; then
+        COMPREPLY=( $(compgen -W "pair add revoke --json" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "devices" ] && { [ "${COMP_WORDS[2]}" = "pair" ] || [ "${COMP_WORDS[2]}" = "add" ]; } && [ "${cur:0:2}" = "--" ]; then
+        COMPREPLY=( $(compgen -W "--control" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "herdr" ]; then
         COMPREPLY=( $(compgen -W "install uninstall config" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 3 ] && [ "${COMP_WORDS[1]}" = "herdr" ] && [ "${COMP_WORDS[2]}" = "config" ]; then
@@ -87,6 +91,7 @@ _clauth() {
             'resume[resume a session under a chosen profile]' \
             'info[print resume command + storage path for a session]' \
             'daemon[run the headless scheduler with no TUI]' \
+            'devices[pair, list and revoke the devices that may call the REST API]' \
             'status[print the usage / auto-switch snapshot as JSON]' \
             'mcp[run the stdio MCP server]' \
             'herdr[install the herdr plugin and bind a key to it]' \
@@ -120,6 +125,13 @@ _clauth() {
         _values 'flag' '--key[key that opens the dashboard]' '--no-config[leave herdr'"'"'s config.toml alone]' '--yes[skip both confirm prompts]' '-y[skip both confirm prompts]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == herdr && "${words[3]}" == uninstall ]]; then
         _values 'flag' '--no-config[leave herdr'"'"'s config.toml alone]' '--yes[skip both confirm prompts]' '-y[skip both confirm prompts]'
+    elif (( CURRENT == 3 )) && [[ "${words[2]}" == devices ]]; then
+        _values 'subcommand' 'pair[print a one-time pairing code and wait for it]' \
+            'add[mint a token for a device here and print it once]' \
+            'revoke[remove a device]'
+        _values 'flag' '--json[emit the device list as JSON]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == devices && "${words[3]}" == (pair|add) ]]; then
+        _values 'flag' '--control[the device may switch accounts, not only read]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == which ]]; then
         _values 'flag' '--json[emit JSON instead of plain name]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == sessions ]]; then
@@ -145,9 +157,7 @@ _clauth() {
             '--status[print the running daemon, or exit 1 when none is]' \
             '--listen[also serve the REST API over TLS, default 0.0.0.0:8443]' \
             '--cert[serve this certificate instead of the lego one; needs --key]' \
-            '--key[private key for --cert]' \
-            '--print-token[print the REST API auth token and exit]' \
-            '--rotate-token[replace the REST API auth token and exit]'
+            '--key[private key for --cert]'
     elif (( CURRENT >= 3 )) && [[ "${words[2]}" == status ]]; then
         _values 'flag' '--json[print the status snapshot as JSON]' '--all[also list disabled profiles]' '--disabled[also list disabled profiles]'
     elif (( CURRENT >= 3 )) && [[ "${words[2]}" == list ]]; then
@@ -178,6 +188,7 @@ complete -c clauth -f -n __fish_is_first_token -a resume -d "Resume a session un
 complete -c clauth -f -n __fish_is_first_token -a info -d "Print resume command + storage path"
 complete -c clauth -f -n __fish_is_first_token -a completions -d "Emit shell completion script"
 complete -c clauth -f -n __fish_is_first_token -a daemon -d "Run the headless scheduler with no TUI"
+complete -c clauth -f -n __fish_is_first_token -a devices -d "Pair, list and revoke the devices that may call the REST API"
 complete -c clauth -f -n __fish_is_first_token -a status -d "Print the usage / auto-switch snapshot as JSON"
 complete -c clauth -f -n __fish_is_first_token -a mcp -d "Run the stdio MCP server"
 complete -c clauth -f -n __fish_is_first_token -a herdr -d "Install the herdr plugin, read its knobs, or uninstall it"
@@ -222,8 +233,11 @@ complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --status -d "Pr
 complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --listen -d "Also serve the REST API over TLS, default 0.0.0.0:8443"
 complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --cert -d "Serve this certificate instead of the lego one; needs --key"
 complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --key -d "Private key for --cert"
-complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --print-token -d "Print the REST API auth token and exit"
-complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --rotate-token -d "Replace the REST API auth token and exit"
+complete -c clauth -f -n "__fish_seen_subcommand_from devices" -a pair -d "Print a one-time pairing code and wait for it"
+complete -c clauth -f -n "__fish_seen_subcommand_from devices" -a add -d "Mint a token for a device here and print it once"
+complete -c clauth -f -n "__fish_seen_subcommand_from devices" -a revoke -d "Remove a device"
+complete -c clauth -f -n "__fish_seen_subcommand_from devices" -a --json -d "Emit the device list as JSON"
+complete -c clauth -f -n "__fish_seen_subcommand_from devices; and __fish_seen_subcommand_from pair add" -a --control -d "The device may switch accounts, not only read"
 "#;
 
 /// The placeholder each script carries where its `login` flag list goes; the

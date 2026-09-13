@@ -237,7 +237,7 @@ fn api_enabled() -> bool {
 
 /// `serve`'s listener decision, extracted because it is the REST kill switch's
 /// call site: `Some(addr)` under `CLAUTH_NO_API=1` must yield `no_api`, never a
-/// prepared listener. The prepare arm reads the certificate; the token mint and
+/// prepared listener. The prepare arm reads the certificate; the legacy import and
 /// the bind itself run later, below the claim, in `api::serve_prepared`.
 fn listener_setup(
     listen: Option<SocketAddr>,
@@ -277,11 +277,11 @@ pub(crate) fn serve(
     // because the claim is what terminates the incumbent under `--replace`.
     // Failing after it would leave the host with no daemon at all: no refresh,
     // no auto-switch, not merely no listener. Nothing else settles here: the
-    // token mint and the bind deliberately do NOT run above the claim — both
+    // legacy import and the bind deliberately do NOT run above the claim — both
     // live in `api::serve_prepared`, below it (and below a standby's
     // promotion), where the incumbent's port is free, a redundant instance
     // never reaches them, and a start that dies cannot have written
-    // `auth_token.json`.
+    // `devices.json` or deleted `auth_token.json`.
     let (mut prepared, no_api) = listener_setup(listen, certs)?;
 
     // Single-instance guard, claimed BEFORE any shared-tree work below: a
@@ -332,7 +332,7 @@ pub(crate) fn serve(
     // After `boot` (the stores are seeded and the scheduler is up, so a request
     // arriving immediately gets real numbers) and before `run` (which never
     // returns). The certificate was settled by `api::prepare` above the claim
-    // (a promoted standby re-read it right after its promotion); the token mint
+    // (a promoted standby re-read it right after its promotion); the legacy import
     // and the bind happen here for the first time, on a port that is winnable
     // exactly now: the incumbent under `--replace` is dead, and a promoted
     // standby holds the claim it parked for.

@@ -1,27 +1,34 @@
-//! Route table: read the feed, switch the account, clone the accounts. Nothing
-//! else.
+//! The route table and the one capability check.
 //!
-//! The narrow surface is the design. A switch is the one mutation the daemon
-//! already performs unattended, so exposing it adds no capability the fallback
-//! chain does not have; everything that needs a human — a diverged live login,
-//! an unprovable identity — is refused here exactly as it is refused for the
-//! scheduler and the MCP tool, and the TUI stays the only place to resolve it.
+//! Every route is a row of [`ROUTES`] carrying the access it needs, and
+//! [`handle`] reads that table for dispatch and for the check alike, so no
+//! route is served outside it or reached without its check. The surface is
+//! narrow on purpose: read the feed, switch the account, redeem a pairing
+//! code. A switch is the one mutation the daemon already performs unattended,
+//! so exposing it adds no capability the fallback chain does not have;
+//! everything that needs a human (a diverged live login, an unprovable
+//! identity) is refused here exactly as it is refused for the scheduler and
+//! the MCP tool, and the TUI stays the only place to resolve it.
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use sha2::Digest as _;
 
 use crate::actions::{SwitchError, switch_profile_noninteractive};
 use crate::daemon::build_status;
+use crate::lock::StateLockTimeout;
 use crate::lockorder::{RankedMutex, rank};
 use crate::logline::logline;
 use crate::oauth;
 use crate::profile::ConfigHandle;
 
+use super::devices::{self, Device, Tier};
 use super::http::{Request, Response, flatten_control_chars, sanitize_for_log};
-use super::token::AuthToken;
+use super::pairing::{self, Code, Redeemed};
 
 /// Every route lives under this prefix, and it is spelled once.
 ///
@@ -32,12 +39,101 @@ use super::token::AuthToken;
 /// the point of the constant — the route table below matches on the remainder.
 pub(crate) const API_PREFIX: &str = "/api/v1";
 
+/// What a route asks of its caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Access {
+    /// No bearer at all: the pairing redemption, the one route a device
+    /// reaches before it holds a token.
+    None,
+    /// Any paired device.
+    View,
+    /// A device paired with control.
+    Control,
+}
+
+/// One row of [`ROUTES`].
+pub(crate) struct Route {
+    pub(crate) method: &'static str,
+    /// The path under [`API_PREFIX`].
+    pub(crate) path: &'static str,
+    pub(crate) access: Access,
+    handler: fn(&ApiContext, &Request, &Caller<'_>) -> Response,
+}
+
+/// Every route the API serves. A path in no row is 404 and a known path with
+/// the wrong method 405.
+///
+/// The HEAD rows serve their GET handler (RFC 9110 §9.3: the server SHOULD
+/// respond as it would to GET, minus the content); the serve loop in `mod.rs`
+/// strips the body off whatever comes back, at every status.
+pub(crate) static ROUTES: &[Route] = &[
+    Route {
+        method: "GET",
+        path: "/health",
+        access: Access::View,
+        handler: health,
+    },
+    Route {
+        method: "HEAD",
+        path: "/health",
+        access: Access::View,
+        handler: health,
+    },
+    Route {
+        method: "GET",
+        path: "/status",
+        access: Access::View,
+        handler: status,
+    },
+    Route {
+        method: "HEAD",
+        path: "/status",
+        access: Access::View,
+        handler: status,
+    },
+    Route {
+        method: "POST",
+        path: "/switch",
+        access: Access::Control,
+        handler: switch,
+    },
+    Route {
+        method: "POST",
+        path: "/pair",
+        access: Access::None,
+        handler: pair,
+    },
+];
+
+/// Who a handler is answering.
+pub(crate) struct Caller<'a> {
+    pub(crate) peer: SocketAddr,
+    /// The device the bearer authenticated as; `None` exactly on an
+    /// [`Access::None`] route, which reads no bearer.
+    pub(crate) device: Option<&'a Device>,
+}
+
+impl Caller<'_> {
+    /// The device's name as it may appear in a log line.
+    fn device_for_log(&self) -> String {
+        self.device
+            .map_or_else(|| "-".to_string(), |device| sanitize_for_log(&device.name))
+    }
+}
+
+/// An answer, and the device it went to: the serve loop names the device in
+/// its per-request line and closes a connection no device earned.
+pub(crate) struct Handled {
+    pub(crate) response: Response,
+    /// `None` for an unauthenticated request and for the pairing redemption.
+    pub(crate) device: Option<String>,
+}
+
 /// Everything a request handler is allowed to touch.
 pub(crate) struct ApiContext {
     pub(crate) config: ConfigHandle,
     /// `~/.clauth/status.json` — the feed the main loop rewrites each tick.
     pub(crate) status_path: PathBuf,
-    pub(crate) token: AuthToken,
     /// One in-flight `POST /api/v1/switch` at a time. See [`rank::ApiSwitch`].
     pub(crate) switch_gate: RankedMutex<(), rank::ApiSwitch>,
     /// The scheduler's in-memory signals, when a daemon built this context.
@@ -55,77 +151,132 @@ impl ApiContext {
     pub(crate) fn new(
         config: ConfigHandle,
         status_path: PathBuf,
-        token: AuthToken,
         live: Option<crate::daemon::LiveStores>,
     ) -> Arc<Self> {
         Arc::new(Self {
             config,
             status_path,
-            token,
             switch_gate: RankedMutex::new(()),
             live,
         })
     }
 }
 
-/// Authenticate, then dispatch. Every route requires the bearer token,
-/// including health: an unauthenticated caller still learns the daemon is alive
-/// (it answers 401 rather than refusing the connection), which is all a liveness
-/// probe needs, and nothing else leaks — not the version, not an account name.
-pub(crate) fn handle(ctx: &ApiContext, req: &Request) -> Response {
-    // One-shot latch for the 500 arm below: the read runs per request, so an
-    // unlatched line would be one line per request for the daemon's life.
-    static READ_FAILED_NOTED: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
-    // Against the token as it is on disk NOW, not the one captured at spawn, so
-    // `clauth daemon --rotate-token` takes effect against a running daemon. An
-    // unknown tier written by a newer build is the one read that refuses rather
-    // than falling back — see `token::current_or`.
-    let live = match crate::daemon::api::token::current_or(&ctx.token) {
-        Ok(live) => live,
-        Err(ref e)
-            if e.downcast_ref::<crate::daemon::api::token::UnknownTier>()
-                .is_some() =>
-        {
-            return Response::error(503, "token_tier_unknown");
+/// The reason every failed pairing redemption carries, whatever failed.
+const PAIRING_REFUSED: &str = "that code did not pair a device: check it, or run `clauth devices \
+                               pair <name>` on the host for a new one";
+/// The reason a view-only device gets from a route that needs control.
+const CONTROL_REQUIRED: &str = "this device is paired view-only; this needs a device paired with \
+                                `clauth devices pair <name> --control` on the host";
+/// The reason a device with a tier this build does not know gets everywhere.
+const TIER_UNKNOWN: &str = "this device was paired by a newer clauth with a tier this one does \
+                            not know; run that clauth, or revoke the device and pair it again";
+
+/// Resolve the route, authenticate, check the route's access, dispatch.
+///
+/// Authentication runs before the path is judged, an unknown path included, so
+/// an unpaired caller learns nothing past a 401 about which paths exist. The
+/// pairing redemption is the one route that reads no bearer, since a device
+/// holds none until it succeeds.
+pub(crate) fn handle(ctx: &ApiContext, req: &Request, peer: SocketAddr) -> Handled {
+    // One-shot latches: the store is read per request, so an unlatched line
+    // would be one line per request for the daemon's life.
+    static READ_FAILED_NOTED: AtomicBool = AtomicBool::new(false);
+    static UNKNOWN_TIER_NOTED: AtomicBool = AtomicBool::new(false);
+
+    let path = req.path.strip_prefix(API_PREFIX);
+    let route = path.and_then(|path| {
+        ROUTES
+            .iter()
+            .find(|route| route.method == req.method && route.path == path)
+    });
+    if let Some(route) = route
+        && route.access == Access::None
+    {
+        return Handled {
+            response: (route.handler)(ctx, req, &Caller { peer, device: None }),
+            device: None,
+        };
+    }
+
+    let device = match devices::authenticate(req.bearer.as_deref()) {
+        Ok(Some(device)) => device,
+        Ok(None) => {
+            return Handled {
+                response: Response::unauthorized(),
+                device: None,
+            };
         }
         Err(e) => {
-            // The per-request summary line names the route and status only, so
-            // the cause has to be carried by this one line or nowhere.
-            if !READ_FAILED_NOTED.swap(true, std::sync::atomic::Ordering::AcqRel) {
-                logline!(
-                    "clauth api: refusing every request until the token file is readable: {e:#}"
-                );
+            // The per-request line names the route and status only, so the
+            // cause has to be carried by this one line or nowhere.
+            if !READ_FAILED_NOTED.swap(true, Ordering::AcqRel) {
+                logline!("clauth api: refusing every request until the device list reads: {e:#}");
             }
-            return Response::error(500, "internal");
+            return Handled {
+                response: Response::error(500, "internal"),
+                device: None,
+            };
         }
     };
-    if !req.bearer.as_deref().is_some_and(|t| live.verify(t)) {
-        return Response::unauthorized();
-    }
-    // Anything outside the prefix is 404 before the table is consulted, so the
-    // table itself never repeats the prefix and cannot drift from it.
-    let Some(route) = req.path.strip_prefix(API_PREFIX) else {
-        return Response::error(404, "not_found");
-    };
-    match (req.method.as_str(), route) {
-        ("GET", "/health") => health(),
-        ("HEAD", "/health") => health(),
-        ("GET", "/status") => status(ctx, req),
-        // HEAD routes as GET (RFC 9110 §9.3: the server SHOULD respond as it
-        // would to GET, minus the content); the serve loop in `mod.rs` strips
-        // the body off whatever comes back, at every status.
-        ("HEAD", "/status") => status(ctx, req),
-        ("POST", "/switch") => switch(ctx, req),
+
+    let response = match route {
+        Some(route) => match authorize(&device.tier, route.access) {
+            Grant::Allowed => (route.handler)(
+                ctx,
+                req,
+                &Caller {
+                    peer,
+                    device: Some(&device),
+                },
+            ),
+            Grant::NeedsControl => Response::refused(403, "control_required", CONTROL_REQUIRED),
+            Grant::TierUnknown => {
+                if !UNKNOWN_TIER_NOTED.swap(true, Ordering::AcqRel) {
+                    logline!(
+                        "clauth api: device '{}' carries tier {:?}, which this build does not \
+                         know, so every route refuses it; run the clauth that paired it",
+                        sanitize_for_log(&device.name),
+                        sanitize_for_log(device.tier.as_str())
+                    );
+                }
+                Response::refused(403, "device_tier_unknown", TIER_UNKNOWN)
+            }
+        },
         // A known path reached with the wrong method is 405, so a client with a
         // typo'd verb gets told which half is wrong.
-        (_, "/health" | "/status") => Response::error(405, "method_not_allowed"),
-        (_, "/switch") => Response::error(405, "method_not_allowed"),
-        _ => Response::error(404, "not_found"),
+        None if path.is_some_and(|path| ROUTES.iter().any(|route| route.path == path)) => {
+            Response::error(405, "method_not_allowed")
+        }
+        None => Response::error(404, "not_found"),
+    };
+    Handled {
+        response,
+        device: Some(device.name),
     }
 }
 
-fn health() -> Response {
+/// What [`authorize`] decided.
+enum Grant {
+    Allowed,
+    NeedsControl,
+    TierUnknown,
+}
+
+/// The one capability check, deny by default: every pairing of a tier with an
+/// access level is spelled out, so a new tier or access level does not compile
+/// until someone decides what it grants.
+fn authorize(tier: &Tier, access: Access) -> Grant {
+    match (tier, access) {
+        (_, Access::None)
+        | (Tier::Control, Access::View | Access::Control)
+        | (Tier::View, Access::View) => Grant::Allowed,
+        (Tier::View, Access::Control) => Grant::NeedsControl,
+        (Tier::Unknown(_), Access::View | Access::Control) => Grant::TierUnknown,
+    }
+}
+
+fn health(_: &ApiContext, _: &Request, _: &Caller<'_>) -> Response {
     Response::json(
         200,
         &serde_json::json!({
@@ -154,7 +305,7 @@ fn health() -> Response {
 /// `?all=1` never waits: it builds its body from config rather than the file,
 /// so there is no file to watch for it — but it is still conditional off its
 /// built body's tag, so a roster that has not moved answers 304.
-fn status(ctx: &ApiContext, req: &Request) -> Response {
+fn status(ctx: &ApiContext, req: &Request, _: &Caller<'_>) -> Response {
     let include_disabled = req.flag("all");
     if !include_disabled {
         let waited = req
@@ -305,7 +456,7 @@ struct SwitchBody {
 /// gate (never install credentials a refresh has rejected), the disabled-target
 /// refusal, and the divergence policy all live inside it, so this endpoint
 /// cannot drift into a weaker switch than the rest of clauth performs.
-fn switch(ctx: &ApiContext, req: &Request) -> Response {
+fn switch(ctx: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
     let Ok(parsed) = serde_json::from_slice::<SwitchBody>(&req.body) else {
         return Response::error(400, "bad_request");
     };
@@ -343,7 +494,10 @@ fn switch(ctx: &ApiContext, req: &Request) -> Response {
         oauth::refresh_result,
     ) {
         Ok((previous, active)) => {
-            logline!("clauth api: switched to '{active}'");
+            logline!(
+                "clauth api: device '{}' switched to '{active}'",
+                caller.device_for_log()
+            );
             // Republish NOW rather than leaving it to the next scheduler tick.
             // Every `GET /api/v1/status?wait=` is parked on this file's content, and
             // this is the daemon's own switch, so there is no other owner to
@@ -378,8 +532,9 @@ fn switch(ctx: &ApiContext, req: &Request) -> Response {
             // (`failed to publish /home/…/credentials.json`), and a body is
             // the one surface handed to a remote reader.
             logline!(
-                "clauth api: switch to '{canonical}' refused: {}",
-                sanitize_for_log(&flatten_control_chars(&format!("{e:#}")))
+                "clauth api: device '{}' switch to '{canonical}' refused: {}",
+                caller.device_for_log(),
+                sanitize_for_log(&format!("{e:#}"))
             );
             // A held state flock is the one retryable failure here: another
             // clauth process is mid-write, and the same request will work in a
@@ -406,6 +561,66 @@ fn switch(ctx: &ApiContext, req: &Request) -> Response {
                         Response::refused(500, "switch_failed", "the switch failed; see daemon.log")
                     }
                 }
+            }
+        }
+    }
+}
+
+/// The one field `POST /api/v1/pair` accepts.
+#[derive(serde::Deserialize)]
+struct PairBody {
+    code: String,
+}
+
+/// `POST /api/v1/pair` — redeem the live pairing code for a device token.
+///
+/// Every failed redemption (a wrong code, a spent one, an expired one, none
+/// live) answers the same `403 pairing_refused`, so a guesser learns nothing
+/// about the host's state from the answer. A body that holds no code at all is
+/// `400 bad_request` and costs no attempt: it is judged before the pairing is
+/// read. The token rides this one response and no log line.
+fn pair(_: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
+    let Some(code) = serde_json::from_slice::<PairBody>(&req.body)
+        .ok()
+        .and_then(|body| Code::normalize(&body.code))
+    else {
+        return Response::error(400, "bad_request");
+    };
+    match pairing::redeem(&code) {
+        Ok(Redeemed::Paired { name, tier, token }) => {
+            logline!(
+                "clauth api: {} paired device '{}' ({})",
+                caller.peer,
+                sanitize_for_log(&name),
+                sanitize_for_log(tier.as_str())
+            );
+            Response::json(
+                201,
+                &serde_json::json!({
+                    "ok": true,
+                    "name": name,
+                    "tier": tier.as_str(),
+                    "token": token,
+                }),
+            )
+        }
+        Ok(Redeemed::Refused) => Response::refused(403, "pairing_refused", PAIRING_REFUSED),
+        Err(e) => {
+            logline!(
+                "clauth api: {} pairing failed: {}",
+                caller.peer,
+                sanitize_for_log(&format!("{e:#}"))
+            );
+            match e
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<StateLockTimeout>())
+            {
+                Some(timeout) => Response::refused(
+                    503,
+                    "state_locked",
+                    &flatten_control_chars(&timeout.to_string()),
+                ),
+                None => Response::error(500, "internal"),
             }
         }
     }

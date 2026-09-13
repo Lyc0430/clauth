@@ -26,7 +26,8 @@ use std::time::Instant;
 
 /// Cap on the request line plus headers. A real request here is ~200 bytes.
 const MAX_HEAD_BYTES: usize = 8 * 1024;
-/// Cap on the body. The only body the API accepts is `{"profile":"<name>"}`.
+/// Cap on the body. The API's bodies are one short field each:
+/// `{"profile":"<name>"}` and `{"code":"<code>"}`.
 const MAX_BODY_BYTES: usize = 64 * 1024;
 /// Headers we are willing to parse before calling the request malformed.
 const MAX_HEADERS: usize = 32;
@@ -572,9 +573,11 @@ pub(crate) fn request_summary(method: &str, path: &str) -> String {
 fn reason_phrase(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        201 => "Created",
         304 => "Not Modified",
         400 => "Bad Request",
         401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         408 => "Request Timeout",
         405 => "Method Not Allowed",

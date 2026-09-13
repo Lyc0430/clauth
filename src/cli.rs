@@ -247,23 +247,23 @@ pub(crate) enum Command {
     ///
     /// Refreshes usage, auto-switches on exhaustion, and writes
     /// ~/.clauth/status.json. Exits at once when a daemon is already running.
-    /// `--listen` also serves the REST API (see the Daemon wiki page);
-    /// `--status`, `--print-token` and `--rotate-token` print and exit without
+    /// `--listen` also serves the REST API to the devices `clauth devices`
+    /// pairs (see the Daemon wiki page); `--status` prints and exits without
     /// running a scheduler.
     Daemon {
         /// Wait instead, and take over when the running daemon exits. For a
         /// launchd/systemd unit paired with a manual run.
-        #[arg(long, conflicts_with_all = ["no_standby", "replace", "status", "print_token", "rotate_token"])]
+        #[arg(long, conflicts_with_all = ["no_standby", "replace", "status"])]
         standby: bool,
         /// The default's explicit spelling, kept so a spawner or unit still
         /// passing it behaves unchanged.
-        #[arg(long, conflicts_with_all = ["replace", "status", "print_token", "rotate_token"])]
+        #[arg(long, conflicts_with_all = ["replace", "status"])]
         no_standby: bool,
         /// Terminate the running daemon and take over, for an in-place upgrade.
-        #[arg(long, conflicts_with_all = ["status", "print_token", "rotate_token"])]
+        #[arg(long, conflicts_with = "status")]
         replace: bool,
         /// Print the running daemon, or exit 1 with no output when none is.
-        #[arg(long, conflicts_with_all = ["listen", "print_token", "rotate_token"])]
+        #[arg(long, conflicts_with = "listen")]
         status: bool,
         /// Also serve the REST API over TLS; bare --listen means 0.0.0.0:8443
         ///
@@ -271,8 +271,8 @@ pub(crate) enum Command {
         /// another. TLS comes from this host's lego certificate — from
         /// /etc/lego/certificates on macOS and Linux, and from
         /// %AppData%\lego\certificates on Windows, either overridable in
-        /// ~/.clauth/tls.json. Every request needs the bearer token from
-        /// `--print-token`.
+        /// ~/.clauth/tls.json. Every request but a pairing needs a paired
+        /// device's token; see `clauth devices`.
         ///
         /// The value-less spelling binds every interface, matching what the
         /// flag is for — a client on another machine. It is the same exposure
@@ -283,7 +283,6 @@ pub(crate) enum Command {
             value_name = "ADDR:PORT",
             num_args = 0..=1,
             default_missing_value = DEFAULT_LISTEN,
-            conflicts_with_all = ["print_token", "rotate_token"],
         )]
         listen: Option<SocketAddr>,
         /// Serve this certificate instead of the host's lego certificate
@@ -296,31 +295,28 @@ pub(crate) enum Command {
         /// Both files are read as PEM. Given these, nothing else is consulted —
         /// not `hostname -f`, not the directory in ~/.clauth/tls.json, and no
         /// issuer file beside the certificate. Requires --key and --listen.
-        #[arg(
-            long,
-            value_name = "PATH",
-            requires = "key",
-            requires = "listen",
-            conflicts_with_all = ["print_token", "rotate_token"],
-        )]
+        #[arg(long, value_name = "PATH", requires = "key", requires = "listen")]
         cert: Option<PathBuf>,
         /// The private key for --cert (PKCS#8, PKCS#1 or SEC1)
-        #[arg(
-            long,
-            value_name = "PATH",
-            requires = "cert",
-            requires = "listen",
-            conflicts_with_all = ["print_token", "rotate_token"],
-        )]
+        #[arg(long, value_name = "PATH", requires = "cert", requires = "listen")]
         key: Option<PathBuf>,
-        /// Print the REST API's auth token, creating it on first use, and exit.
-        #[arg(long, conflicts_with = "rotate_token")]
-        print_token: bool,
-        /// Replace the REST API's auth token with a fresh one, print it, exit.
-        ///
-        /// Every client holding the old token starts getting 401s.
+    },
+
+    /// Pair, list, and revoke the devices that may call the REST API
+    ///
+    /// Every `clauth daemon --listen` request but a pairing authenticates as
+    /// one named device, and each device holds a tier fixed here, on this
+    /// machine: `view` reads the status feed, `control` may also switch
+    /// accounts.
+    /// Bare, it lists the devices. No token is ever printed back: clauth keeps
+    /// only a SHA-256 of each.
+    #[command(args_conflicts_with_subcommands = true)]
+    Devices {
+        /// Emit a JSON array instead of the table.
         #[arg(long)]
-        rotate_token: bool,
+        json: bool,
+        #[command(subcommand)]
+        cmd: Option<DevicesCommand>,
     },
 
     /// Print the usage / auto-switch snapshot as JSON
@@ -561,5 +557,45 @@ pub(crate) enum HerdrConfigCommand {
         /// Knob name: popup_width, pane_tag, tag_watch_secs, border_label,
         /// delegate_dot, delegate_row_text.
         key: String,
+    },
+}
+
+/// `clauth devices <cmd>`: the ways a device joins or leaves.
+#[derive(Subcommand, Debug)]
+pub(crate) enum DevicesCommand {
+    /// Print a one-time pairing code and wait until a device redeems it
+    ///
+    /// The code is 8 characters, valid for 5 minutes, used once, and dropped
+    /// after 5 wrong tries; a new `pair` replaces a code still waiting. The
+    /// device posts it to `POST /api/v1/pair` on this host's
+    /// `clauth daemon --listen` and gets its token in the answer. The code
+    /// prints alone on stdout and the wait reports on stderr; Ctrl-C withdraws
+    /// the code if it is still waiting.
+    Pair {
+        /// Name for the device: letters, digits and - _ . @ +.
+        name: String,
+        /// Pair it with control, which can switch accounts rather than only
+        /// read. Until the code is used, whoever enters it first gets control.
+        #[arg(long)]
+        control: bool,
+    },
+
+    /// Mint a token for a device on this machine and print it once
+    ///
+    /// For a client configured by hand. The token prints alone on stdout;
+    /// clauth keeps only its SHA-256 and cannot show it again.
+    Add {
+        /// Name for the device: letters, digits and - _ . @ +.
+        name: String,
+        /// Mint it with control, which can switch accounts rather than only
+        /// read.
+        #[arg(long)]
+        control: bool,
+    },
+
+    /// Remove a device; its next request is refused
+    Revoke {
+        /// Device to remove.
+        name: String,
     },
 }

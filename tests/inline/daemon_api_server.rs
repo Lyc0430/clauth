@@ -20,8 +20,8 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::process::Command;
 
+use crate::daemon::api::devices::Tier;
 use crate::daemon::api::routes::ApiContext;
-use crate::daemon::api::token::AuthToken;
 use crate::profile::{AppConfig, AppState};
 use crate::testutil::HomeSandbox;
 
@@ -47,13 +47,24 @@ fn client_config(ca_crt: &Path) -> Option<std::sync::Arc<rustls::ClientConfig>> 
     ))
 }
 
-fn ctx() -> std::sync::Arc<ApiContext> {
-    let config = std::sync::Arc::new(crate::lockorder::RankedMutex::new(AppConfig {
+/// The device [`TOKEN`] authenticates as.
+const DEVICE: &str = "tray";
+/// The bearer of a view-only device, which the tests that need one pair.
+const VIEW_TOKEN: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+fn empty_config() -> crate::profile::ConfigHandle {
+    std::sync::Arc::new(crate::lockorder::RankedMutex::new(AppConfig {
         state: AppState::default(),
         profiles: Vec::new(),
-    }));
+    }))
+}
+
+/// A context with [`TOKEN`] paired as the control device [`DEVICE`].
+fn ctx() -> std::sync::Arc<ApiContext> {
+    crate::daemon::api::devices::seed_for_tests(DEVICE, Tier::Control, TOKEN)
+        .expect("pair the fixture device");
     let status_path = crate::profile::clauth_dir().unwrap().join("status.json");
-    ApiContext::new(config, status_path, AuthToken::from_plaintext(TOKEN), None)
+    ApiContext::new(empty_config(), status_path, None)
 }
 
 /// The name the generated certificate is issued for, and the name the client
@@ -507,9 +518,10 @@ fn the_log_line_for_a_long_unauthenticated_path_is_bounded() {
         );
     });
 
-    // "clauth api: " (12) + a peer address (≤21) + " " + the summary (≤131:
-    // `http::LOG_TEXT_LIMIT` plus its "..." marker) + " -> 401" (7).
-    let bound = 12 + 21 + 1 + 131 + 7;
+    // "clauth api: " (12) + a peer address (≤21) + " - " (3, no device) + the
+    // summary (≤131: `http::LOG_TEXT_LIMIT` plus its "..." marker) + " -> 401"
+    // (7).
+    let bound = 12 + 21 + 3 + 131 + 7;
     let logged = lines.snapshot();
     let line = logged
         .iter()
@@ -1361,8 +1373,8 @@ fn a_tailnet_bind_refuses_on_reload_when_the_lego_certificate_is_gone() {
 /// `prepare` reads the certificate and binds nothing: the bind belongs below
 /// the singleton claim, where the port is winnable, so a
 /// prepared-but-not-yet-serving listener leaves its port answering
-/// `ConnectionRefused`. The token mint lives below the claim too — see the
-/// tests at the end of this file.
+/// `ConnectionRefused`. The legacy import lives below the claim too
+/// (`a_start_that_loses_its_port_imports_nothing`).
 #[test]
 fn prepare_leaves_the_port_unbound() {
     let _home = HomeSandbox::new();
@@ -1480,40 +1492,59 @@ fn a_failing_prepare_leaves_the_incumbent_alive_under_replace() {
     drop(incumbent);
 }
 
-// The token mint sits below the singleton claim: a `--listen` start that dies
-// on TLS preparation, or yields as redundant, must never write
-// `auth_token.json` — replacing a damaged file there revokes every client of
-// the running daemon from a start that served nothing. The byte comparisons
-// assert through `assert!` on purpose: a red must not print token bytes.
+// The legacy import sits below the singleton claim and below the bind. It is
+// the one write a listener's start makes to `~/.clauth`, so a `--listen` start
+// that dies on TLS preparation, yields as redundant, or loses its port must
+// leave `auth_token.json` and the device list exactly as it found them. The
+// byte comparisons assert through `assert!` on purpose: a red must not print
+// token bytes.
+
+/// A token a clauth from before pairing left behind, importable as it stands.
+const LEGACY_TOKEN: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
 
 /// `~/.clauth/auth_token.json` inside the sandbox.
-fn token_file() -> std::path::PathBuf {
+fn legacy_file() -> std::path::PathBuf {
     crate::profile::clauth_dir()
         .expect("dir")
         .join("auth_token.json")
 }
 
-/// Seed a well-formed fixture token — the identity a running incumbent was
-/// spawned with and its clients hold. Synthetic fixture bytes only; a bearer is
-/// a password, so nothing here renders one.
-fn seed_token(path: &Path, token: &str) {
-    crate::profile::mkdir_700(path.parent().expect("token parent")).expect("mkdir token parent");
+/// `~/.clauth/devices.json` inside the sandbox.
+fn device_list() -> std::path::PathBuf {
+    crate::profile::clauth_dir()
+        .expect("dir")
+        .join("devices.json")
+}
+
+/// Seed an importable `auth_token.json`, the file an upgrade finds. Synthetic
+/// fixture bytes only; a bearer is a password, so nothing here renders one.
+fn seed_legacy(token: &str) {
+    let path = legacy_file();
+    crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
     std::fs::write(
-        path,
+        &path,
         serde_json::json!({
             "schema": 1,
             "token": token,
-            "created_at": "synthetic-fixture",
+            "created_at": "2026-01-02T03:04:05+00:00",
             "tier": "control",
         })
         .to_string(),
     )
-    .expect("write the token fixture");
+    .expect("write the legacy fixture");
 }
 
-/// A health request answered by the INCUMBENT's context. Routes read the token
-/// file per request (`token::current_or`), so a replacement on disk is what
-/// flips which bearer verifies — the revocation these tests pin.
+/// The two files the import writes, as they stand now.
+fn snapshot() -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+    (
+        std::fs::read(legacy_file()).ok(),
+        std::fs::read(device_list()).ok(),
+    )
+}
+
+/// A health request answered by the INCUMBENT's context. Routes read the
+/// device list per request, so a list an import rewrote is what would flip
+/// which bearer verifies.
 fn health_status(ctx: &ApiContext, bearer: &str) -> u16 {
     routes::handle(
         ctx,
@@ -1526,7 +1557,9 @@ fn health_status(ctx: &ApiContext, bearer: &str) -> u16 {
             body: Vec::new(),
             keep_alive: false,
         },
+        std::net::SocketAddr::from(([127, 0, 0, 1], 1)),
     )
+    .response
     .status
 }
 
@@ -1552,29 +1585,21 @@ fn unreadable_certs(root: &Path) -> crate::daemon::api::tls::CertSource {
     })
 }
 
-/// A damaged `auth_token.json` must survive a contender whose certificate
-/// cannot be read. The mint used to run beside that certificate read, above the
-/// singleton claim, so the contender replaced the file on its way out and every
-/// client of the running daemon went 401 — the pin is the file's bytes and the
-/// incumbent's auth flip, not just the error.
+/// A contender whose certificate cannot be read imports nothing: the legacy
+/// file and the incumbent's device list stay byte-identical, and the
+/// incumbent's clients still verify.
 #[test]
-fn a_tls_failed_start_leaves_a_damaged_token_file_untouched() {
+fn a_tls_failed_start_imports_nothing() {
     let _home = HomeSandbox::new();
-    let path = token_file();
-    seed_token(&path, TOKEN);
+    seed_legacy(LEGACY_TOKEN);
     let incumbent = ctx();
     let _lock = incumbent_claim();
     // Held by the test, so a bind misplaced above the claim would fail on the
     // port before reaching the arm under test.
     let held = std::net::TcpListener::bind("127.0.0.1:0").expect("bind held port");
     let addr = held.local_addr().expect("addr");
+    let before = snapshot();
     assert_eq!(health_status(&incumbent, TOKEN), 200);
-    std::fs::write(&path, b"not json").expect("damage the token file");
-    assert_eq!(
-        health_status(&incumbent, TOKEN),
-        200,
-        "damaged disk state alone must fall back to the incumbent's spawn token"
-    );
 
     let err = crate::daemon::serve(
         crate::daemon::StartMode::ExitIfRunning,
@@ -1587,28 +1612,29 @@ fn a_tls_failed_start_leaves_a_damaged_token_file_untouched() {
         "the failure must be TLS preparation, not something later: {err:#}"
     );
     assert!(
-        std::fs::read(&path).expect("read the damaged file") == b"not json",
-        "a failed contender must leave the damaged token file byte-identical"
+        snapshot() == before,
+        "a failed contender must leave auth_token.json and the device list byte-identical"
     );
     assert_eq!(
         health_status(&incumbent, TOKEN),
         200,
         "the incumbent's clients must still verify after the failed start"
     );
+    assert_eq!(
+        health_status(&incumbent, LEGACY_TOKEN),
+        401,
+        "and nothing was imported"
+    );
 }
 
-/// No token file at all must stay that way: a file minted by a start that never
-/// serves is a credential nobody asked for.
+/// With no device list at all, a start that never served writes none.
 #[test]
-fn a_tls_failed_start_mints_no_token_when_none_exists() {
+fn a_tls_failed_start_writes_no_device_list() {
     let _home = HomeSandbox::new();
-    let path = token_file();
-    seed_token(&path, TOKEN);
-    let incumbent = ctx();
+    seed_legacy(LEGACY_TOKEN);
     let _lock = incumbent_claim();
     let held = std::net::TcpListener::bind("127.0.0.1:0").expect("bind held port");
     let addr = held.local_addr().expect("addr");
-    std::fs::remove_file(&path).expect("remove the token file");
 
     let err = crate::daemon::serve(
         crate::daemon::StartMode::ExitIfRunning,
@@ -1621,34 +1647,28 @@ fn a_tls_failed_start_mints_no_token_when_none_exists() {
         "{err:#}"
     );
     assert!(
-        !path.exists(),
-        "a contender that never served must not mint a token file"
+        !device_list().exists(),
+        "a contender that never served must not write a device list"
     );
-    assert_eq!(health_status(&incumbent, TOKEN), 200);
+    assert!(legacy_file().exists(), "nor spend the legacy file");
 }
 
-/// The redundant exit is a one-line yield to the holder — and under the old
-/// order the contender's only durable action was still a token replacement:
-/// the mint ran above the claim, before the contender knew it was redundant.
+/// The redundant exit is a one-line yield to the holder, and an import must
+/// not be the durable trace it leaves.
 #[test]
-fn a_redundant_start_leaves_a_damaged_token_file_untouched() {
+fn a_redundant_start_imports_nothing() {
     let _home = HomeSandbox::new();
     let certdir = tempfile::tempdir_in(_home.home()).expect("cert fixture dir");
     let Some((paths, _ca)) = generate_chain(certdir.path()).expect("fixture") else {
-        eprintln!(
-            "SKIPPED a_redundant_start_leaves_a_damaged_token_file_untouched: \
-             openssl is not usable here"
-        );
+        eprintln!("SKIPPED a_redundant_start_imports_nothing: openssl is not usable here");
         return;
     };
-    let path = token_file();
-    seed_token(&path, TOKEN);
+    seed_legacy(LEGACY_TOKEN);
     let incumbent = ctx();
     let _lock = incumbent_claim();
     let held = std::net::TcpListener::bind("127.0.0.1:0").expect("bind held port");
     let addr = held.local_addr().expect("addr");
-    assert_eq!(health_status(&incumbent, TOKEN), 200);
-    std::fs::write(&path, b"not json").expect("damage the token file");
+    let before = snapshot();
 
     let lines = crate::logline::LogLines::new();
     let _capture = lines.capture_here();
@@ -1666,10 +1686,122 @@ fn a_redundant_start_leaves_a_damaged_token_file_untouched() {
         "the contender must have reached the redundant-claim branch"
     );
     assert!(
-        std::fs::read(&path).expect("read the damaged file") == b"not json",
-        "a redundant start must leave the damaged token file byte-identical"
+        snapshot() == before,
+        "a redundant start must leave auth_token.json and the device list byte-identical"
     );
     assert_eq!(health_status(&incumbent, TOKEN), 200);
+}
+
+/// A start that loses its port dies at the bind, before the import: a listener
+/// that never existed must not spend the legacy file.
+#[test]
+fn a_start_that_loses_its_port_imports_nothing() {
+    let _home = HomeSandbox::new();
+    let certdir = tempfile::tempdir_in(_home.home()).expect("cert fixture dir");
+    let Some((paths, _ca)) = generate_chain(certdir.path()).expect("fixture") else {
+        eprintln!(
+            "SKIPPED a_start_that_loses_its_port_imports_nothing: openssl is not usable here"
+        );
+        return;
+    };
+    seed_legacy(LEGACY_TOKEN);
+    let held = std::net::TcpListener::bind("127.0.0.1:0").expect("bind held port");
+    let addr = held.local_addr().expect("addr");
+    let prepared = super::prepare(addr, &crate::daemon::api::tls::CertSource::Explicit(paths))
+        .expect("prepare reads the valid certificate");
+    let before = snapshot();
+
+    let err = super::serve_prepared(
+        prepared,
+        empty_config(),
+        crate::profile::clauth_dir()
+            .expect("dir")
+            .join("status.json"),
+        crate::daemon::LiveStores::default(),
+    )
+    .expect_err("the port is taken");
+    assert!(
+        format!("{err:#}").contains("failed to bind the REST API"),
+        "{err:#}"
+    );
+    assert!(
+        snapshot() == before,
+        "a start that never bound must not import"
+    );
+}
+
+/// The upgrade end to end: a start that serves folds `auth_token.json` in
+/// below the bind, and the bytes the tray already holds authenticate over TLS
+/// as the control device `legacy`.
+///
+/// The accept thread `serve_prepared` spawns runs for the process's life by
+/// design and has no shutdown to call, so it outlives this test, blocked in
+/// `accept` on an ephemeral port nothing else dials; it never reaches for the
+/// sandbox home once the sandbox is gone.
+#[test]
+fn a_start_that_serves_imports_the_legacy_token() {
+    let _home = HomeSandbox::new();
+    let certdir = tempfile::tempdir_in(_home.home()).expect("cert fixture dir");
+    let Some((paths, ca_crt)) = generate_chain(certdir.path()).expect("fixture") else {
+        eprintln!(
+            "SKIPPED a_start_that_serves_imports_the_legacy_token: openssl is not usable here"
+        );
+        return;
+    };
+    seed_legacy(LEGACY_TOKEN);
+    let addr = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("probe a free port")
+        .local_addr()
+        .expect("addr");
+    let prepared = super::prepare(addr, &crate::daemon::api::tls::CertSource::Explicit(paths))
+        .expect("prepare reads the valid certificate");
+
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+    super::serve_prepared(
+        prepared,
+        empty_config(),
+        crate::profile::clauth_dir()
+            .expect("dir")
+            .join("status.json"),
+        crate::daemon::LiveStores::default(),
+    )
+    .expect("the listener serves");
+    drop(capture);
+
+    assert!(
+        !legacy_file().exists(),
+        "the plaintext is gone once the listener serves"
+    );
+    assert!(
+        lines
+            .snapshot()
+            .iter()
+            .all(|line| !line.contains(LEGACY_TOKEN)),
+        "a line the start logged carries the token it imported"
+    );
+    assert!(
+        lines
+            .snapshot()
+            .iter()
+            .any(|line| line.contains("device 'legacy' is imported (control)")),
+        "{:#?}",
+        lines.snapshot()
+    );
+    let client = client_config(&ca_crt).expect("client config");
+    let answer = round_trip(
+        addr.port(),
+        &client,
+        &format!(
+            "GET /api/v1/health HTTP/1.1\r\nHost: {SERVER_NAME}\r\n\
+             Authorization: Bearer {LEGACY_TOKEN}\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .expect("a round trip with the tray's bytes");
+    assert!(
+        answer.starts_with("HTTP/1.1 200 OK\r\n"),
+        "the tray's bytes must still work after the upgrade: {answer}"
+    );
 }
 
 // ── a standby's certificate across the park (#63 T19) ────────────────────────
@@ -1731,8 +1863,8 @@ fn drive_parked_standby(
 
 /// The certificate file is deleted while the contender parks — the shape of a
 /// renewal mid-rewrite. The promotion must FAIL: `serve` returns an error
-/// naming the certificate before any listener exists and before the token
-/// mint, because a daemon that promoted anyway would look healthy while
+/// naming the certificate before any listener exists and before the legacy
+/// import, because a daemon that promoted anyway would look healthy while
 /// serving the stale identity to every client.
 #[test]
 fn a_promoted_standby_whose_certificate_vanished_fails_before_listening() {
@@ -1746,6 +1878,8 @@ fn a_promoted_standby_whose_certificate_vanished_fails_before_listening() {
         return;
     };
     let cert = paths.cert.clone();
+    seed_legacy(LEGACY_TOKEN);
+    let before = snapshot();
     let verdict =
         drive_parked_standby(crate::daemon::api::tls::CertSource::Explicit(paths), || {
             std::fs::remove_file(&cert).expect("remove the parked-away certificate")
@@ -1758,8 +1892,8 @@ fn a_promoted_standby_whose_certificate_vanished_fails_before_listening() {
         "the failure must be the post-promotion reload, not the bind or anything later: {err:#}"
     );
     assert!(
-        !token_file().exists(),
-        "a promotion that never served must not mint a token"
+        snapshot() == before,
+        "a promotion that never served must not import auth_token.json"
     );
 }
 
@@ -1779,6 +1913,8 @@ fn a_promoted_standby_whose_certificate_corrupted_fails_before_listening() {
         return;
     };
     let cert = paths.cert.clone();
+    seed_legacy(LEGACY_TOKEN);
+    let before = snapshot();
     let verdict =
         drive_parked_standby(crate::daemon::api::tls::CertSource::Explicit(paths), || {
             std::fs::write(&cert, "not a certificate: a torn renewal write")
@@ -1798,8 +1934,8 @@ fn a_promoted_standby_whose_certificate_corrupted_fails_before_listening() {
          mean a listener existed: {msg}"
     );
     assert!(
-        !token_file().exists(),
-        "a promotion that never served must not mint a token"
+        snapshot() == before,
+        "a promotion that never served must not import auth_token.json"
     );
 }
 
@@ -2037,34 +2173,255 @@ fn a_promoted_standby_serves_the_certificate_that_landed_during_its_park() {
     });
 }
 
-/// The control, green both before and after the mint moves: a HEALTHY token is
-/// never rewritten by any start, because reading a valid token never writes.
-/// If this reddens, the mint stopped reading before writing.
-#[test]
-fn a_tls_failed_start_leaves_a_healthy_token_untouched() {
-    let _home = HomeSandbox::new();
-    let path = token_file();
-    seed_token(&path, TOKEN);
-    let incumbent = ctx();
-    let _lock = incumbent_claim();
-    let held = std::net::TcpListener::bind("127.0.0.1:0").expect("bind held port");
-    let addr = held.local_addr().expect("addr");
-    let before = std::fs::read(&path).expect("read the healthy file");
-    assert_eq!(health_status(&incumbent, TOKEN), 200);
+// ── devices on the wire ─────────────────────────────────────────────────────
 
-    let err = crate::daemon::serve(
-        crate::daemon::StartMode::ExitIfRunning,
-        Some(addr),
-        &unreadable_certs(_home.home()),
+/// Serve up to `connections` connections off `listener`, waiting at most 10s
+/// for each to arrive. A client leg that fails before it connects must fail the
+/// test, not leave a blocking accept holding the scope, and with it the
+/// sandbox lock every later test queues on.
+fn serve_bounded(
+    listener: &std::net::TcpListener,
+    connections: usize,
+    mut serve: impl FnMut(std::net::TcpStream, std::net::SocketAddr),
+) {
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
+    for _ in 0..connections {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match listener.accept() {
+                Ok((stream, peer)) => {
+                    stream.set_nonblocking(false).expect("blocking stream");
+                    serve(stream, peer);
+                    break;
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(_) => return,
+            }
+        }
+    }
+}
+
+/// A failed pairing is an answer no device earned, so it closes the connection
+/// the way a 401 does, whether the code was refused or the body held none; a
+/// paired device refused a route keeps its own.
+#[test]
+fn a_failed_pairing_closes_the_connection_and_a_devices_refusal_does_not() {
+    let Some(f) = fixture() else {
+        eprintln!("SKIPPED a_failed_pairing_closes_the_connection: openssl is not usable here");
+        return;
+    };
+    crate::daemon::api::devices::seed_for_tests("phone", Tier::View, VIEW_TOKEN)
+        .expect("pair a view device");
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            serve_bounded(&f.listener, 3, |stream, peer| {
+                serve_connection(stream, peer, &f.server_tls, &f.ctx, brisk_limits());
+            });
+        });
+
+        for (body, status) in [
+            (r#"{"code":"ABCD-2345"}"#, "403 Forbidden"),
+            ("{}", "400 Bad Request"),
+        ] {
+            let mut pairing = Session::connect(f.port, &f.client_tls).expect("connect");
+            pairing
+                .send(&format!(
+                    "POST /api/v1/pair HTTP/1.1\r\nHost: {SERVER_NAME}\r\n\
+                     Content-Length: {}\r\n\r\n{body}",
+                    body.len()
+                ))
+                .expect("send");
+            let (head, _) = pairing.recv().expect("recv");
+            assert!(
+                head.starts_with(&format!("HTTP/1.1 {status}\r\n")),
+                "{head}"
+            );
+            assert!(
+                head.contains("Connection: close\r\n"),
+                "a failed pairing must not keep the slot: {head}"
+            );
+        }
+
+        let body = r#"{"profile":"alpha"}"#;
+        let mut viewer = Session::connect(f.port, &f.client_tls).expect("connect");
+        viewer
+            .send(&format!(
+                "POST /api/v1/switch HTTP/1.1\r\nHost: {SERVER_NAME}\r\n\
+                 Authorization: Bearer {VIEW_TOKEN}\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            ))
+            .expect("send");
+        let (head, _) = viewer.recv().expect("recv");
+        assert!(head.starts_with("HTTP/1.1 403 Forbidden\r\n"), "{head}");
+        assert!(
+            head.contains("Connection: keep-alive\r\n"),
+            "a paired device's refusal keeps its connection: {head}"
+        );
+        // Closing here ends the server's idle wait at once, not at the budget.
+        drop(viewer);
+    });
+}
+
+/// The per-request line names the device that asked, and `-` for a request no
+/// device made.
+#[test]
+fn the_request_line_names_the_device() {
+    let Some(fx) = fixture() else {
+        eprintln!("SKIPPED the_request_line_names_the_device: openssl is not usable here");
+        return;
+    };
+    let Fixture {
+        port,
+        listener,
+        server_tls,
+        client_tls,
+        ctx,
+        feed: _feed,
+        _home,
+        _dir,
+    } = fx;
+    let lines = crate::logline::LogLines::new();
+    let worker_lines = lines.clone();
+
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let _capture = worker_lines.capture_here();
+            serve_bounded(&listener, 2, |stream, peer| {
+                serve_connection(stream, peer, &server_tls, &ctx, Limits::DEFAULT);
+            });
+        });
+        round_trip(
+            port,
+            &client_tls,
+            &format!(
+                "GET /api/v1/health HTTP/1.1\r\nHost: {SERVER_NAME}\r\n\
+                 Authorization: Bearer {TOKEN}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .expect("authorized round trip");
+        round_trip(
+            port,
+            &client_tls,
+            &format!(
+                "GET /api/v1/status HTTP/1.1\r\nHost: {SERVER_NAME}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .expect("anonymous round trip");
+    });
+
+    let logged = lines.snapshot();
+    assert_eq!(logged.len(), 2, "{logged:#?}");
+    assert!(
+        logged[0].starts_with("clauth api: 127.0.0.1:")
+            && logged[0].ends_with(&format!(" {DEVICE} GET /api/v1/health -> 200")),
+        "{logged:#?}"
+    );
+    assert!(
+        logged[1].starts_with("clauth api: 127.0.0.1:")
+            && logged[1].ends_with(" - GET /api/v1/status -> 401"),
+        "{logged:#?}"
+    );
+}
+
+/// A pairing over TLS: the 201 hands back a token that works on the same
+/// connection, and no line the connection logs holds the token or the code.
+#[test]
+fn a_pairing_over_tls_hands_back_a_working_token_and_logs_no_secret() {
+    let Some(fx) = fixture() else {
+        eprintln!(
+            "SKIPPED a_pairing_over_tls_hands_back_a_working_token: openssl is not usable here"
+        );
+        return;
+    };
+    let Fixture {
+        port,
+        listener,
+        server_tls,
+        client_tls,
+        ctx,
+        feed: _feed,
+        _home,
+        _dir,
+    } = fx;
+    let pending = crate::daemon::api::pairing::begin(
+        &crate::daemon::api::devices::DeviceName::parse("phone").expect("name"),
+        Tier::View,
     )
-    .expect_err("the unreadable certificate must fail the contender");
+    .expect("begin");
+    let code = pending.code().to_string();
+    let lines = crate::logline::LogLines::new();
+    let worker_lines = lines.clone();
+
+    let token = std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let _capture = worker_lines.capture_here();
+            serve_bounded(&listener, 1, |stream, peer| {
+                serve_connection(stream, peer, &server_tls, &ctx, brisk_limits());
+            });
+        });
+
+        let mut session = Session::connect(port, &client_tls).expect("connect");
+        let body = serde_json::json!({ "code": code }).to_string();
+        session
+            .send(&format!(
+                "POST /api/v1/pair HTTP/1.1\r\nHost: {SERVER_NAME}\r\n\
+                 Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            ))
+            .expect("send");
+        let (head, reply) = session.recv().expect("recv");
+        assert!(head.starts_with("HTTP/1.1 201 Created\r\n"), "{head}");
+        assert!(
+            head.contains("Connection: keep-alive\r\n"),
+            "a pairing that succeeded may carry on: {head}"
+        );
+        let reply: serde_json::Value = serde_json::from_str(&reply).expect("json");
+        let token = reply["token"]
+            .as_str()
+            .expect("the token rides the 201")
+            .to_string();
+        session
+            .send(&format!(
+                "GET /api/v1/health HTTP/1.1\r\nHost: {SERVER_NAME}\r\n\
+                 Authorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+            ))
+            .expect("send");
+        let (head, _) = session.recv().expect("recv");
+        assert!(
+            head.starts_with("HTTP/1.1 200 OK\r\n"),
+            "the minted token works on the same connection: {head}"
+        );
+        token
+    });
+
+    let logged = lines.snapshot();
+    let bare_code = code.replace('-', "");
+    for line in &logged {
+        assert!(
+            !line.contains(&token) && !line.contains(&code) && !line.contains(&bare_code),
+            "a secret reached the log"
+        );
+    }
+    assert_eq!(logged.len(), 3, "{logged:#?}");
     assert!(
-        format!("{err:#}").contains("failed to read the TLS certificate"),
-        "{err:#}"
+        logged[0].starts_with("clauth api: 127.0.0.1:")
+            && logged[0].ends_with(" paired device 'phone' (view)"),
+        "{logged:#?}"
     );
     assert!(
-        std::fs::read(&path).expect("read the token file") == before,
-        "a healthy token must stay byte-identical across a failed start"
+        logged[1].ends_with(" - POST /api/v1/pair -> 201"),
+        "{logged:#?}"
     );
-    assert_eq!(health_status(&incumbent, TOKEN), 200);
+    assert!(
+        logged[2].ends_with(" phone GET /api/v1/health -> 200"),
+        "{logged:#?}"
+    );
 }

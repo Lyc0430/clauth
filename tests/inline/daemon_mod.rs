@@ -1316,21 +1316,22 @@ fn drain_pending_switch_off_does_not_resurrect_a_deleted_row() {
 
 /// The kill switch pinned at its CALL SITE, not just its predicate: with
 /// `CLAUTH_NO_API=1` and a `--listen` address, `serve`'s listener decision must
-/// yield the no-api arm — no certificate read, no token mint, nothing for
-/// `api::serve_prepared` to bind later. Deleting the `api_enabled()` guard from
-/// the start path (leaving the predicate test green) re-arms a listener the
-/// operator could only kill by editing the unit.
+/// yield the no-api arm — no certificate read, nothing for
+/// `api::serve_prepared` to bind or import later. Deleting the `api_enabled()`
+/// guard from the start path (leaving the predicate test green) re-arms a
+/// listener the operator could only kill by editing the unit.
 ///
 /// `Lego` (not a generated chain) and no `HomeSandbox` on purpose: under the
-/// opt-out the decision never reads the certificate or the token file, so the
-/// arm is decided by the env var alone. The pin's RED CHAIN is the token mint:
-/// `prepare` mints the token (which resolves `home_dir()`) BEFORE it reads the
-/// certificate, so a regression that deletes the guard dies at the mint's
-/// sandbox panic — "test resolved the operator's real home" — before any
-/// certificate is consulted. Both `assert`s never evaluate on that edit; the
-/// panic is the red, and a legitimate one. A sandbox would deadlock the guard
-/// another way: `HomeSandbox` holds `HOME_TEST_LOCK` for the test's life and
-/// `with_no_api_env` takes it again.
+/// opt-out the decision never reads the certificate, so the arm is decided by
+/// the env var alone. The pin's RED CHAIN is the certificate read: `prepare`
+/// looks up this host's FQDN, then finds lego's directory through
+/// `~/.clauth/tls.json` (which resolves `home_dir()`), so a regression that
+/// deletes the guard dies at the sandbox panic — "test resolved the operator's
+/// real home" — before any certificate file is opened, or at the `expect`
+/// below when the FQDN lookup fails first. Both `assert`s never evaluate on
+/// that edit; the panic is the red, and a legitimate one. A sandbox would
+/// deadlock the guard another way: `HomeSandbox` holds `HOME_TEST_LOCK` for
+/// the test's life and `with_no_api_env` takes it again.
 #[test]
 fn the_kill_switch_suppresses_the_listener_at_the_start_path() {
     with_no_api_env(Some("1"), || {

@@ -116,23 +116,42 @@ impl std::fmt::Display for HelpRendered {
 
 impl std::error::Error for HelpRendered {}
 
+/// A run a signal ended once its command had cleaned up after itself (`clauth
+/// devices pair` withdrawing its code). [`exit_code`] answers the shell's
+/// `128 + signal` with no `Error:` line, since the command already said what
+/// it did.
+#[derive(Debug)]
+pub(crate) struct Interrupted(pub(crate) i32);
+
+impl std::fmt::Display for Interrupted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "interrupted by signal {}", self.0)
+    }
+}
+
+impl std::error::Error for Interrupted {}
+
 /// Build a [`UsageError`] as an `anyhow::Error` for a dispatch arm to return.
 fn usage_error(msg: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(UsageError(msg.into()))
 }
 
 /// Map a dispatch outcome to a process exit code: 0 on success, 2 for a
-/// [`UsageError`] (bad flag/args) or an already-printed [`HelpRendered`], 1
-/// for any other failure. Prints the error exactly as anyhow's `Result`
-/// `Termination` did (`Error: {:?}`) — except the [`HelpRendered`] arm, whose
-/// message already reached stderr — so the message surface is unchanged now
-/// that `main` maps the code itself.
+/// [`UsageError`] (bad flag/args) or an already-printed [`HelpRendered`],
+/// `128 + signal` for an [`Interrupted`] run, 1 for any other failure. Prints
+/// the error exactly as anyhow's `Result` `Termination` did (`Error: {:?}`) —
+/// except the [`HelpRendered`] and [`Interrupted`] arms, whose commands already
+/// said what happened on stderr — so the message surface is unchanged now that
+/// `main` maps the code itself.
 pub(crate) fn exit_code(result: Result<()>) -> i32 {
     match result {
         Ok(()) => 0,
         Err(e) => {
             if e.downcast_ref::<HelpRendered>().is_some() {
                 return 2;
+            }
+            if let Some(Interrupted(signal)) = e.downcast_ref::<Interrupted>() {
+                return 128 + signal;
             }
             // `errln!`, so a reader that walked away from `2>&1 | head` still
             // gets this code rather than the 101 `eprintln!` panicked with.
@@ -200,19 +219,16 @@ fn dispatch(cli: Cli) -> Result<()> {
             listen,
             cert,
             key,
-            print_token,
-            rotate_token,
             // The default's explicit spelling: nothing to branch on.
             no_standby: _,
         } => cmd_daemon(
             standby,
             replace,
             status,
-            print_token,
-            rotate_token,
             listen,
             daemon::api::tls::CertSource::from_flags(cert, key),
         ),
+        Command::Devices { json, cmd } => cmd_devices(json, cmd),
         Command::Status {
             json: _,
             all,
@@ -239,25 +255,10 @@ fn cmd_daemon(
     standby: bool,
     replace: bool,
     status: bool,
-    print_token: bool,
-    rotate_token: bool,
     listen: Option<std::net::SocketAddr>,
     certs: daemon::api::tls::CertSource,
 ) -> Result<()> {
-    // The token arms come first: both print and exit without touching the
-    // singleton lock, so they answer for a daemon that is already running as
-    // readily as for one that is not.
-    //
-    // `outln!` rather than `println!` — `out` owns stdout so that
-    // `clauth daemon --print-token | head -1` exits 0 instead of panicking on
-    // the EPIPE, which is what `out::tests::no_bare_print_macro_under_src` pins.
-    if print_token {
-        outln!("{}", daemon::api::token::load_or_create()?);
-        Ok(())
-    } else if rotate_token {
-        outln!("{}", daemon::api::token::rotate()?);
-        Ok(())
-    } else if status {
+    if status {
         daemon::status_probe()
     } else if replace {
         daemon::serve(daemon::StartMode::Replace, listen, &certs)
@@ -265,6 +266,20 @@ fn cmd_daemon(
         daemon::serve(daemon::StartMode::Standby, listen, &certs)
     } else {
         daemon::serve(daemon::StartMode::ExitIfRunning, listen, &certs)
+    }
+}
+
+/// `clauth devices`: bare lists; `pair`, `add` and `revoke` change the list.
+fn cmd_devices(json: bool, cmd: Option<cli::DevicesCommand>) -> Result<()> {
+    match cmd {
+        None => daemon::api::devices::run_list(json),
+        Some(cli::DevicesCommand::Pair { name, control }) => {
+            daemon::api::pairing::run_pair(&name, control)
+        }
+        Some(cli::DevicesCommand::Add { name, control }) => {
+            daemon::api::devices::run_add(&name, control)
+        }
+        Some(cli::DevicesCommand::Revoke { name }) => daemon::api::devices::run_revoke(&name),
     }
 }
 

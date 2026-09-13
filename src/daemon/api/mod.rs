@@ -11,20 +11,23 @@
 //!
 //! Shape:
 //!   * **TLS always.** There is no plaintext mode and no flag to ask for one —
-//!     the bearer token crosses this connection on every request.
-//!   * **Token always.** Every route, health included, needs
-//!     `Authorization: Bearer <token>`; see [`token`].
-//!   * **Two operations.** Read the status feed, switch the active account. The
-//!     switch goes through the same action the MCP tool uses, so anything
-//!     needing human eyes is refused here too ([`routes`]).
+//!     a bearer token crosses this connection on every request.
+//!   * **A device always.** Every route but the pairing redemption needs
+//!     `Authorization: Bearer <token>` from a paired device, and the switch
+//!     needs one paired with control; see [`devices`], [`pairing`], and the
+//!     table in [`routes`].
+//!   * **Three operations.** Read the status feed, switch the active account,
+//!     redeem a pairing code. The switch goes through the same action the MCP
+//!     tool uses, so anything needing human eyes is refused here too.
 //!   * **Thread per connection**, capped and time-bounded. Connections persist
 //!     across requests and serve pipelined ones in order; see [`http`] for the
 //!     framing rules that makes safe. No async runtime.
 
+pub(crate) mod devices;
 mod http;
+pub(crate) mod pairing;
 pub(crate) mod routes;
 pub(crate) mod tls;
-pub(crate) mod token;
 
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -38,7 +41,6 @@ use crate::logline::logline;
 use crate::profile::ConfigHandle;
 
 use routes::ApiContext;
-use token::AuthToken;
 
 /// Concurrent connections served at once. The cap is what stops a connection
 /// flood from spawning threads without bound.
@@ -189,30 +191,27 @@ impl Prepared {
 /// `daemon::serve` re-reads the certificate after a promotion
 /// ([`Prepared::reload_certificate`]) rather than serving what was built here.
 ///
-/// The token is NOT minted here: minting above the singleton claim let a
-/// contender replace a damaged `auth_token.json` before it knew whether it may
-/// serve — a start that then died on this certificate, or yielded as redundant,
-/// had already revoked every client of the running daemon. [`serve_prepared`]
-/// mints, below the claim and below a standby's promotion.
+/// The legacy import runs in [`serve_prepared`] too, below the claim and below
+/// a standby's promotion, so a start that dies on this certificate or yields
+/// as redundant imports nothing.
 pub(crate) fn prepare(listen: SocketAddr, certs: &tls::CertSource) -> Result<Prepared> {
     let tls_config = tls::server_config(certs, listen.ip())?;
     Ok(Prepared { listen, tls_config })
 }
 
-/// Mint the bearer token, bind the listener [`prepare`] set up, and start
+/// Bind the listener [`prepare`] set up, fold in the legacy token, and start
 /// serving on it.
 ///
-/// The mint and the bind deliberately happen here, below the singleton claim
-/// and below a standby's promotion. Minting above the claim (in `prepare`)
-/// replaced a damaged `auth_token.json` before the contender knew whether it
-/// may serve: a start that then died on the certificate, or exited redundant,
-/// had already revoked every client of the running daemon. Binding above the
-/// claim died `--replace --listen` on the port its dying incumbent still held,
-/// exited a plain second instance non-zero on a boot race its contract says it
-/// wins by yielding, and had a parked standby holding a listening socket
-/// nothing accepted on for the whole park. Every failure here is fatal to the
-/// daemon by design (the caller propagates it): the operator asked for a
-/// listener, and a daemon that silently ran without one would look healthy
+/// The bind and the import deliberately happen here, below the singleton claim
+/// and below a standby's promotion. The import is the one write a listener's
+/// start makes to `~/.clauth`, and a start that will not serve (redundant,
+/// TLS-dead, or without its port) has no business making it. Binding above
+/// the claim died `--replace --listen` on the port its dying incumbent still
+/// held, exited a plain second instance non-zero on a boot race its contract
+/// says it wins by yielding, and had a parked standby holding a listening
+/// socket nothing accepted on for the whole park. Every failure here is fatal
+/// to the daemon by design (the caller propagates it): the operator asked for
+/// a listener, and a daemon that silently ran without one would look healthy
 /// while the remote client stayed dark.
 pub(crate) fn serve_prepared(
     prepared: Prepared,
@@ -223,11 +222,9 @@ pub(crate) fn serve_prepared(
     let Prepared { listen, tls_config } = prepared;
     let listener = TcpListener::bind(listen)
         .with_context(|| format!("failed to bind the REST API to {listen}"))?;
-    // Minted after the bind too: a start that will not serve — redundant,
-    // TLS-dead, or without its port — never writes `auth_token.json`. The
-    // plaintext token lives only for this scope; `AuthToken` keeps its digest.
-    let auth = AuthToken::from_plaintext(&token::load_or_create()?);
-    let ctx = ApiContext::new(config, status_path, auth, Some(live));
+    devices::import_legacy()?;
+    devices::note_at_start();
+    let ctx = ApiContext::new(config, status_path, Some(live));
 
     let spawned = std::thread::Builder::new()
         .name("clauth-api-accept".into())
@@ -335,7 +332,7 @@ fn serve_connection(
                 // message would start, so answer and close rather than try to
                 // resynchronize on a stream an attacker may be framing.
                 let response = e.response();
-                logline!("clauth api: {peer} <unparsed> -> {}", response.status);
+                logline!("clauth api: {peer} - <unparsed> -> {}", response.status);
                 let _ =
                     http::write_response(reader.stream_mut(), &response, &http::Disposition::Close);
                 break;
@@ -344,38 +341,47 @@ fn serve_connection(
 
         served = served.saturating_add(1);
         let summary = http::request_summary(&request.method, &request.path);
+        let handled = routes::handle(ctx, &request, peer);
         let response = if request.method == "HEAD" {
-            routes::handle(ctx, &request).into_head()
+            handled.response.into_head()
         } else {
-            routes::handle(ctx, &request)
+            handled.response
         };
 
         // Both sides have to agree, and the budget is ours alone to enforce.
         // What is advertised is the budget genuinely left, so a client is never
         // told it has time it does not have.
         //
-        // An unauthenticated request never keeps the connection. Otherwise
-        // anyone able to reach the port could hold a slot for the whole budget
-        // by sending one bogus request and going quiet, and at 32 slots that is
-        // a lockout for the price of a TCP connection. Before connections
-        // persisted, one socket timeout capped that; now the budget would. A
-        // real client always presents its token, so this costs nothing
-        // legitimate.
+        // An answer no device earned (a 401, a failed pairing) never keeps the
+        // connection. Otherwise anyone able to reach the port could hold a slot
+        // for the whole budget by sending one bogus request and going quiet,
+        // and at 32 slots that is a lockout for the price of a TCP connection;
+        // and every wrong pairing code costs its sender a new connection rather
+        // than one more request on an open one. Before connections persisted,
+        // one socket timeout capped the hold; now the budget would. A real
+        // client presents its token, and a pairing that succeeds may carry on,
+        // so this costs nothing legitimate.
+        let earned = handled.device.is_some() || (200..300).contains(&response.status);
         let remaining = expires.saturating_duration_since(std::time::Instant::now());
-        let disposition = if request.keep_alive
-            && response.status != 401
-            && served < limits.max_requests
-            && !remaining.is_zero()
-        {
-            http::Disposition::KeepAlive {
-                timeout_secs: remaining.as_secs(),
-                max_requests: limits.max_requests - served,
-            }
-        } else {
-            http::Disposition::Close
-        };
+        let disposition =
+            if request.keep_alive && earned && served < limits.max_requests && !remaining.is_zero()
+            {
+                http::Disposition::KeepAlive {
+                    timeout_secs: remaining.as_secs(),
+                    max_requests: limits.max_requests - served,
+                }
+            } else {
+                http::Disposition::Close
+            };
 
-        logline!("clauth api: {peer} {summary} -> {}", response.status);
+        let device = handled
+            .device
+            .as_deref()
+            .map_or_else(|| "-".to_string(), http::sanitize_for_log);
+        logline!(
+            "clauth api: {peer} {device} {summary} -> {}",
+            response.status
+        );
         if let Err(e) = http::write_response(reader.stream_mut(), &response, &disposition) {
             logline!("clauth api: {peer}: failed to write the response: {e}");
             break;

@@ -475,15 +475,6 @@ fn cert_and_key_are_required_together_and_only_with_listen() {
         ["daemon", "--listen", "--cert", "/tmp/a.crt"].as_slice(),
         ["daemon", "--listen", "--key", "/tmp/a.key"].as_slice(),
         ["daemon", "--cert", "/tmp/a.crt", "--key", "/tmp/a.key"].as_slice(),
-        [
-            "daemon",
-            "--print-token",
-            "--cert",
-            "/tmp/a.crt",
-            "--key",
-            "/tmp/a.key",
-        ]
-        .as_slice(),
     ] {
         assert_eq!(parse_exit_code(args), 2, "{args:?} must be a usage error");
     }
@@ -658,8 +649,6 @@ fn daemon_modes_are_mutually_exclusive_and_default_to_exit_if_running() {
         listen,
         cert,
         key,
-        print_token,
-        rotate_token,
     } = command(&["daemon"])
     else {
         panic!("must parse");
@@ -670,8 +659,7 @@ fn daemon_modes_are_mutually_exclusive_and_default_to_exit_if_running() {
         "bare `clauth daemon` picks no mode, which dispatch reads as exit-if-running"
     );
     assert_eq!(
-        (listen, print_token, rotate_token),
-        (None, false, false),
+        listen, None,
         "the REST API is off unless an address is asked for"
     );
     assert_eq!(
@@ -685,8 +673,6 @@ fn daemon_modes_are_mutually_exclusive_and_default_to_exit_if_running() {
         (["daemon", "--no-standby"].as_slice(), "no_standby"),
         (["daemon", "--replace"].as_slice(), "replace"),
         (["daemon", "--status"].as_slice(), "status"),
-        (["daemon", "--print-token"].as_slice(), "print_token"),
-        (["daemon", "--rotate-token"].as_slice(), "rotate_token"),
     ] {
         let Command::Daemon {
             standby,
@@ -696,8 +682,6 @@ fn daemon_modes_are_mutually_exclusive_and_default_to_exit_if_running() {
             listen,
             cert: _,
             key: _,
-            print_token,
-            rotate_token,
         } = command(args)
         else {
             panic!("{args:?} must parse");
@@ -707,8 +691,6 @@ fn daemon_modes_are_mutually_exclusive_and_default_to_exit_if_running() {
             ("no_standby", no_standby),
             ("replace", replace),
             ("status", status),
-            ("print_token", print_token),
-            ("rotate_token", rotate_token),
         ];
         for (name, value) in set {
             assert_eq!(
@@ -722,24 +704,14 @@ fn daemon_modes_are_mutually_exclusive_and_default_to_exit_if_running() {
     }
 
     // Every pair conflicts, so no invocation can ask for two start modes, and
-    // neither one-shot (--status, --print-token, --rotate-token) can be asked
-    // for alongside anything else.
+    // the one-shot `--status` cannot be asked for alongside one.
     for pair in [
         ["--standby", "--no-standby"],
         ["--standby", "--replace"],
         ["--standby", "--status"],
-        ["--standby", "--print-token"],
-        ["--standby", "--rotate-token"],
         ["--no-standby", "--replace"],
         ["--no-standby", "--status"],
-        ["--no-standby", "--print-token"],
-        ["--no-standby", "--rotate-token"],
         ["--replace", "--status"],
-        ["--replace", "--print-token"],
-        ["--replace", "--rotate-token"],
-        ["--status", "--print-token"],
-        ["--status", "--rotate-token"],
-        ["--print-token", "--rotate-token"],
     ] {
         assert_eq!(
             parse_exit_code(&["daemon", pair[0], pair[1]]),
@@ -779,13 +751,11 @@ fn listen_parses_an_address_and_composes_with_the_start_modes() {
         assert!(listen.is_some(), "{mode} should not conflict with --listen");
     }
 
-    for one_shot in ["--status", "--print-token", "--rotate-token"] {
-        assert_eq!(
-            parse_exit_code(&["daemon", one_shot, "--listen", "0.0.0.0:8443"]),
-            2,
-            "daemon {one_shot} --listen must be refused as a conflict"
-        );
-    }
+    assert_eq!(
+        parse_exit_code(&["daemon", "--status", "--listen", "0.0.0.0:8443"]),
+        2,
+        "daemon --status --listen must be refused as a conflict"
+    );
 
     for bad in ["8443", "not-an-address", "0.0.0.0", "0.0.0.0:99999"] {
         assert_eq!(
@@ -853,15 +823,131 @@ fn bare_listen_defaults_to_every_interface_without_eating_the_next_flag() {
         );
     }
 
-    // The one-shots conflict with the shorthand exactly as they do with the
+    // The one-shot conflicts with the shorthand exactly as it does with the
     // spelled-out address.
-    for one_shot in ["--status", "--print-token", "--rotate-token"] {
+    assert_eq!(
+        parse_exit_code(&["daemon", "--status", "--listen"]),
+        2,
+        "daemon --status --listen must be refused as a conflict"
+    );
+}
+
+/// The global token's flags are gone with no shim, so a script still passing
+/// either gets clap's own unknown-argument error, alone or beside another flag.
+#[test]
+fn the_retired_token_flags_are_unknown_arguments() {
+    for args in [
+        ["daemon", "--print-token"].as_slice(),
+        ["daemon", "--rotate-token"].as_slice(),
+        ["daemon", "--listen", "--print-token"].as_slice(),
+        ["daemon", "--status", "--rotate-token"].as_slice(),
+    ] {
+        let err = parse(args).expect_err("a retired flag must not parse");
         assert_eq!(
-            parse_exit_code(&["daemon", one_shot, "--listen"]),
-            2,
-            "daemon {one_shot} --listen must be refused as a conflict"
+            err.kind(),
+            clap::error::ErrorKind::UnknownArgument,
+            "{args:?}"
+        );
+        assert_eq!(err.exit_code(), 2, "{args:?}");
+    }
+}
+
+// ── devices ─────────────────────────────────────────────────────────────────
+
+/// `devices` parses its four verbs: bare lists, with or without `--json`;
+/// `pair` and `add` take a name and an optional `--control`; `revoke` a name.
+#[test]
+fn devices_parses_its_four_verbs() {
+    use crate::cli::DevicesCommand;
+
+    assert!(matches!(
+        command(&["devices"]),
+        Command::Devices {
+            json: false,
+            cmd: None
+        }
+    ));
+    assert!(matches!(
+        command(&["devices", "--json"]),
+        Command::Devices {
+            json: true,
+            cmd: None
+        }
+    ));
+    for (args, want_control) in [
+        (["devices", "pair", "phone"].as_slice(), false),
+        (["devices", "pair", "phone", "--control"].as_slice(), true),
+        (["devices", "pair", "--control", "phone"].as_slice(), true),
+    ] {
+        let Command::Devices {
+            cmd: Some(DevicesCommand::Pair { name, control }),
+            ..
+        } = command(args)
+        else {
+            panic!("{args:?} must parse as pair");
+        };
+        assert_eq!(
+            (name.as_str(), control),
+            ("phone", want_control),
+            "{args:?}"
         );
     }
+    for (args, want_control) in [
+        (["devices", "add", "tray"].as_slice(), false),
+        (["devices", "add", "tray", "--control"].as_slice(), true),
+    ] {
+        let Command::Devices {
+            cmd: Some(DevicesCommand::Add { name, control }),
+            ..
+        } = command(args)
+        else {
+            panic!("{args:?} must parse as add");
+        };
+        assert_eq!((name.as_str(), control), ("tray", want_control), "{args:?}");
+    }
+    let Command::Devices {
+        cmd: Some(DevicesCommand::Revoke { name }),
+        ..
+    } = command(&["devices", "revoke", "phone"])
+    else {
+        panic!("revoke must parse");
+    };
+    assert_eq!(name, "phone");
+
+    for args in [
+        ["devices", "pair"].as_slice(),
+        ["devices", "add"].as_slice(),
+        ["devices", "revoke"].as_slice(),
+        ["devices", "revoke", "phone", "--control"].as_slice(),
+        ["devices", "pair", "phone", "extra"].as_slice(),
+        ["devices", "--json", "pair", "phone"].as_slice(),
+        ["devices", "pair", "phone", "--json"].as_slice(),
+        ["devices", "list"].as_slice(),
+    ] {
+        assert_eq!(parse_exit_code(args), 2, "{args:?} must be a usage error");
+    }
+}
+
+/// `revoke` of a name no device holds is a plain failure naming it: exit 1,
+/// not the usage code.
+#[test]
+fn revoking_an_unknown_device_exits_one_naming_it() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let err = dispatch(Cli {
+        theme: None,
+        command: Some(Command::Devices {
+            json: false,
+            cmd: Some(crate::cli::DevicesCommand::Revoke {
+                name: "ghost".to_string(),
+            }),
+        }),
+    })
+    .expect_err("no device holds that name");
+    assert_eq!(
+        err.to_string(),
+        "no device named 'ghost'; `clauth devices` lists the paired ones"
+    );
+    assert_eq!(crate::exit_code(Err(err)), 1);
 }
 
 #[test]
@@ -1180,8 +1266,6 @@ fn an_absent_daemon_reports_exit_one_not_the_usage_code() {
             listen: None,
             cert: None,
             key: None,
-            print_token: false,
-            rotate_token: false,
         }),
     })
     .expect_err("no daemon is running in the sandbox");

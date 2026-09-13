@@ -97,7 +97,7 @@ pub(crate) fn default_cert_dir() -> Result<PathBuf> {
     }
 }
 
-/// Peer of `status.json` / `auth_token.json` in `~/.clauth`.
+/// Peer of `status.json` / `devices.json` in `~/.clauth`.
 const TLS_FILE: &str = "tls.json";
 /// Bumped only on a breaking change to the file's shape, like `status.json`.
 const TLS_SCHEMA: u64 = 1;
@@ -118,18 +118,15 @@ fn tls_config_path() -> Result<PathBuf> {
 /// The configured certificate directory, writing the platform default on first
 /// use so the operator has a file to edit rather than a documented path to
 /// retype. Only [`server_config`] calls this, so `tls.json` appears when a
-/// `--listen` daemon first starts and not when `--print-token` runs.
+/// `--listen` daemon first starts.
 ///
-/// Runs under the cross-process state flock for the same reason
-/// [`token::load_or_create`](super::token::load_or_create) does: two instances
-/// starting together must not both decide they are the one creating it.
+/// Runs under the cross-process state flock, so two instances starting
+/// together cannot both decide they are the one creating it.
 ///
-/// A malformed file is a hard error, NOT a silent fall back to the default.
-/// That is the opposite of how `auth_token.json` treats a bad file, and
-/// deliberately so: regenerating a token is recoverable, whereas quietly
-/// ignoring an edited `cert_dir` would serve certificates from a directory the
-/// operator believes they moved away from, and the only symptom would be a
-/// confusing "no such file" naming a path they never configured.
+/// A malformed file is a hard error, NOT a silent fall back to the default:
+/// quietly ignoring an edited `cert_dir` would serve certificates from a
+/// directory the operator believes they moved away from, and the only symptom
+/// would be a confusing "no such file" naming a path they never configured.
 pub(crate) fn cert_dir() -> Result<PathBuf> {
     let path = tls_config_path()?;
     crate::lock::with_state_lock(|_| {
