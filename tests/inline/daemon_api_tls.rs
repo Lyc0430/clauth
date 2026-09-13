@@ -16,6 +16,7 @@
 
 use super::*;
 
+use std::net::IpAddr;
 use std::path::PathBuf;
 
 use crate::profile::clauth_dir;
@@ -403,5 +404,246 @@ fn a_newer_schema_is_still_read() {
         cert_dir().expect("a newer schema must not be fatal"),
         Path::new("/srv/lego"),
         "a downgrade must not strand the operator's configured directory"
+    );
+}
+
+// ── tailnet-range bind refusal ─────────────────────────────────────────────
+
+/// The two ranges are Tailscale's own (`net/tsaddr`'s `CGNATRange` and
+/// `TailscaleULARange`), pinned at their exact boundaries.
+#[test]
+fn tailscale_range_matches_only_tailscale_assigned_addresses() {
+    for (addr, inside) in [
+        // CGNATRange 100.64.0.0/10: the two edges and the two just outside.
+        ("100.63.255.255", false),
+        ("100.64.0.0", true),
+        ("100.127.255.255", true),
+        ("100.128.0.0", false),
+        // TailscaleULARange fd7a:115c:a1e0::/48.
+        ("fd7a:115c:a1df:ffff:ffff:ffff:ffff:ffff", false),
+        ("fd7a:115c:a1e0::", true),
+        ("fd7a:115c:a1e0:ffff:ffff:ffff:ffff:ffff", true),
+        ("fd7a:115c:a1e1::", false),
+        // Neither range, plus the IPv4-mapped form that must canonicalize.
+        ("0.0.0.0", false),
+        ("127.0.0.1", false),
+        ("::1", false),
+        ("::ffff:100.64.1.2", true),
+    ] {
+        let ip: IpAddr = addr.parse().expect("parse address");
+        assert_eq!(
+            tailscale_range(ip).is_some(),
+            inside,
+            "{addr} should be {}",
+            if inside { "inside" } else { "outside" }
+        );
+    }
+}
+
+/// The IPv4-mapped form maps to its IPv4 address, and the range it names is
+/// the IPv4 one — so the refusal the operator sees is the range their
+/// `--listen` spelled out.
+#[test]
+fn an_ipv4_mapped_tailnet_address_canonicalizes_to_the_ipv4_range() {
+    let mapped: IpAddr = "::ffff:100.64.1.2".parse().expect("mapped addr");
+    assert_eq!(tailscale_range(mapped), Some(TAILSCALE_IPV4_RANGE));
+}
+
+/// The tailnet refusal for a known IPv4 bind, word-for-word. Pinned by
+/// equality, never by substring: a wording drift or a wrong range name must
+/// fail the suite, not pass on a fragment.
+const TAILNET_REFUSAL_V4: &str = "100.64.1.2 is in the 100.64.0.0/10 range Tailscale assigns addresses from, and this host's lego certificate is not available; run `tailscale cert <machine>.<tailnet>.ts.net` and pass `--cert <machine>.<tailnet>.ts.net.crt --key <machine>.<tailnet>.ts.net.key` to `clauth daemon --listen`";
+
+/// The same refusal for a known IPv6 bind. Repeated rather than derived: the
+/// interpolated range must be the IPv6 one.
+const TAILNET_REFUSAL_V6: &str = "fd7a:115c:a1e0::1 is in the fd7a:115c:a1e0::/48 range Tailscale assigns addresses from, and this host's lego certificate is not available; run `tailscale cert <machine>.<tailnet>.ts.net` and pass `--cert <machine>.<tailnet>.ts.net.crt --key <machine>.<tailnet>.ts.net.key` to `clauth daemon --listen`";
+
+/// The seam that takes the lego paths: a missing `.crt` on a tailnet-range
+/// bind becomes the tailnet refusal, pinned word-for-word, with the lego cause
+/// kept in the chain; on any other bind it stays lego's missing-file error.
+#[test]
+fn a_missing_certificate_on_a_tailnet_bind_becomes_the_tailscale_refusal() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let paths = lego_paths_in(dir.path(), "host.example");
+    let lego_cause = format!(
+        "failed to read the TLS certificate {}",
+        paths.cert.display()
+    );
+
+    let tailnet: IpAddr = "100.64.1.2".parse().expect("tailnet v4 addr");
+    let Err(err) = load_lego_or_refuse(tailnet, &paths) else {
+        panic!("an absent certificate must fail");
+    };
+    assert_eq!(
+        err.to_string(),
+        TAILNET_REFUSAL_V4,
+        "the IPv4 tailnet bind gets the exact refusal sentence"
+    );
+    assert_eq!(
+        err.chain()
+            .nth(1)
+            .expect("the lego cause stays in the chain")
+            .to_string(),
+        lego_cause,
+        "the lego path that was looked for stays in the chain"
+    );
+
+    let tailnet_v6: IpAddr = "fd7a:115c:a1e0::1".parse().expect("tailnet v6 addr");
+    let Err(err) = load_lego_or_refuse(tailnet_v6, &paths) else {
+        panic!("an absent certificate must fail");
+    };
+    assert_eq!(
+        err.to_string(),
+        TAILNET_REFUSAL_V6,
+        "the IPv6 tailnet bind gets the exact refusal sentence with its range"
+    );
+
+    let elsewhere: IpAddr = "192.0.2.1".parse().expect("non-tailnet addr");
+    let Err(err) = load_lego_or_refuse(elsewhere, &paths) else {
+        panic!("an absent certificate must fail");
+    };
+    assert_eq!(
+        err.to_string(),
+        lego_cause,
+        "a non-tailnet bind keeps the plain lego error, no refusal"
+    );
+}
+
+/// A `.crt` that cannot even be stat'ed — here the "directory" holding it is a
+/// regular file, so every read and stat returns ENOTDIR — is not a not-found,
+/// and must NOT become the tailnet refusal: the refusal is for a certificate
+/// that is genuinely absent, and the operator's real problem here is their
+/// `cert_dir`.
+///
+/// Unix only: Windows reports a path through a regular file as
+/// `ERROR_PATH_NOT_FOUND`, which std maps to `NotFound`, so there this path
+/// reads as absent and the refusal is the expected answer.
+#[cfg(unix)]
+#[test]
+fn a_certificate_path_that_cannot_be_statd_keeps_todays_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let blocker = dir.path().join("cert_dir_is_a_file");
+    std::fs::write(&blocker, "not a directory").expect("write blocker");
+    let paths = lego_paths_in(&blocker, "host.example");
+    let tailnet: IpAddr = "100.64.1.2".parse().expect("tailnet addr");
+
+    let Err(err) = load_lego_or_refuse(tailnet, &paths) else {
+        panic!("an unreadable certificate path must fail");
+    };
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "failed to read the TLS certificate {}",
+            paths.cert.display()
+        ),
+        "a stat failure that is not a not-found keeps today's lego error"
+    );
+}
+
+/// A `.crt` inside a directory the daemon cannot search (a root-run lego's
+/// `0o700` certificate directory beside a user-run daemon) is present, not
+/// absent, so it keeps today's error rather than becoming the tailnet refusal.
+/// Unix only, and skipped under root, which can search any directory.
+#[cfg(unix)]
+#[test]
+fn a_certificate_behind_an_unsearchable_directory_keeps_todays_error() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    if std::fs::metadata(dir.path()).expect("stat tempdir").uid() == 0 {
+        eprintln!("SKIPPING: running as root, which can search any directory");
+        return;
+    }
+    let locked = dir.path().join("certificates");
+    std::fs::create_dir(&locked).expect("mkdir");
+    let paths = lego_paths_in(&locked, "host.example");
+    std::fs::write(&paths.cert, "present").expect("write cert");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("lock dir");
+    let tailnet: IpAddr = "100.64.1.2".parse().expect("tailnet addr");
+
+    let result = load_lego_or_refuse(tailnet, &paths);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).expect("unlock dir");
+
+    let Err(err) = result else {
+        panic!("a certificate behind an unsearchable directory must fail to load");
+    };
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "failed to read the TLS certificate {}",
+            paths.cert.display()
+        ),
+        "EACCES is not a not-found, so it keeps today's lego error"
+    );
+}
+
+/// A certificate that is present but does not parse keeps today's error even
+/// on a tailnet bind: only "the certificate is not there" turns into the
+/// refusal, not "the certificate is wrong".
+#[test]
+fn an_unparseable_certificate_on_a_tailnet_bind_keeps_todays_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let paths = lego_paths_in(dir.path(), "host.example");
+    std::fs::write(&paths.cert, "not a certificate").expect("write malformed leaf");
+    let tailnet: IpAddr = "100.64.1.2".parse().expect("tailnet addr");
+
+    let Err(err) = load_lego_or_refuse(tailnet, &paths) else {
+        panic!("a malformed certificate must fail");
+    };
+    let msg = format!("{err:#}");
+    assert!(
+        !msg.contains("tailscale cert"),
+        "an unparseable certificate keeps today's error: {msg}"
+    );
+    assert!(
+        msg.contains("host.example.crt"),
+        "and still names the file: {msg}"
+    );
+}
+
+// ── FQDN-failure arm ───────────────────────────────────────────────────────
+
+/// The `fqdn().map_err(|cause| refuse_on_tailnet(listen, cause))` wiring: a
+/// lego bind whose FQDN lookup fails maps to the tailnet refusal on a
+/// tailnet-range address, with the lookup error kept in the chain.
+#[test]
+fn an_fqdn_failure_on_a_tailnet_bind_becomes_the_tailscale_refusal() {
+    let _home = HomeSandbox::new();
+    let tailnet: IpAddr = "100.64.1.2".parse().expect("tailnet addr");
+    *FQDN_OVERRIDE.lock().expect("fqdn override") = Some("forced fqdn failure".to_string());
+    let Err(err) = server_config(&CertSource::Lego, tailnet) else {
+        panic!("a failed FQDN lookup must fail the lego load");
+    };
+    *FQDN_OVERRIDE.lock().expect("fqdn override") = None;
+    assert_eq!(
+        err.to_string(),
+        TAILNET_REFUSAL_V4,
+        "a failed lookup on a tailnet bind gets the same refusal sentence"
+    );
+    assert_eq!(
+        err.chain()
+            .nth(1)
+            .expect("the lookup error stays in the chain")
+            .to_string(),
+        "forced fqdn failure",
+        "the lookup cause stays in the chain"
+    );
+}
+
+/// The same failed lookup on any other bind passes the lookup error through
+/// untouched — no refusal, no range mention.
+#[test]
+fn an_fqdn_failure_on_a_non_tailnet_bind_stays_the_lookup_error() {
+    let _home = HomeSandbox::new();
+    let elsewhere: IpAddr = "192.0.2.1".parse().expect("non-tailnet addr");
+    *FQDN_OVERRIDE.lock().expect("fqdn override") = Some("forced fqdn failure".to_string());
+    let Err(err) = server_config(&CertSource::Lego, elsewhere) else {
+        panic!("a failed FQDN lookup must fail the lego load");
+    };
+    *FQDN_OVERRIDE.lock().expect("fqdn override") = None;
+    assert_eq!(
+        err.to_string(),
+        "forced fqdn failure",
+        "a non-tailnet bind keeps the plain lookup error"
     );
 }

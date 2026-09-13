@@ -168,7 +168,7 @@ impl Prepared {
     /// while every client's trust in it expired. Nothing else calls this — a
     /// start that did not park read the certificate moments before serving.
     pub(crate) fn reload_certificate(&mut self, certs: &tls::CertSource) -> Result<()> {
-        self.tls_config = tls::server_config(certs)
+        self.tls_config = tls::server_config(certs, self.listen.ip())
             .context("failed to reload the TLS certificate after the standby promotion")?;
         Ok(())
     }
@@ -195,7 +195,7 @@ impl Prepared {
 /// had already revoked every client of the running daemon. [`serve_prepared`]
 /// mints, below the claim and below a standby's promotion.
 pub(crate) fn prepare(listen: SocketAddr, certs: &tls::CertSource) -> Result<Prepared> {
-    let tls_config = tls::server_config(certs)?;
+    let tls_config = tls::server_config(certs, listen.ip())?;
     Ok(Prepared { listen, tls_config })
 }
 

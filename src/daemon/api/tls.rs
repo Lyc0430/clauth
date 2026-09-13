@@ -30,7 +30,12 @@
 //! file beside it and none of lego's naming. So the whole derivation is
 //! skippable — `--cert`/`--key` name the two files outright ([`CertSource`]),
 //! and nothing about the FQDN, the directory, or the issuer file is consulted.
+//! A bind on a Tailscale range (100.64.0.0/10, fd7a:115c:a1e0::/48) whose lego
+//! derivation still fails for want of a certificate refuses with the
+//! `tailscale cert` route and the `--cert`/`--key` flags to pass, instead of
+//! lego's missing-file error.
 
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -238,6 +243,15 @@ impl CertSource {
     }
 }
 
+/// Test-only override for [`fqdn`]: `Some` is the failure message the lookup
+/// returns instead of shelling out, so a test can drive the failure without
+/// the real command. Set while holding a `testutil::HomeSandbox` — the same
+/// `HOME_TEST_LOCK` serialization every other process-global test seam uses —
+/// so a forced value never bleeds into a concurrent test that consults the
+/// real lookup. Never compiled into the binary.
+#[cfg(test)]
+static FQDN_OVERRIDE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
 /// This host's fully-qualified name, from [`FQDN_COMMAND`].
 ///
 /// Shelling out rather than resolving in-process, on every platform: the FQDN
@@ -246,6 +260,10 @@ impl CertSource {
 /// else on the box already agrees with, and the in-process equivalent would
 /// need `getaddrinfo` through `unsafe`, which the crate denies.
 fn fqdn() -> Result<String> {
+    #[cfg(test)]
+    if let Some(failure) = FQDN_OVERRIDE.lock().ok().and_then(|g| g.clone()) {
+        bail!("{failure}");
+    }
     let (program, args) = FQDN_COMMAND;
     let out = std::process::Command::new(program)
         .args(args)
@@ -350,18 +368,84 @@ pub(crate) fn server_config_from(paths: &CertPaths) -> Result<Arc<ServerConfig>>
     Ok(Arc::new(config))
 }
 
+/// Tailscale's IPv4 node-address range (`net/tsaddr`'s `CGNATRange`). It is
+/// also RFC 6598 carrier-grade NAT space, so an address in it does not prove a
+/// tailnet — the refusal below states the range fact, never the identity.
+const TAILSCALE_IPV4_RANGE: &str = "100.64.0.0/10";
+
+/// Tailscale's IPv6 node-address range (`net/tsaddr`'s `TailscaleULARange`).
+const TAILSCALE_IPV6_RANGE: &str = "fd7a:115c:a1e0::/48";
+
+/// Which Tailscale range `ip` sits in, if any.
+///
+/// Canonicalized first, so an IPv4-mapped IPv6 bind (`::ffff:100.64.1.2`)
+/// counts as the IPv4 address it spells — the form `--listen` would have been
+/// given as anyway.
+fn tailscale_range(ip: IpAddr) -> Option<&'static str> {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => {
+            let [a, b, _, _] = v4.octets();
+            (a == 100 && (b & 0b1100_0000) == 0b0100_0000).then_some(TAILSCALE_IPV4_RANGE)
+        }
+        IpAddr::V6(v6) => {
+            let [s0, s1, s2, ..] = v6.segments();
+            (s0 == 0xfd7a && s1 == 0x115c && s2 == 0xa1e0).then_some(TAILSCALE_IPV6_RANGE)
+        }
+    }
+}
+
+/// The tailnet refusal for a bind on a Tailscale range whose lego identity
+/// cannot be produced. States the range fact and the two things the operator
+/// must run, and keeps the original failure in the chain so the path that was
+/// looked for is not lost. Any other bind passes the cause through untouched.
+fn refuse_on_tailnet(listen: IpAddr, cause: anyhow::Error) -> anyhow::Error {
+    match tailscale_range(listen) {
+        Some(range) => cause.context(format!(
+            "{listen} is in the {range} range Tailscale assigns addresses from, \
+             and this host's lego certificate is not available; run \
+             `tailscale cert <machine>.<tailnet>.ts.net` and pass \
+             `--cert <machine>.<tailnet>.ts.net.crt --key <machine>.<tailnet>.ts.net.key` \
+             to `clauth daemon --listen`"
+        )),
+        None => cause,
+    }
+}
+
+/// The lego arm's load: read the identity [`CertPaths`] names, and turn the
+/// one "no certificate here" failure — the derived `.crt` is genuinely absent
+/// — on a Tailscale-range bind into the tailnet refusal. Absence is decided by
+/// [`Path::try_exists`], so on unix a stat failure that is not a not-found
+/// (EACCES, ENOTDIR) is not mistaken for one. Windows maps more errors to
+/// not-found than a missing file (a path through a regular file among them),
+/// so there those read as absent. Every other failure (a `.crt` that exists
+/// but does not parse, a missing key, a bad `tls.json`, an unreadable parent)
+/// stays exactly as today, as does a bind outside the ranges.
+pub(crate) fn load_lego_or_refuse(listen: IpAddr, paths: &CertPaths) -> Result<Arc<ServerConfig>> {
+    server_config_from(paths).map_err(|cause| {
+        if matches!(paths.cert.try_exists(), Ok(false)) {
+            refuse_on_tailnet(listen, cause)
+        } else {
+            cause
+        }
+    })
+}
+
 /// The production entry point.
 ///
+/// `listen` decides only the tailnet refusal below and never what is loaded.
 /// For [`CertSource::Lego`] this resolves the host's FQDN and the configured
-/// certificate directory and loads what they name between them. For
-/// [`CertSource::Explicit`] none of that runs: no `hostname -f`, no `tls.json`,
-/// no issuer file — the two named files are read and that is all.
-pub(crate) fn server_config(source: &CertSource) -> Result<Arc<ServerConfig>> {
+/// certificate directory and loads what they name between them; where that
+/// cannot produce an identity because the derived `.crt` is absent or the FQDN
+/// lookup fails, a bind on a Tailscale range refuses with the `tailscale cert`
+/// route instead of lego's missing-file error. For [`CertSource::Explicit`]
+/// none of that runs: no `hostname -f`, no `tls.json`, no issuer file, no
+/// tailnet refusal — the two named files are read and that is all.
+pub(crate) fn server_config(source: &CertSource, listen: IpAddr) -> Result<Arc<ServerConfig>> {
     match source {
         CertSource::Lego => {
-            let fqdn = fqdn()?;
+            let fqdn = fqdn().map_err(|cause| refuse_on_tailnet(listen, cause))?;
             let paths = lego_paths_in(&cert_dir()?, &fqdn);
-            server_config_from(&paths)
+            load_lego_or_refuse(listen, &paths)
         }
         CertSource::Explicit(paths) => server_config_from(paths),
     }

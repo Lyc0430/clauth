@@ -1210,6 +1210,154 @@ fn a_missing_certificate_fails_in_prepare_not_after_the_claim() {
     );
 }
 
+/// The verify line, pinned for both bind classes: a tailnet-range bind with no
+/// lego certificate refuses with the `tailscale cert` route, while a
+/// non-tailnet (and non-loopback) bind keeps today's missing-file error. Both
+/// go through `prepare`, the pre-claim start path, with the cert directory
+/// pointed at an empty tempdir so this host's real `/etc/lego` is not what
+/// decides it.
+#[test]
+fn a_tailnet_bind_without_a_certificate_refuses_with_the_tailscale_route() {
+    let _home = HomeSandbox::new();
+    let empty = tempfile::tempdir().expect("tempdir");
+    let tls_json = crate::profile::clauth_dir().expect("dir").join("tls.json");
+    std::fs::create_dir_all(tls_json.parent().expect("has parent")).expect("mkdir");
+    std::fs::write(
+        &tls_json,
+        serde_json::json!({ "schema": 1, "cert_dir": empty.path() }).to_string(),
+    )
+    .expect("write tls.json");
+
+    let tailnet = "100.64.1.2:0".parse().expect("tailnet addr");
+    let elsewhere = "192.0.2.1:0".parse().expect("non-tailnet addr");
+
+    let Err(err) = super::prepare(tailnet, &crate::daemon::api::tls::CertSource::Lego) else {
+        panic!("an empty certificate directory must fail on a tailnet bind");
+    };
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("tailscale cert <machine>.<tailnet>.ts.net"),
+        "the tailnet bind must be told the route: {msg}"
+    );
+    assert!(
+        msg.contains("--cert <machine>.<tailnet>.ts.net.crt --key <machine>.<tailnet>.ts.net.key"),
+        "and the flags to pass: {msg}"
+    );
+    assert!(
+        msg.contains(&empty.path().display().to_string()),
+        "the lego path that was looked for stays in the chain: {msg}"
+    );
+
+    let Err(err) = super::prepare(elsewhere, &crate::daemon::api::tls::CertSource::Lego) else {
+        panic!("an empty certificate directory must fail on any bind");
+    };
+    let msg = format!("{err:#}");
+    assert!(
+        !msg.contains("tailscale cert"),
+        "a non-tailnet bind keeps today's lego error: {msg}"
+    );
+    assert!(
+        msg.contains(&empty.path().display().to_string()),
+        "and still names the path: {msg}"
+    );
+}
+
+/// An explicit `--cert`/`--key` pair on a tailnet-range bind skips the tailnet
+/// check entirely: the two named files load and the config is built, exactly
+/// as on any other bind — and a missing explicit file keeps today's missing-
+/// file error rather than the refusal, which is for the lego derivation alone.
+#[test]
+fn an_explicit_certificate_pair_on_a_tailnet_bind_builds_a_config() {
+    let _home = HomeSandbox::new();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tailnet = "100.64.1.2:0".parse().expect("tailnet addr");
+
+    // The missing-file leg needs no certificate fixture, so it runs before the
+    // `openssl` skip: a box without `openssl` must still see this leg red if
+    // an explicit pair ever gains the tailnet refusal.
+    let missing = crate::daemon::api::tls::CertSource::from_flags(
+        Some(dir.path().join("absent.crt")),
+        Some(dir.path().join("absent.key")),
+    );
+    let Err(err) = super::prepare(tailnet, &missing) else {
+        panic!("a missing explicit certificate must fail");
+    };
+    let msg = format!("{err:#}");
+    assert!(
+        !msg.contains("tailscale cert"),
+        "an explicit pair never gets the tailnet refusal: {msg}"
+    );
+    assert!(
+        msg.contains("absent.crt"),
+        "the missing explicit file is named: {msg}"
+    );
+
+    let Some((paths, _ca)) = generate_chain(dir.path()).expect("fixture") else {
+        return;
+    };
+
+    super::prepare(
+        tailnet,
+        &crate::daemon::api::tls::CertSource::from_flags(
+            Some(paths.cert.clone()),
+            Some(paths.key.clone()),
+        ),
+    )
+    .expect("an explicit pair on a tailnet bind builds a config like anywhere else");
+}
+
+/// A working lego identity still loads on a tailnet bind: the refusal is only
+/// for "the certificate is not there", never for every tailnet-range bind.
+#[test]
+fn a_working_lego_identity_still_loads_on_a_tailnet_bind() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let Some((paths, _ca)) = generate_chain(dir.path()).expect("fixture") else {
+        return;
+    };
+    let tailnet = "100.64.1.2".parse().expect("tailnet addr");
+
+    crate::daemon::api::tls::load_lego_or_refuse(tailnet, &paths)
+        .expect("a working lego identity loads on a tailnet bind");
+}
+
+/// `reload_certificate` re-runs the same load as `prepare`, so a tailnet-range
+/// bind that loses its lego certificate refuses with the same `tailscale cert`
+/// route on the reload, not only on the first start.
+#[test]
+fn a_tailnet_bind_refuses_on_reload_when_the_lego_certificate_is_gone() {
+    let _home = HomeSandbox::new();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let empty = tempfile::tempdir().expect("empty lego dir");
+    let tls_json = crate::profile::clauth_dir().expect("dir").join("tls.json");
+    std::fs::create_dir_all(tls_json.parent().expect("has parent")).expect("mkdir");
+    std::fs::write(
+        &tls_json,
+        serde_json::json!({ "schema": 1, "cert_dir": empty.path() }).to_string(),
+    )
+    .expect("write tls.json");
+    let Some((paths, _ca)) = generate_chain(dir.path()).expect("fixture") else {
+        return;
+    };
+    let tailnet = "100.64.1.2:0".parse().expect("tailnet addr");
+
+    // The pre-claim read succeeds on the explicit pair, carrying the tailnet
+    // listen address into the Prepared the reload re-uses.
+    let mut prepared = super::prepare(
+        tailnet,
+        &crate::daemon::api::tls::CertSource::from_flags(Some(paths.cert), Some(paths.key)),
+    )
+    .expect("the explicit pair prepares");
+
+    let Err(err) = prepared.reload_certificate(&crate::daemon::api::tls::CertSource::Lego) else {
+        panic!("a reload with no lego certificate must fail on a tailnet bind");
+    };
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("tailscale cert <machine>.<tailnet>.ts.net"),
+        "the reload must carry the same refusal: {msg}"
+    );
+}
+
 /// `prepare` reads the certificate and binds nothing: the bind belongs below
 /// the singleton claim, where the port is winnable, so a
 /// prepared-but-not-yet-serving listener leaves its port answering
