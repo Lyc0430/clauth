@@ -904,3 +904,109 @@ fn a_burned_code_is_not_read_as_paired_by_a_later_add() {
         Some(Outcome::Burned)
     );
 }
+
+/// The lost-code fallback with a withdraw that fails pins its sentence by
+/// exact words. Replacing the code file with a directory makes [`withdraw`]
+/// fail its read on every platform; the read error and the sandbox path are
+/// inputs to the sentence, so only those two are substituted, never the
+/// approved copy.
+#[test]
+fn a_lost_code_line_with_a_failed_withdraw_pins_its_sentence() {
+    let _home = HomeSandbox::new();
+    let pending = begin(&name("tray"), Tier::View).expect("mint the code");
+    let path = pairing_path().expect("path");
+    std::fs::remove_file(&path).expect("remove the code file");
+    std::fs::create_dir(&path).expect("replace it with an unreadable entry");
+    let err = withdraw_lost(&pending, None).expect_err("the withdraw read fails");
+    let read_err = std::fs::read(&path).expect_err("a directory refuses a plain read");
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "the pairing code for 'tray' never reached its reader and could not be withdrawn: \
+             failed to read {}: {read_err}; it stays redeemable until it expires in 5 minutes",
+            path.display()
+        )
+    );
+}
+
+/// The same arm with the write error present AND the withdrawal failing — the
+/// double failure — pins its sentence by exact words: the parenthetical names
+/// the write error, and the TTL is the operator's only remaining guarantee.
+/// The dir-in-place-of-`pairing.json` seam makes [`withdraw`] fail its read on
+/// every platform; the read error and the sandbox path are inputs to the
+/// sentence, so only those two are substituted, never the approved copy.
+#[test]
+fn a_lost_code_line_with_a_write_error_and_a_failed_withdraw_pins_its_sentence() {
+    let _home = HomeSandbox::new();
+    let pending = begin(&name("tray"), Tier::View).expect("mint the code");
+    let path = pairing_path().expect("path");
+    std::fs::remove_file(&path).expect("remove the code file");
+    std::fs::create_dir(&path).expect("replace it with an unreadable entry");
+    let write_err = std::io::Error::other("full disk");
+    let err = withdraw_lost(&pending, Some(write_err)).expect_err("the withdraw read fails");
+    let read_err = std::fs::read(&path).expect_err("a directory refuses a plain read");
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "the pairing code for 'tray' never reached its reader (full disk) and could not be \
+             withdrawn: failed to read {}: {read_err}; it stays redeemable until it expires in 5 minutes",
+            path.display()
+        )
+    );
+}
+
+/// The lost-code fallback with a withdraw that lands pins its success-arm
+/// sentence by exact words, so a reword of the approved copy cannot ship green.
+#[test]
+fn a_lost_code_line_with_a_withdrawn_code_pins_its_sentence() {
+    let _home = HomeSandbox::new();
+    let pending = begin(&name("tray"), Tier::View).expect("mint the code");
+    let err = withdraw_lost(&pending, None).expect_err("the withdraw lands");
+    assert_eq!(
+        err.to_string(),
+        "the pairing code for 'tray' never reached its reader; it was withdrawn"
+    );
+}
+
+/// The same arm under a write error renders the io error's Display in a
+/// parenthetical, pinned exactly against the real message the helper produces.
+#[test]
+fn a_lost_code_line_with_a_write_error_pins_the_cause_and_withdrawal() {
+    let _home = HomeSandbox::new();
+    let pending = begin(&name("tray"), Tier::View).expect("mint the code");
+    let write_err = std::io::Error::other("full disk");
+    let err = withdraw_lost(&pending, Some(write_err)).expect_err("the withdraw lands");
+    assert_eq!(
+        err.to_string(),
+        "the pairing code for 'tray' never reached its reader (full disk); it was withdrawn"
+    );
+}
+
+/// `Ok(false)` from `withdraw` means a newer `pair` replaced the code before
+/// anyone read it; the message says replaced, not withdrawn, by exact words.
+#[test]
+fn a_lost_code_line_on_a_replaced_code_says_replaced() {
+    let _home = HomeSandbox::new();
+    let first = begin(&name("tray"), Tier::View).expect("first code");
+    begin(&name("tray"), Tier::View).expect("a newer pair replaces it");
+    let err = withdraw_lost(&first, None).expect_err("the code is already gone");
+    assert_eq!(
+        err.to_string(),
+        "the pairing code for 'tray' never reached its reader; a newer `clauth devices pair` had already replaced it"
+    );
+}
+
+/// The replaced sentence under a write error still renders the parenthetical,
+/// pinned exactly against the real message the helper produces.
+#[test]
+fn a_lost_code_line_with_a_write_error_and_a_replaced_code_pins_its_sentence() {
+    let _home = HomeSandbox::new();
+    let first = begin(&name("tray"), Tier::View).expect("first code");
+    begin(&name("tray"), Tier::View).expect("a newer pair replaces it");
+    let write_err = std::io::Error::other("full disk");
+    let err = withdraw_lost(&first, Some(write_err)).expect_err("the code is already gone");
+    assert_eq!(
+        err.to_string(),
+        "the pairing code for 'tray' never reached its reader (full disk); a newer `clauth devices pair` had already replaced it"
+    );
+}

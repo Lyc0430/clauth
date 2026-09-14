@@ -196,3 +196,164 @@ fn a_replaced_pair_says_so_and_exits_1() {
         Some(130)
     );
 }
+
+/// `clauth <args>` with stdout already closed: an OS pipe whose reader is
+/// dropped before spawn, so the child's first stdout write meets `EPIPE`
+/// instead of racing a reader that leaves later.
+fn closed_stdout(home: &Path, args: &[&str]) -> std::process::Output {
+    let (reader, writer) = std::io::pipe().expect("pipe");
+    drop(reader);
+    clauth(home)
+        .args(args)
+        .stdout(Stdio::from(writer))
+        .output()
+        .expect("run clauth")
+}
+
+/// `clauth <args>` with stdout pointed at `/dev/full`, where every write fails
+/// with `ENOSPC` instead of the `EPIPE` a closed pipe gives: the write-error
+/// arm the closed-pipe tests never exercise. Opened for writing, the way a
+/// shell's `> /dev/full` opens it — a read-only handle would buffer the line
+/// away instead of failing the write.
+fn full_stdout(home: &Path, args: &[&str]) -> std::process::Output {
+    let sink = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .expect("open /dev/full for writing");
+    clauth(home)
+        .args(args)
+        .stdout(Stdio::from(sink))
+        .output()
+        .expect("run clauth")
+}
+
+/// True when `text` holds a run of 64 hex chars, the whole shape of a minted
+/// token. Nothing else the command prints is that long of a hex run.
+fn has_token_shape(text: &str) -> bool {
+    text.as_bytes().windows(64).any(|w| {
+        w.iter()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+    })
+}
+
+/// True when `text` holds a `XXXX-XXXX` display-code shape.
+fn has_code_shape(text: &str) -> bool {
+    text.as_bytes()
+        .windows(9)
+        .any(|w| std::str::from_utf8(w).is_ok_and(is_display_code))
+}
+
+/// A reader gone before the token line prints loses nothing to keep: the run
+/// revokes the device it just minted and exits 1, and the stderr names the loss
+/// without the token itself.
+#[test]
+fn add_with_closed_stdout_rolls_back_and_exits_1() {
+    let home = tempfile::tempdir().expect("home");
+    let out = closed_stdout(home.path(), &["devices", "add", "tray"]);
+    let status = out.status.code();
+    let stderr = String::from_utf8(out.stderr).expect("utf8 stderr");
+    assert_eq!(status, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("never reached its reader"),
+        "stderr names the loss: {stderr}"
+    );
+    assert!(!has_token_shape(&stderr), "stderr holds no token: {stderr}");
+
+    let listed = clauth(home.path())
+        .args(["devices", "--json"])
+        .output()
+        .expect("run clauth devices --json");
+    assert_eq!(listed.status.code(), Some(0));
+    let listed = String::from_utf8(listed.stdout).expect("utf8");
+    let rows: serde_json::Value = serde_json::from_str(&listed).expect("json rows");
+    assert!(
+        rows.as_array()
+            .is_some_and(|rows| rows.iter().all(|row| row["name"].as_str() != Some("tray"))),
+        "the device was removed: {listed}"
+    );
+}
+
+/// A reader gone before the code line prints leaves nothing to wait on: the
+/// run withdraws the code and exits 1, so an `add` under the same name succeeds
+/// right after.
+#[test]
+fn pair_with_closed_stdout_withdraws_and_exits_1() {
+    let home = tempfile::tempdir().expect("home");
+    let out = closed_stdout(home.path(), &["devices", "pair", "tray"]);
+    let status = out.status.code();
+    let stderr = String::from_utf8(out.stderr).expect("utf8 stderr");
+    assert_eq!(status, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("never reached its reader"),
+        "stderr names the loss: {stderr}"
+    );
+    assert!(!has_code_shape(&stderr), "stderr holds no code: {stderr}");
+
+    let added = clauth(home.path())
+        .args(["devices", "add", "tray"])
+        .output()
+        .expect("run clauth devices add");
+    assert_eq!(
+        added.status.code(),
+        Some(0),
+        "add succeeds once the code is withdrawn: {}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+}
+
+/// A full disk behind the token line is the same loss as a gone reader, not a
+/// panic: the run revokes the device it just minted and exits 1, and the
+/// stderr names the loss and the cause without the token itself.
+#[test]
+fn add_with_full_stdout_rolls_back_and_exits_1() {
+    let home = tempfile::tempdir().expect("home");
+    let out = full_stdout(home.path(), &["devices", "add", "tray"]);
+    let status = out.status.code();
+    let stderr = String::from_utf8(out.stderr).expect("utf8 stderr");
+    assert_eq!(status, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("never reached its reader"),
+        "stderr names the loss: {stderr}"
+    );
+    assert!(!has_token_shape(&stderr), "stderr holds no token: {stderr}");
+
+    let listed = clauth(home.path())
+        .args(["devices", "--json"])
+        .output()
+        .expect("run clauth devices --json");
+    assert_eq!(listed.status.code(), Some(0));
+    let listed = String::from_utf8(listed.stdout).expect("utf8");
+    let rows: serde_json::Value = serde_json::from_str(&listed).expect("json rows");
+    assert!(
+        rows.as_array()
+            .is_some_and(|rows| rows.iter().all(|row| row["name"].as_str() != Some("tray"))),
+        "the device was removed: {listed}"
+    );
+}
+
+/// A full disk behind the code line withdraws the code and exits 1, so an
+/// `add` under the same name succeeds right after.
+#[test]
+fn pair_with_full_stdout_withdraws_and_exits_1() {
+    let home = tempfile::tempdir().expect("home");
+    let out = full_stdout(home.path(), &["devices", "pair", "tray"]);
+    let status = out.status.code();
+    let stderr = String::from_utf8(out.stderr).expect("utf8 stderr");
+    assert_eq!(status, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("never reached its reader"),
+        "stderr names the loss: {stderr}"
+    );
+    assert!(!has_code_shape(&stderr), "stderr holds no code: {stderr}");
+
+    let added = clauth(home.path())
+        .args(["devices", "add", "tray"])
+        .output()
+        .expect("run clauth devices add");
+    assert_eq!(
+        added.status.code(),
+        Some(0),
+        "add succeeds once the code is withdrawn: {}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+}

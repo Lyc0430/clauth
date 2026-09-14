@@ -22,7 +22,7 @@ use super::devices::{self, DeviceName, Tier};
 use super::http::sanitize_for_log;
 use crate::lock::with_state_lock;
 use crate::logline::logline;
-use crate::out::{errln, outln};
+use crate::out::{Wrote, errln, write_chunk_result};
 use crate::profile::{atomic_write_600, clauth_dir};
 use crate::usage::{epoch_secs_to_iso, iso_to_epoch_secs, now_epoch_secs};
 
@@ -403,7 +403,18 @@ pub(crate) fn run_pair(name: &str, control: bool) -> Result<()> {
     // and being able to withdraw it.
     let interrupt = Interrupt::install()?;
     let pending = begin(&name, tier.clone())?;
-    outln!("{}", pending.code());
+    let lost = match write_chunk_result(
+        &mut std::io::stdout().lock(),
+        format_args!("{}", pending.code()),
+        true,
+    ) {
+        Ok(Wrote::Yes) => None,
+        Ok(Wrote::ReaderGone) => Some(None),
+        Err(e) => Some(Some(e)),
+    };
+    if let Some(write_err) = lost {
+        withdraw_lost(&pending, write_err)?;
+    }
     errln!(
         "clauth: enter the code on the device within {} minutes to pair '{name}' ({tier}); \
          Ctrl-C withdraws it",
@@ -423,6 +434,30 @@ pub(crate) fn run_pair(name: &str, control: bool) -> Result<()> {
     }
     let waited = wait_for(&pending, || interrupt.caught(), POLL);
     finish(&pending, waited)
+}
+
+/// Withdraw the code a lost line minted, naming the loss. `write_err` is
+/// `Some(e)` when the write itself failed — a full disk behind a redirect —
+/// rather than the reader closing the pipe, so the operator sees the cause.
+/// `Ok(false)` from [`withdraw`] means a newer `pair` already replaced the code
+/// before anyone read it, so the message says replaced, not withdrawn.
+fn withdraw_lost(pending: &Pending, write_err: Option<std::io::Error>) -> Result<()> {
+    let name = &pending.name;
+    let cause = write_err.map(|e| format!(" ({e})")).unwrap_or_default();
+    match withdraw(pending) {
+        Ok(true) => {
+            bail!("the pairing code for '{name}' never reached its reader{cause}; it was withdrawn")
+        }
+        Ok(false) => bail!(
+            "the pairing code for '{name}' never reached its reader{cause}; a newer `clauth \
+             devices pair` had already replaced it"
+        ),
+        Err(e) => bail!(
+            "the pairing code for '{name}' never reached its reader{cause} and could not be \
+             withdrawn: {e:#}; it stays redeemable until it expires in {} minutes",
+            CODE_TTL_SECS / 60
+        ),
+    }
 }
 
 /// Turn a wait into what `pair` prints and exits with. Only a signal or an

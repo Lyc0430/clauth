@@ -236,6 +236,69 @@ fn revoking_an_unknown_name_names_it() {
     );
 }
 
+/// The lost-token fallback with a revoke that fails pins its sentence: the loss
+/// and the cause are named, and the operator is pointed at the revoke command.
+/// `fail_next_write` is the crate's seam for a store write that does not land.
+#[test]
+fn a_lost_token_line_with_a_failed_revoke_names_the_remove_command() {
+    let _home = HomeSandbox::new();
+    add(&name("tray"), Tier::View).expect("mint the device");
+    fail_next_write();
+    let err = revoke_lost(&name("tray"), None).expect_err("the revoke write fails");
+    assert_eq!(
+        err.to_string(),
+        "the token for 'tray' never reached its reader and the device could not be removed: \
+         injected failure writing the device list; remove it with `clauth devices revoke tray`"
+    );
+}
+
+/// The same arm with the write error present AND the revoke failing — the
+/// double failure — pins its sentence by exact words: the parenthetical names
+/// the write error, the rollback cause names the injected failure, and the fix
+/// points at the revoke command. The revoke failure rides the same
+/// `fail_next_write` seam.
+#[test]
+fn a_lost_token_line_with_a_write_error_and_a_failed_revoke_pins_its_sentence() {
+    let _home = HomeSandbox::new();
+    add(&name("tray"), Tier::View).expect("mint the device");
+    fail_next_write();
+    let write_err = std::io::Error::other("full disk");
+    let err = revoke_lost(&name("tray"), Some(write_err)).expect_err("the revoke write fails");
+    assert_eq!(
+        err.to_string(),
+        "the token for 'tray' never reached its reader (full disk) and the device could not be \
+         removed: injected failure writing the device list; remove it with `clauth devices revoke tray`"
+    );
+}
+
+/// The lost-token fallback with a revoke that lands pins its success-arm
+/// sentence by exact words, so a reword of the approved copy cannot ship green.
+#[test]
+fn a_lost_token_line_with_a_removed_device_pins_its_sentence() {
+    let _home = HomeSandbox::new();
+    add(&name("tray"), Tier::View).expect("mint the device");
+    let err = revoke_lost(&name("tray"), None).expect_err("the revoke removes the device");
+    assert_eq!(
+        err.to_string(),
+        "the token for 'tray' never reached its reader; the device was removed"
+    );
+}
+
+/// The same arm under a write error renders the io error's Display in a
+/// parenthetical, pinned exactly against the real message the helper produces.
+#[test]
+fn a_lost_token_line_with_a_write_error_pins_the_cause_and_removal() {
+    let _home = HomeSandbox::new();
+    add(&name("tray"), Tier::View).expect("mint the device");
+    let write_err = std::io::Error::other("full disk");
+    let err =
+        revoke_lost(&name("tray"), Some(write_err)).expect_err("the revoke removes the device");
+    assert_eq!(
+        err.to_string(),
+        "the token for 'tray' never reached its reader (full disk); the device was removed"
+    );
+}
+
 // ── an unreadable store ─────────────────────────────────────────────────────
 
 /// An unreadable list is refused, never read as empty: authenticating against

@@ -19,7 +19,7 @@ use subtle::ConstantTimeEq;
 
 use crate::lock::{StateLockHeld, with_state_lock};
 use crate::logline::logline;
-use crate::out::{errln, out, outln};
+use crate::out::{Wrote, errln, out, outln, write_chunk_result};
 use crate::profile::{atomic_write_600, clauth_dir};
 use crate::usage::{epoch_secs_to_iso, humanize_duration, iso_to_epoch_secs, now_epoch_secs};
 
@@ -644,12 +644,48 @@ pub(crate) fn run_add(name: &str, control: bool) -> Result<()> {
     let name = DeviceName::parse(name)?;
     let tier = Tier::chosen(control);
     let token = add(&name, tier.clone())?;
-    outln!("{token}");
+    let lost =
+        match write_chunk_result(&mut std::io::stdout().lock(), format_args!("{token}"), true) {
+            Ok(Wrote::Yes) => None,
+            Ok(Wrote::ReaderGone) => Some(None),
+            Err(e) => Some(Some(e)),
+        };
+    if let Some(write_err) = lost {
+        revoke_lost(&name, write_err)?;
+    }
     errln!(
         "clauth: added device '{name}' ({tier}). That token is its only copy: clauth keeps just \
          a SHA-256 of it and cannot show it again."
     );
     Ok(())
+}
+
+/// Roll back the device a lost token line minted, naming the loss. `write_err`
+/// is `Some(e)` when the write itself failed — a full disk behind a redirect —
+/// rather than the reader closing the pipe, so the operator sees the cause.
+fn revoke_lost(name: &DeviceName, write_err: Option<std::io::Error>) -> Result<()> {
+    match revoke(name.as_str()) {
+        Ok(_) => match write_err {
+            Some(e) => {
+                bail!(
+                    "the token for '{name}' never reached its reader ({e}); the device was removed"
+                )
+            }
+            None => {
+                bail!("the token for '{name}' never reached its reader; the device was removed")
+            }
+        },
+        Err(e) => match write_err {
+            Some(write) => bail!(
+                "the token for '{name}' never reached its reader ({write}) and the device could \
+                 not be removed: {e:#}; remove it with `clauth devices revoke {name}`"
+            ),
+            None => bail!(
+                "the token for '{name}' never reached its reader and the device could not be \
+                 removed: {e:#}; remove it with `clauth devices revoke {name}`"
+            ),
+        },
+    }
 }
 
 /// `clauth devices revoke <name>`.
