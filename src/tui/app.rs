@@ -2353,19 +2353,15 @@ impl App {
     }
 
     /// The profile's peak-rate state off the live price table, sampled now:
-    /// its recognized provider's own store rows when the base URL names one,
-    /// else the window constraints cost pricing reads over the profile's
-    /// pinned models. `None` when no table is loaded or neither path finds a
-    /// time-varying rate — the Usage tab's `pricing` row and the overview's
-    /// `▲` marker then do not render.
+    /// the recognized provider's own store rows — peak/off-peak is a property
+    /// of the provider, never of the pinned models. `None` when no table is
+    /// loaded or the profile has no store-backed provider (OAuth, generic
+    /// endpoints, OpenRouter) — the Usage tab's `pricing` row and the
+    /// overview's `▲` marker then do not render.
     pub(crate) fn peak_state_for(&self, profile: &Profile) -> Option<crate::pricing::PeakState> {
-        self.price_table.as_ref().and_then(|t| {
-            t.peak_state_for_profile(
-                profile.provider,
-                &profile.models.pinned(),
-                now_ms() as i64 / 1000,
-            )
-        })
+        self.price_table
+            .as_ref()
+            .and_then(|t| t.peak_state_for_profile(profile.provider, now_ms() as i64 / 1000))
     }
 
     /// UI-thread tail of bootstrap: rebuilds token snapshot, starts scheduler,

@@ -2318,13 +2318,16 @@ fn five_hour_stamp_never_lost_without_a_7d_bar_gain() {
 
 // ── peak-rate marker (▲) ─────────────────────────────────────────────────────
 
-/// A table holding one model with a flat base plus a `start`–`end` window:
-/// "00:00"–"24:00" covers every hour (peak whatever the real clock says),
-/// "12:00"–"12:00" no hour (never peak) — the two deterministic fixtures the
-/// marker tests need, time-independent by construction.
+/// A table whose `deepseek` store key holds one model with a flat base plus a
+/// `start`–`end` window: "00:00"–"24:00" covers every hour (peak whatever the
+/// real clock says), "12:00"–"12:00" no hour (never peak) — the two
+/// deterministic fixtures the marker tests need, time-independent by
+/// construction. The store-key shape is the point: the indicator is
+/// provider-bound, so the table must carry the provider's own store row.
 fn windowed_table(start: &str, end: &str) -> crate::pricing::PriceTable {
-    crate::pricing::PriceTable::capture(
-        vec![crate::pricing::PricedModel {
+    crate::pricing::PriceTable::store_key_table(
+        "deepseek",
+        crate::pricing::PricedModel {
             id: "deepseek-v4-pro".to_owned(),
             prices: vec![
                 crate::pricing::PriceEntry {
@@ -2348,21 +2351,18 @@ fn windowed_table(start: &str, end: &str) -> crate::pricing::PriceTable {
                 },
             ],
             effective_at: None,
-        }],
-        Vec::new(),
-        Vec::new(),
-        crate::pricing::CanonicalMap::default(),
-        crate::tokens::today_date(),
-        0,
-        Vec::new(),
+        },
+        "2026-01-01",
     )
 }
 
-/// A profile with one pinned model, active or not, over the shared `profile`
-/// fixture shape.
-fn pinned_profile(name: &str, model: &str) -> Profile {
+/// A profile on the deepseek endpoint — the provider whose store rows the
+/// fixture tables carry — over the shared `profile` fixture shape. The peak
+/// marker is provider-bound: what the profile pins never feeds it.
+fn peak_profile(name: &str) -> Profile {
     let mut p = profile(name, 40.0, 20.0, 3600);
-    p.models.default = Some(model.to_owned());
+    p.base_url = Some("https://api.deepseek.com/anthropic".into());
+    p.provider = Some(crate::providers::Provider::DeepSeek);
     p
 }
 
@@ -2372,11 +2372,7 @@ fn pinned_profile(name: &str, model: &str) -> Profile {
 fn peak_marker_replaces_the_active_dot() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    let config = config_with(
-        vec![pinned_profile("a", "deepseek-v4-pro")],
-        Some("a"),
-        vec![],
-    );
+    let config = config_with(vec![peak_profile("a")], Some("a"), vec![]);
     let mut app = App::new(config);
     app.price_table = Some(windowed_table("00:00", "24:00"));
     let widths = OverviewWidths::new(80, &app);
@@ -2395,11 +2391,7 @@ fn off_peak_row_keeps_the_active_dot() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     // An empty window ("12:00"–"12:00") is active at no hour.
-    let config = config_with(
-        vec![pinned_profile("a", "deepseek-v4-pro")],
-        Some("a"),
-        vec![],
-    );
+    let config = config_with(vec![peak_profile("a")], Some("a"), vec![]);
     let mut app = App::new(config);
     app.price_table = Some(windowed_table("12:00", "12:00"));
     let widths = OverviewWidths::new(80, &app);
@@ -2413,11 +2405,7 @@ fn off_peak_row_keeps_the_active_dot() {
 fn bell_outranks_the_peak_marker() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    let config = config_with(
-        vec![pinned_profile("a", "deepseek-v4-pro")],
-        Some("a"),
-        vec![],
-    );
+    let config = config_with(vec![peak_profile("a")], Some("a"), vec![]);
     let mut app = App::new(config);
     app.price_table = Some(windowed_table("00:00", "24:00"));
     app.bell_fired.insert("a".into(), true);
@@ -2435,11 +2423,7 @@ fn bell_outranks_the_peak_marker() {
 #[test]
 fn no_table_no_peak_marker() {
     let _home = crate::testutil::HomeSandbox::new();
-    let config = config_with(
-        vec![pinned_profile("a", "deepseek-v4-pro")],
-        Some("a"),
-        vec![],
-    );
+    let config = config_with(vec![peak_profile("a")], Some("a"), vec![]);
     let app = App::new(config);
     let widths = OverviewWidths::new(80, &app);
     let text = line_text(&render_overview_row(&app, 0, &widths, false, true));

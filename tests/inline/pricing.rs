@@ -1940,12 +1940,14 @@ fn zai_quota_entries_mark_windows_but_never_price() {
     // The fixture's real glm-5.3-flash row: the quota_multiplier-only entries
     // distill to `window_only` entries — the windowless one drops, the windowed
     // one marks hours — so a weekday peak hour still prices the flat base and
-    // the peak indicator sees zai's 06:00–10:00 window.
+    // the peak indicator sees zai's 06:00–10:00 window through the provider
+    // path.
     let models = distill(FIXTURE, &fixture_guard()).expect("fixture distills");
     let flash = models
         .iter()
         .find(|m| m.id == "glm-5.3-flash")
-        .expect("row distills");
+        .expect("row distills")
+        .clone();
     assert_eq!(flash.prices.len(), 2, "base plus the windowed quota marker");
     assert!(!flash.prices[0].window_only, "the base entry prices");
     assert!(flash.prices[1].window_only, "the quota entry never prices");
@@ -1966,14 +1968,16 @@ fn zai_quota_entries_mark_windows_but_never_price() {
         "no peak multiplier applies"
     );
     assert!((rate.output - 2.5e-7).abs() < 1e-15);
-    // And the indicator reads the window the pricing ignores.
-    let s = t
-        .peak_state_now(&["glm-5.3-flash"], at("2026-09-14 08:00"))
+    // And the indicator reads the window the pricing ignores: a zai store key
+    // over the same distilled row.
+    let keyed = PriceTable::store_key_table("zai", flash.clone(), "2026-08-30");
+    let s = keyed
+        .peak_state_source("zai", at("2026-09-14 08:00"))
         .expect("the quota window feeds the indicator");
     assert!(s.peak, "08:00 UTC monday sits inside 06:00–10:00");
     // Outside the window, off-peak.
-    let s = t
-        .peak_state_now(&["glm-5.3-flash"], at("2026-09-14 12:00"))
+    let s = keyed
+        .peak_state_source("zai", at("2026-09-14 12:00"))
         .expect("the quota window feeds the indicator");
     assert!(!s.peak, "12:00 UTC monday sits outside the window");
 }
@@ -3145,7 +3149,7 @@ fn dated_row(observed: &str, applies: &str, removed: bool, model: Option<PricedM
     }
 }
 
-// ── peak_state_now (the live peak indicator query) ──────────────────────────
+// ── peak_state (the provider-keyed live indicator query) ─────────────────────
 
 /// Seconds into a UTC instant: "YYYY-MM-DD HH:MM" → epoch secs.
 fn at(datetime: &str) -> i64 {
@@ -3155,26 +3159,32 @@ fn at(datetime: &str) -> i64 {
         .timestamp()
 }
 
+/// A table whose single store key under `deepseek` prices `model` today — the
+/// fixture shape every provider-keyed peak query tests reads.
+fn deepseek_store(model: PricedModel) -> PriceTable {
+    PriceTable::store_key_table("deepseek", model, "2026-01-01")
+}
+
 #[test]
 fn peak_state_prices_the_two_window_shape_hour_by_hour() {
-    let t = table(vec![two_window_model()]);
+    let t = deepseek_store(two_window_model());
     // 2026-09-14 is a monday. Inside the 06:00–10:00Z window.
     let s = t
-        .peak_state_now(&["deepseek-v4-pro"], at("2026-09-14 08:30"))
-        .expect("windowed model answers");
+        .peak_state_source("deepseek", at("2026-09-14 08:30"))
+        .expect("windowed source answers");
     assert!(s.peak, "08:30 UTC monday sits inside 06:00–10:00");
     // Off-peak starts at the 10:00 boundary.
     assert_eq!(s.next_flip, Some((false, 90 * 60)));
     // Between the windows (04:00–06:00) is off-peak, peak resumes at 06:00.
     let s = t
-        .peak_state_now(&["deepseek-v4-pro"], at("2026-09-14 05:00"))
-        .expect("windowed model answers");
+        .peak_state_source("deepseek", at("2026-09-14 05:00"))
+        .expect("windowed source answers");
     assert!(!s.peak, "05:00 UTC monday sits between the windows");
     assert_eq!(s.next_flip, Some((true, 3600)));
     // Inside the first window, off-peak resumes at 04:00.
     let s = t
-        .peak_state_now(&["deepseek-v4-pro"], at("2026-09-14 02:00"))
-        .expect("windowed model answers");
+        .peak_state_source("deepseek", at("2026-09-14 02:00"))
+        .expect("windowed source answers");
     assert!(s.peak, "02:00 UTC monday sits inside 01:00–04:00");
     assert_eq!(s.next_flip, Some((false, 2 * 3600)));
 }
@@ -3205,11 +3215,11 @@ fn peak_state_crosses_the_weekend_off_peak() {
         ],
         effective_at: None,
     };
-    let t = table(vec![m]);
+    let t = deepseek_store(m);
     // Friday 22:00 UTC: off-peak until monday 01:00 — the weekend crossing.
     let s = t
-        .peak_state_now(&["deepseek-v4-pro"], at("2026-09-11 22:00"))
-        .expect("windowed model answers");
+        .peak_state_source("deepseek", at("2026-09-11 22:00"))
+        .expect("windowed source answers");
     assert!(!s.peak, "friday evening is off-peak");
     let (to_peak, secs) = s.next_flip.expect("flip lands inside the horizon");
     assert!(to_peak, "the next flip enters peak");
@@ -3239,10 +3249,10 @@ fn peak_state_saturday_weekday_window_stays_off_peak() {
         ],
         effective_at: None,
     };
-    let t = table(vec![m]);
+    let t = deepseek_store(m);
     // Saturday 08:00 UTC — inside the window's hours but outside its days.
     let s = t
-        .peak_state_now(&["m"], at("2026-09-12 08:00"))
+        .peak_state_source("deepseek", at("2026-09-12 08:00"))
         .expect("answers");
     assert!(!s.peak, "a weekday-gated window is off-peak on saturday");
     let (to_peak, _) = s.next_flip.expect("flip lands inside the horizon");
@@ -3250,14 +3260,17 @@ fn peak_state_saturday_weekday_window_stays_off_peak() {
 }
 
 #[test]
-fn peak_state_none_for_flat_rates_and_unmatched_models() {
-    // A flat-only model: no indicator, whatever the hour.
-    let t = table(vec![eq_model("flat", 1.0, 2.0)]);
-    assert_eq!(t.peak_state_now(&["flat"], at("2026-09-14 03:00")), None);
-    // An unmatched model id: same read as the flat case — nothing to show.
-    let t2 = table(vec![two_window_model()]);
+fn peak_state_none_for_flat_rates_and_absent_sources() {
+    // A flat-only source: no indicator, whatever the hour.
+    let t = deepseek_store(eq_model("flat", 1.0, 2.0));
     assert_eq!(
-        t2.peak_state_now(&["no-such-model"], at("2026-09-14 03:00")),
+        t.peak_state_source("deepseek", at("2026-09-14 03:00")),
+        None
+    );
+    // A source the store does not carry: same read — nothing to show.
+    let t2 = deepseek_store(two_window_model());
+    assert_eq!(
+        t2.peak_state_source("minimax", at("2026-09-14 03:00")),
         None
     );
 }
@@ -3268,27 +3281,22 @@ fn peak_state_before_effective_at_is_none() {
     // window either — the same gate `entry_rate` applies.
     let mut m = two_window_model();
     m.effective_at = Some("2026-12-01".to_owned());
-    let t = table(vec![m]);
+    let t = deepseek_store(m);
     assert_eq!(
-        t.peak_state_now(&["deepseek-v4-pro"], at("2026-09-14 03:00")),
+        t.peak_state_source("deepseek", at("2026-09-14 03:00")),
         None
     );
 }
 
 #[test]
-fn peak_state_dedupes_windows_across_pinned_models() {
-    // Two pinned models of one provider carry the same schedule: one window
-    // set, one flip answer. Distinguished only by the state holding — a
-    // duplicate window cannot change `peak` or `next_flip`, so the observable
-    // is that the query still answers with the single-window values.
-    let mut second = two_window_model();
-    second.id = "deepseek-v4-flash".to_owned();
-    let t = table(vec![two_window_model(), second]);
+fn peak_state_dedupes_windows_across_a_providers_keys() {
+    // Two of the provider's models carry the same schedule: one window set,
+    // one flip answer. The store fixture gives deepseek one windowed id, so
+    // the observable is the single-window values answering — a duplicate
+    // window from a second key could not change `peak` or `next_flip`.
+    let t = provider_store_table();
     let s = t
-        .peak_state_now(
-            &["deepseek-v4-pro", "deepseek-v4-flash"],
-            at("2026-09-14 07:00"),
-        )
+        .peak_state_source("deepseek", at("2026-09-14 07:00"))
         .expect("answers");
     assert!(s.peak);
     assert_eq!(s.next_flip, Some((false, 3 * 3600)));
@@ -3296,26 +3304,14 @@ fn peak_state_dedupes_windows_across_pinned_models() {
 
 #[test]
 fn peak_state_flip_lands_on_the_hour_boundary_from_mid_hour() {
-    let t = table(vec![two_window_model()]);
+    let t = deepseek_store(two_window_model());
     // 03:59:30 — 30s before the boundary; the flip still reads as 04:00, the
     // granularity the pricing itself samples at.
     let s = t
-        .peak_state_now(&["deepseek-v4-pro"], at("2026-09-14 03:59") + 30)
+        .peak_state_source("deepseek", at("2026-09-14 03:59") + 30)
         .expect("answers");
     assert!(s.peak);
     assert_eq!(s.next_flip, Some((false, 30)));
-}
-
-#[test]
-fn peak_state_skips_an_unmatched_pin_but_keeps_the_windowed_one() {
-    let t = table(vec![two_window_model()]);
-    let s = t
-        .peak_state_now(
-            &["no-such-model", "deepseek-v4-pro"],
-            at("2026-09-14 07:00"),
-        )
-        .expect("the windowed pin still answers");
-    assert!(s.peak);
 }
 
 #[test]
@@ -3341,9 +3337,9 @@ fn peak_state_ignores_a_window_shadowed_by_a_later_flat_entry() {
         ],
         effective_at: None,
     };
-    let t = table(vec![shadowed]);
+    let t = deepseek_store(shadowed);
     assert_eq!(
-        t.peak_state_now(&["shadowed"], at("2026-09-14 12:00")),
+        t.peak_state_source("deepseek", at("2026-09-14 12:00")),
         None
     );
     // Control: the same window AFTER the flat entry prices peak all day.
@@ -3365,9 +3361,9 @@ fn peak_state_ignores_a_window_shadowed_by_a_later_flat_entry() {
         ],
         effective_at: None,
     };
-    let t2 = table(vec![winning]);
+    let t2 = deepseek_store(winning);
     let s = t2
-        .peak_state_now(&["winning"], at("2026-09-14 12:00"))
+        .peak_state_source("deepseek", at("2026-09-14 12:00"))
         .expect("an unshadowed window answers");
     assert!(s.peak);
 }
@@ -3440,45 +3436,43 @@ fn peak_state_source_reads_a_providers_own_rows() {
 }
 
 #[test]
-fn peak_state_for_profile_prefers_the_provider_path() {
+fn peak_state_for_profile_is_provider_bound() {
+    // Peak/off-peak is a property of the PROVIDER (owner ruling 2026-09-15):
+    // the provider's own store rows answer whatever the profile pins, and no
+    // provider — OAuth, generic endpoint, OpenRouter — ever reads pins.
     let t = provider_store_table();
-    // A deepseek profile pinning nothing: the provider path answers — this is
-    // the fleet the pins-only query could not see.
+    // A deepseek profile: the provider's schedule answers.
     let s = t
         .peak_state_for_profile(
             Some(crate::providers::Provider::DeepSeek),
-            &[],
             at("2026-09-14 08:00"),
         )
-        .expect("the provider answers without pins");
+        .expect("the provider answers");
     assert!(s.peak);
-    // Pins never override the provider path: a deepseek profile pinning a
-    // flat model still reads deepseek's windows.
     let s = t
         .peak_state_for_profile(
             Some(crate::providers::Provider::DeepSeek),
-            &["grok-4.5"],
             at("2026-09-14 12:00"),
         )
-        .expect("the provider path answers");
+        .expect("the provider answers");
     assert!(
         !s.peak,
         "12:00 UTC monday is off-peak on deepseek's schedule"
     );
-    // OpenRouter has no store source: the pins path serves it.
+    // OpenRouter has no store source: no indicator.
     assert_eq!(
         t.peak_state_for_profile(
             Some(crate::providers::Provider::OpenRouter),
-            &["grok-4.5"],
             at("2026-09-14 12:00")
         ),
         None,
-        "a flat pin through a store-less provider answers nothing"
+        "a store-less provider answers nothing"
     );
-    // A generic endpoint (no provider) falls to the pins path, which here
-    // finds the deepseek window through the store walk too.
-    let s = t
-        .peak_state_for_profile(None, &["deepseek-v4-pro"], at("2026-09-14 08:00"))
-        .expect("the pins path answers");
-    assert!(s.peak);
+    // A generic endpoint (no provider): no indicator — even with the very
+    // model whose windows the store carries.
+    assert_eq!(
+        t.peak_state_for_profile(None, at("2026-09-14 08:00")),
+        None,
+        "a pin is never a provider: no indicator without one"
+    );
 }

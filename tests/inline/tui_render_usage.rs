@@ -2273,11 +2273,12 @@ fn header_lines_pricing_row_only_with_windows() {
     );
 }
 
-/// A table whose one model is windowed all day — `peak_state_now` on it is
-/// peak whatever the real clock says.
+/// A table whose `deepseek` store key holds one model windowed all day — the
+/// provider's rows are peak whatever the real clock says.
 fn windowed_table_fixture() -> crate::pricing::PriceTable {
-    crate::pricing::PriceTable::capture(
-        vec![crate::pricing::PricedModel {
+    crate::pricing::PriceTable::store_key_table(
+        "deepseek",
+        crate::pricing::PricedModel {
             id: "deepseek-v4-pro".to_owned(),
             prices: vec![
                 crate::pricing::PriceEntry {
@@ -2301,25 +2302,21 @@ fn windowed_table_fixture() -> crate::pricing::PriceTable {
                 },
             ],
             effective_at: None,
-        }],
-        Vec::new(),
-        Vec::new(),
-        crate::pricing::CanonicalMap::default(),
-        crate::tokens::today_date(),
-        0,
-        Vec::new(),
+        },
+        "2026-01-01",
     )
 }
 
-/// `App::peak_state_for` wires the pinned models to the live table: a pinned
-/// windowed model answers, a pinned flat model does not, and an unpinned
-/// (OAuth-style) profile never does.
+/// `App::peak_state_for` is provider-bound: a profile on a recognized
+/// provider's endpoint answers through that provider's store rows, an OAuth
+/// profile never does, and pins are irrelevant either way.
 #[test]
-fn peak_state_for_reads_pinned_models_off_the_table() {
+fn peak_state_for_is_provider_bound() {
     let _home = crate::testutil::HomeSandbox::new();
     let table = windowed_table_fixture();
     let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("ds"));
-    profile.models.default = Some("deepseek-v4-pro".to_owned());
+    profile.base_url = Some("https://api.deepseek.com/anthropic".into());
+    profile.provider = Some(crate::providers::Provider::DeepSeek);
     let config = crate::profile::AppConfig {
         state: crate::profile::AppState::default(),
         profiles: vec![profile.clone()],
@@ -2332,12 +2329,17 @@ fn peak_state_for_reads_pinned_models_off_the_table() {
     app.price_table = Some(table);
     let s = app
         .peak_state_for(&profile)
-        .expect("pinned windowed model answers");
+        .expect("the provider's store rows answer");
     assert!(s.peak, "the all-day fixture window is always active");
 
-    // Flat model pinned → None.
-    let flat_table = crate::pricing::PriceTable::capture(
-        vec![crate::pricing::PricedModel {
+    // Pinning nothing changes nothing: the provider still answers.
+    // (The profile above pins nothing already — `blank_profile` — and the
+    // provider path answered, which is the unpinned fleet's exact shape.)
+
+    // A store key the provider does not own: flat, no indicator.
+    let flat_table = crate::pricing::PriceTable::store_key_table(
+        "deepseek",
+        crate::pricing::PricedModel {
             id: "flat".to_owned(),
             prices: vec![crate::pricing::PriceEntry {
                 input: 1.0,
@@ -2348,24 +2350,19 @@ fn peak_state_for_reads_pinned_models_off_the_table() {
                 window_only: false,
             }],
             effective_at: None,
-        }],
-        Vec::new(),
-        Vec::new(),
-        crate::pricing::CanonicalMap::default(),
-        crate::tokens::today_date(),
-        0,
-        Vec::new(),
+        },
+        "2026-01-01",
     );
-    let mut flat_profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("f"));
-    flat_profile.models.default = Some("flat".to_owned());
     app.price_table = Some(flat_table);
-    assert!(app.peak_state_for(&flat_profile).is_none());
+    assert!(app.peak_state_for(&profile).is_none());
 
-    // Nothing pinned → None even with a windowed table loaded: an unpinned
-    // (OAuth-style) profile must not pick up some other model's windows.
-    // The windowed table is rebuilt here — the previous sub-case consumed it
-    // with the flat one.
+    // No provider at all (OAuth-style): never an indicator — even with the
+    // windowed table loaded, pins or no pins.
     app.price_table = Some(windowed_table_fixture());
-    let bare = crate::testutil::blank_profile(&crate::profile::ProfileName::from("b"));
-    assert!(app.peak_state_for(&bare).is_none());
+    let mut bare = crate::testutil::blank_profile(&crate::profile::ProfileName::from("b"));
+    bare.models.default = Some("deepseek-v4-pro".to_owned());
+    assert!(
+        app.peak_state_for(&bare).is_none(),
+        "a pin is never a provider: no indicator without one"
+    );
 }

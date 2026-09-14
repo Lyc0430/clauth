@@ -468,6 +468,32 @@ impl PriceTable {
         }
     }
 
+    /// Test-only table for the provider-keyed peak indicator: one store key
+    /// under `source`, its single row priced at `model` with `observed` as
+    /// both stamps and no snapshot half. `StoreKey`'s fields are private to
+    /// this module, so test mods outside it build the store through here.
+    #[cfg(test)]
+    pub(crate) fn store_key_table(source: &str, model: PricedModel, observed: &str) -> Self {
+        Self {
+            models: Vec::new(),
+            history: Vec::new(),
+            store: vec![StoreKey {
+                source: source.to_owned(),
+                id: model.id.clone(),
+                rows: vec![StoreRow {
+                    observed: observed.to_owned(),
+                    applies: observed.to_owned(),
+                    removed: false,
+                    model: Some(model),
+                }],
+            }],
+            aliases: Vec::new(),
+            canonical: CanonicalMap::default(),
+            fetched_at_ms: 0,
+            memo: Mutex::default(),
+        }
+    }
+
     /// Rate for a model id at `(date, hour)`:
     ///
     /// 1. The id is bracket-stripped (a trailing `[<digits>k|m]` context
@@ -677,40 +703,6 @@ impl PriceTable {
         Some(total)
     }
 
-    /// Time-varying pricing state for one profile's pinned models, sampled at
-    /// `now_secs` — the live peak indicator the Usage tab and the overview rows
-    /// render. The PINS path of [`PriceTable::peak_state_for_profile`]: a
-    /// recognized provider answers through its store rows there, so this walk
-    /// serves the generic endpoints (and any pin set a provider query cannot
-    /// answer). Windows come from the SAME entries [`rate_at`] picks (the alias
-    /// ladder and the `effective_at` gate included), never a second opinion,
-    /// plus any [`window_only`](PriceEntry::window_only) entries the distill
-    /// kept. `None` when no model matches, or every match carries only flat
-    /// rates — such a profile never pays a time-varying rate and gets no
-    /// indicator.
-    ///
-    /// The feed models a peak tier as a windowed override over a cheaper flat
-    /// base (deepseek v4), so an active window IS peak; the state is the window
-    /// predicate, not a rate comparison.
-    pub(crate) fn peak_state_now(&self, models: &[&str], now_secs: i64) -> Option<PeakState> {
-        let utc = DateTime::from_timestamp(now_secs, 0)?;
-        let date = utc.date_naive();
-        let date_s = date.format("%Y-%m-%d").to_string();
-        let hour = utc.hour() as u8;
-        // Distinct windows across the matched models (two pinned models of one
-        // provider carry the same schedule — dedupe to one). An unmatched pin
-        // contributes nothing rather than voiding the query: the other pins
-        // still price what they price.
-        let mut windows: Vec<Constraint> = Vec::new();
-        for id in models {
-            let Some((set, idx)) = self.matched(id, &date_s) else {
-                continue;
-            };
-            push_model_windows(&set[idx], &date_s, date, &mut windows);
-        }
-        finish_peak_state(windows, date, hour, now_secs)
-    }
-
     /// The provider path of the peak indicator: windows from every row the
     /// named store `source` (see [`Provider::store_source`](crate::providers::Provider::store_source))
     /// itself prices today, regardless of what the profile pins. A recognized
@@ -736,25 +728,23 @@ impl PriceTable {
         finish_peak_state(windows, date, hour, now_secs)
     }
 
-    /// The peak indicator for a whole profile: its provider's own store rows
-    /// when the base URL names a provider the store carries, else the pinned
-    /// ids. The provider path answers whenever it can — a recognized provider
-    /// charges its windows whatever the profile pins — and the pins path
-    /// covers the generic endpoints, the providers whose rows never survive
-    /// the resold guard (OpenRouter), and any window a pin set holds that the
-    /// provider walk cannot see.
+    /// The peak indicator for a whole profile: its provider's own store rows,
+    /// nothing else. Peak/off-peak is a property of the PROVIDER (owner ruling
+    /// 2026-09-15): a recognized provider charges its windows whatever the
+    /// profile pins, and an endpoint clauth does not recognize has no schedule
+    /// clauth can name — pinned models matching another provider's rows would
+    /// price a schedule that endpoint never charges (a reseller fronting
+    /// deepseek ids is not on deepseek's clock), so pins never feed the
+    /// indicator. `None` for every profile without a store-backed provider:
+    /// OAuth accounts, generic endpoints, OpenRouter (its first-party rows
+    /// never survive the resold guard).
     pub(crate) fn peak_state_for_profile(
         &self,
         provider: Option<crate::providers::Provider>,
-        pins: &[&str],
         now_secs: i64,
     ) -> Option<PeakState> {
-        if let Some(source) = provider.and_then(|p| p.store_source())
-            && let Some(state) = self.peak_state_source(source, now_secs)
-        {
-            return Some(state);
-        }
-        self.peak_state_now(pins, now_secs)
+        let source = provider?.store_source()?;
+        self.peak_state_source(source, now_secs)
     }
 }
 
