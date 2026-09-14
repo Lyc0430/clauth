@@ -192,7 +192,8 @@ A key clauth does not know (written by a newer release, or added by hand) is kep
   ai_pricelog_v4_price_cache.json  # ai-pricelog model prices for the cost lens
   status_cache.json        # status.claude.com incident feed
   status.json              # the daemon's published snapshot (see Daemon)
-  auth_token.json          # the REST API's bearer token, created by `--print-token` (0600)
+  devices.json             # devices paired with the REST API: name, tier, a SHA-256 of each token (0600)
+  pairing.json             # the waiting pairing code's SHA-256 while `clauth devices pair` runs (0600)
   tls.json                 # REST API certificate directory, written on the first `--listen` start
   session_profiles.json    # which account each Claude Code session ran on
   token_ledger.json        # the per-day token ledger behind the Tokens tab
