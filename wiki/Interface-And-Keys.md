@@ -7,7 +7,7 @@
 | Tab | Holds | You can |
 |-----|-------|---------|
 | **Overview** | account table, live 5h / 7d bars, chain position | switch accounts, reorder them |
-| **Usage** | per-account window breakdown: 5h, 7d, per-model weeks, extra-usage spend | refresh one account, toggle estimates and the pace marker |
+| **Usage** | per-account window breakdown: 5h, 7d, per-model weeks, extra-usage spend, peak-rate state | refresh one account, toggle estimates and the pace marker |
 | **Tokens** | global Claude Code token stats and API-equivalent cost | drill into models, change the period lens, count cache tokens |
 | **Setup** | per-account endpoint, key, env, model routing, auto-start | edit any of it, log in, log out, disable, delete |
 | **Fallback** | the auto-switch chain | reorder members, edit thresholds, flip gates, set a spend ceiling |
@@ -15,7 +15,7 @@
 | **Status** | incidents from status.claude.com with per-component health | open an incident's timeline or its page in a browser |
 | **Plugin** | Claude Code wiring health, per-profile runtime state, running delegates | apply one-key fixes |
 
-The active account is orange. Usage numbers are cached on disk, so they stay on screen when the API is rate-limited or unreachable. Once those figures age past the refresh cadence's stale threshold, the Usage tab's status block adds a `[ stale ]` pill; it reads the age of the reading — an OAuth account's own fetch stamp, one it cannot date reading stale at once, or a third-party account's cache write time — not the last fetch outcome, so a `[ cached ]` pill and it can appear together.
+The active account is orange. A `▲` on an account's row means its pinned models are on peak-rate hours right now — some providers (DeepSeek, Z.ai's GLM-5.3) charge roughly double at set times of day; the Usage tab's `pricing` row names the state, the countdown to the next switch, and nothing renders for flat-rate accounts. Usage numbers are cached on disk, so they stay on screen when the API is rate-limited or unreachable. Once those figures age past the refresh cadence's stale threshold, the Usage tab's status block adds a `[ stale ]` pill; it reads the age of the reading — an OAuth account's own fetch stamp, one it cannot date reading stale at once, or a third-party account's cache write time — not the last fetch outcome, so a `[ cached ]` pill and it can appear together.
 
 ## Keys
 
