@@ -482,6 +482,39 @@ fn only_the_401_carries_a_bearer_challenge() {
     assert!(!ok.contains("WWW-Authenticate"));
 }
 
+/// The one error body is typed now, and serializes to exactly the bytes the
+/// `json!` it replaced produced. The load-bearing half is the absent `reason`:
+/// an `error()` answer has no `reason` key today, so `None` must be skipped,
+/// never written as `null` — while `refused()` adds the key when it has one.
+#[test]
+fn the_error_body_serializes_byte_identically_to_the_json_it_replaced() {
+    let code = "bad_request";
+    let reason = "this device is paired view-only";
+
+    assert_eq!(
+        Response::error(400, code).body,
+        serde_json::to_vec(&serde_json::json!({ "ok": false, "error": code }))
+            .expect("json! serializes"),
+        "error() is byte-identical to the json! it replaced"
+    );
+    assert_eq!(
+        Response::refused(403, "control_required", reason).body,
+        serde_json::to_vec(&serde_json::json!({
+            "ok": false,
+            "error": "control_required",
+            "reason": reason,
+        }))
+        .expect("json! serializes"),
+        "refused() is byte-identical to the json! it replaced"
+    );
+    assert_eq!(
+        Response::unauthorized().body,
+        serde_json::to_vec(&serde_json::json!({ "ok": false, "error": "unauthorized" }))
+            .expect("json! serializes"),
+        "unauthorized() is error(401, \"unauthorized\"), no reason key"
+    );
+}
+
 /// The connection budget is wall-clock, not per-read: without it a peer
 /// trickling a byte just under the socket timeout holds a slot indefinitely.
 ///

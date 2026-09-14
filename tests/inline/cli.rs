@@ -649,6 +649,7 @@ fn daemon_modes_are_mutually_exclusive_and_default_to_exit_if_running() {
         listen,
         cert,
         key,
+        dump_openapi,
     } = command(&["daemon"])
     else {
         panic!("must parse");
@@ -657,6 +658,10 @@ fn daemon_modes_are_mutually_exclusive_and_default_to_exit_if_running() {
         (standby, no_standby, replace, status),
         (false, false, false, false),
         "bare `clauth daemon` picks no mode, which dispatch reads as exit-if-running"
+    );
+    assert!(
+        !dump_openapi,
+        "the document dump is opt-in exactly like the listener"
     );
     assert_eq!(
         listen, None,
@@ -682,6 +687,7 @@ fn daemon_modes_are_mutually_exclusive_and_default_to_exit_if_running() {
             listen,
             cert: _,
             key: _,
+            dump_openapi: _,
         } = command(args)
         else {
             panic!("{args:?} must parse");
@@ -849,6 +855,67 @@ fn the_retired_token_flags_are_unknown_arguments() {
             "{args:?}"
         );
         assert_eq!(err.exit_code(), 2, "{args:?}");
+    }
+}
+
+/// `--dump-openapi` writes the exact bytes `GET /api/v1/openapi.json` serves.
+/// Driven through `write_openapi_document` into a buffer, never the real
+/// stdout: the document is ~27 KB and printing it on every selecting run is
+/// noise. The no-home pin and the gone-reader exit live in
+/// `tests/dump_openapi.rs`, which spawns the real binary.
+#[test]
+fn dump_openapi_writes_the_served_bytes_verbatim() {
+    let mut buf: Vec<u8> = Vec::new();
+    crate::write_openapi_document(&mut buf).expect("dump must write");
+    assert_eq!(
+        buf,
+        crate::daemon::api::routes::openapi_document_bytes().expect("document serializes"),
+        "the dump must be the exact bytes GET /api/v1/openapi.json serves"
+    );
+}
+
+/// A reader that left mid-dump ends the dump at `Ok` — exit 0 at the real
+/// entry — because the pipeline reported what the reader returned, not this run
+/// failing.
+#[test]
+fn dump_openapi_ends_ok_when_the_reader_is_gone() {
+    struct BrokenPipe;
+    impl std::io::Write for BrokenPipe {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    crate::write_openapi_document(&mut BrokenPipe)
+        .expect("a gone reader ends the dump at Ok, not an error");
+}
+
+/// `--dump-openapi` refuses every flag that starts or probes a daemon, so no
+/// invocation can ask for both a document dump and a listener/certificate/probe.
+#[test]
+fn dump_openapi_conflicts_with_every_daemon_starting_or_probing_flag() {
+    for (other, value) in [
+        ("--standby", None),
+        ("--no-standby", None),
+        ("--replace", None),
+        ("--status", None),
+        ("--listen", None),
+        ("--cert", Some("/tmp/a.crt")),
+        ("--key", Some("/tmp/a.key")),
+    ] {
+        let mut args = vec!["daemon", "--dump-openapi", other];
+        if let Some(v) = value {
+            args.push(v);
+        }
+        let err = parse(&args).expect_err("--dump-openapi must refuse this flag");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "--dump-openapi + {other}"
+        );
+        assert_eq!(err.exit_code(), 2, "--dump-openapi + {other}");
     }
 }
 
@@ -1266,6 +1333,7 @@ fn an_absent_daemon_reports_exit_one_not_the_usage_code() {
             listen: None,
             cert: None,
             key: None,
+            dump_openapi: false,
         }),
     })
     .expect_err("no daemon is running in the sandbox");

@@ -16,9 +16,10 @@
 //!     `Authorization: Bearer <token>` from a paired device, and the switch
 //!     needs one paired with control; see [`devices`], [`pairing`], and the
 //!     table in [`routes`].
-//!   * **Three operations.** Read the status feed, switch the active account,
-//!     redeem a pairing code. The switch goes through the same action the MCP
-//!     tool uses, so anything needing human eyes is refused here too.
+//!   * **Operations.** The health check, the status feed, the OpenAPI document,
+//!     the account switch (control devices only), and the pairing redemption.
+//!     The switch goes through the same action the MCP tool uses, so anything
+//!     needing human eyes is refused here too.
 //!   * **Thread per connection**, capped and time-bounded. Connections persist
 //!     across requests and serve pipelined ones in order; see [`http`] for the
 //!     framing rules that makes safe. No async runtime.

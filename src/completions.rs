@@ -22,7 +22,7 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
     elif [ "${COMP_WORDS[1]}" = "start" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--isolated --with-fallback" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "daemon" ] && [ "${cur:0:2}" = "--" ]; then
-        COMPREPLY=( $(compgen -W "--standby --no-standby --replace --status --listen --cert --key" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "--standby --no-standby --replace --status --listen --cert --key --dump-openapi" -- "${cur}") )
     elif [ "$prev" = "--isolated" ] || [ "$prev" = "--with-fallback" ] || [ "$prev" = "--profile" ]; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
@@ -157,7 +157,8 @@ _clauth() {
             '--status[print the running daemon, or exit 1 when none is]' \
             '--listen[also serve the REST API over TLS, default 0.0.0.0:8443]' \
             '--cert[serve this certificate instead of the lego one; needs --key]' \
-            '--key[private key for --cert]'
+            '--key[private key for --cert]' \
+            '--dump-openapi[print the OpenAPI document the REST API serves, and start nothing]'
     elif (( CURRENT >= 3 )) && [[ "${words[2]}" == status ]]; then
         _values 'flag' '--json[print the status snapshot as JSON]' '--all[also list disabled profiles]' '--disabled[also list disabled profiles]'
     elif (( CURRENT >= 3 )) && [[ "${words[2]}" == list ]]; then
@@ -233,6 +234,7 @@ complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --status -d "Pr
 complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --listen -d "Also serve the REST API over TLS, default 0.0.0.0:8443"
 complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --cert -d "Serve this certificate instead of the lego one; needs --key"
 complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --key -d "Private key for --cert"
+complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --dump-openapi -d "Print the OpenAPI document the REST API serves, and start nothing"
 complete -c clauth -f -n "__fish_seen_subcommand_from devices" -a pair -d "Print a one-time pairing code and wait for it"
 complete -c clauth -f -n "__fish_seen_subcommand_from devices" -a add -d "Mint a token for a device here and print it once"
 complete -c clauth -f -n "__fish_seen_subcommand_from devices" -a revoke -d "Remove a device"

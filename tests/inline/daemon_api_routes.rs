@@ -402,10 +402,929 @@ fn the_route_table_is_exactly_this() {
             ("HEAD", "/health", Access::View),
             ("GET", "/status", Access::View),
             ("HEAD", "/status", Access::View),
+            ("GET", "/openapi.json", Access::View),
+            ("HEAD", "/openapi.json", Access::View),
             ("POST", "/switch", Access::Control),
             ("POST", "/pair", Access::None),
         ]
     );
+}
+
+// -------------------------------------------------------------- openapi
+
+/// The operation the document emits for one table row.
+fn doc_operation<'a>(
+    doc: &'a utoipa::openapi::OpenApi,
+    method: &str,
+    path: &str,
+) -> Option<&'a utoipa::openapi::path::Operation> {
+    let method = match method {
+        "GET" => utoipa::openapi::path::HttpMethod::Get,
+        "HEAD" => utoipa::openapi::path::HttpMethod::Head,
+        "POST" => utoipa::openapi::path::HttpMethod::Post,
+        _ => return None,
+    };
+    doc.paths
+        .get_path_operation(format!("{API_PREFIX}{path}"), method)
+}
+
+/// Every operation the document carries, as `(method, path under API_PREFIX)`.
+fn all_operations(
+    doc: &utoipa::openapi::OpenApi,
+) -> Vec<(&str, &str, &utoipa::openapi::path::Operation)> {
+    let mut operations = Vec::new();
+    for (path, item) in &doc.paths.paths {
+        let Some(rel) = path.strip_prefix(API_PREFIX) else {
+            panic!("documented path outside API_PREFIX: {path}");
+        };
+        for (method, op) in [
+            ("GET", item.get.as_ref()),
+            ("HEAD", item.head.as_ref()),
+            ("POST", item.post.as_ref()),
+            ("PUT", item.put.as_ref()),
+            ("DELETE", item.delete.as_ref()),
+            ("OPTIONS", item.options.as_ref()),
+            ("PATCH", item.patch.as_ref()),
+            ("TRACE", item.trace.as_ref()),
+        ] {
+            if let Some(op) = op {
+                operations.push((method, rel, op));
+            }
+        }
+    }
+    operations
+}
+
+/// The document's operations, one per row, sorted.
+fn document_rows(doc: &utoipa::openapi::OpenApi) -> Vec<(String, String)> {
+    let mut rows: Vec<(String, String)> = all_operations(doc)
+        .into_iter()
+        .map(|(method, rel, _)| (method.to_string(), rel.to_string()))
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// One operation's EFFECTIVE security must state its row's access: `view` and
+/// `control` ride the `bearer` scheme's roles, and `Access::None` carries none
+/// at all. An operation with no `security` of its own inherits the document's
+/// top-level requirement, so the test compares the requirement a client
+/// actually faces, not the annotation alone.
+fn assert_doc_security(
+    operation: &utoipa::openapi::path::Operation,
+    route: &Route,
+    top_level: Option<&[utoipa::openapi::security::SecurityRequirement]>,
+) {
+    let effective = operation
+        .security
+        .as_deref()
+        .unwrap_or_else(|| top_level.unwrap_or(&[]));
+    match route.access {
+        Access::View | Access::Control => {
+            let role = if route.access == Access::View {
+                "view"
+            } else {
+                "control"
+            };
+            assert_eq!(effective.len(), 1, "{} {}", route.method, route.path);
+            let expected = serde_json::to_value(
+                utoipa::openapi::security::SecurityRequirement::new("bearer", [role]),
+            )
+            .expect("security requirement serializes");
+            assert_eq!(
+                serde_json::to_value(&effective[0]).expect("security requirement serializes"),
+                expected,
+                "{} {} must require bearer {role}",
+                route.method,
+                route.path
+            );
+        }
+        Access::None => assert!(
+            effective.is_empty(),
+            "{} {} must carry no security requirement",
+            route.method,
+            route.path
+        ),
+    }
+}
+
+/// The document and [`ROUTES`] name the same set in both directions, and each
+/// operation's security states its row's access. An unannotated row, or an
+/// annotation whose role disagrees with its row, reds this.
+#[test]
+fn the_openapi_document_matches_the_route_table_both_ways() {
+    let doc = <ApiDoc as utoipa::OpenApi>::openapi();
+
+    for route in ROUTES {
+        // A HEAD row is documented by its GET operation: RFC 9110 §9.3 serves
+        // the GET answer minus the body, so one `#[utoipa::path(get)]` covers
+        // both table rows.
+        let method = if route.method == "HEAD" {
+            "GET"
+        } else {
+            route.method
+        };
+        let operation = doc_operation(&doc, method, route.path).unwrap_or_else(|| {
+            panic!(
+                "{} {} is missing from the OpenAPI document",
+                route.method, route.path
+            )
+        });
+        assert_doc_security(operation, route, doc.security.as_deref());
+    }
+
+    // The document names each GET operation once; its HEAD rows are those same
+    // operations minus the body, so the reverse direction compares the
+    // non-HEAD rows.
+    let mut table_rows: Vec<(String, String)> = ROUTES
+        .iter()
+        .filter(|route| route.method != "HEAD")
+        .map(|route| (route.method.to_string(), route.path.to_string()))
+        .collect();
+    table_rows.sort();
+    assert_eq!(
+        document_rows(&doc),
+        table_rows,
+        "every documented operation must be a route"
+    );
+}
+
+/// The auth-layer answers one access implies: each status code and the error
+/// code(s) its description must name, as [`handle`] produces them.
+fn auth_answers(access: Access) -> Vec<(u16, Vec<&'static str>)> {
+    match access {
+        Access::None => Vec::new(),
+        Access::View => vec![
+            (401, vec!["unauthorized"]),
+            (403, vec!["device_tier_unknown"]),
+            (500, vec!["internal"]),
+        ],
+        Access::Control => vec![
+            (401, vec!["unauthorized"]),
+            (403, vec!["device_tier_unknown", "control_required"]),
+            (500, vec!["internal"]),
+        ],
+    }
+}
+
+/// Every operation documents the auth answers its row's access implies, each
+/// as an `ErrorBody` by `$ref`, with the 403 naming every refusal code the
+/// router sends for that access. The expected set derives from
+/// `ROUTES[].access`, the field the router decides on, so a new access level
+/// cannot ship an undocumented answer.
+#[test]
+fn every_operation_documents_the_auth_answers_its_access_implies() {
+    let doc = <ApiDoc as utoipa::OpenApi>::openapi();
+
+    for route in ROUTES {
+        let method = if route.method == "HEAD" {
+            "GET"
+        } else {
+            route.method
+        };
+        let operation = doc_operation(&doc, method, route.path).unwrap_or_else(|| {
+            panic!(
+                "{} {} is missing from the OpenAPI document",
+                route.method, route.path
+            )
+        });
+
+        if route.access == Access::None {
+            assert!(
+                !operation.responses.responses.contains_key("401"),
+                "{} {} must gain no auth 401",
+                route.method,
+                route.path
+            );
+        }
+
+        for (status, codes) in auth_answers(route.access) {
+            let response = operation
+                .responses
+                .responses
+                .get(&status.to_string())
+                .unwrap_or_else(|| {
+                    panic!("{} {} must document {status}", route.method, route.path)
+                });
+            let utoipa::openapi::RefOr::T(response) = response else {
+                panic!(
+                    "{} {} status {status} must be an inline response",
+                    route.method, route.path
+                );
+            };
+            let content = response.content.get("application/json").unwrap_or_else(|| {
+                panic!(
+                    "{} {} status {status} must be json",
+                    route.method, route.path
+                )
+            });
+            let Some(utoipa::openapi::RefOr::Ref(schema)) = content.schema.as_ref() else {
+                panic!(
+                    "{} {} status {status} must reference ErrorBody",
+                    route.method, route.path
+                );
+            };
+            assert_eq!(
+                schema.ref_location, "#/components/schemas/ErrorBody",
+                "{} {} status {status}",
+                route.method, route.path
+            );
+            for code in codes {
+                assert!(
+                    response.description.contains(code),
+                    "{} {} status {status} must name {code}",
+                    route.method,
+                    route.path
+                );
+            }
+        }
+    }
+}
+
+/// OpenAPI 3.1 requires every `operationId` to be unique, and both client
+/// generators key operations on it.
+#[test]
+fn every_operation_id_is_unique() {
+    let doc = <ApiDoc as utoipa::OpenApi>::openapi();
+    let mut seen: std::collections::BTreeMap<&str, (&str, &str)> =
+        std::collections::BTreeMap::new();
+    for (method, path, operation) in all_operations(&doc) {
+        let Some(id) = operation.operation_id.as_deref() else {
+            panic!("{method} {path} must name an operationId");
+        };
+        if let Some((first_method, first_path)) = seen.insert(id, (method, path)) {
+            panic!(
+                "operationId {id} is duplicated by {first_method} {first_path} and {method} {path}"
+            );
+        }
+    }
+}
+
+/// One function is the whole source: two calls return byte-identical documents.
+#[test]
+fn the_openapi_document_is_identical_across_calls() {
+    assert_eq!(
+        openapi_document_bytes().expect("document serializes"),
+        openapi_document_bytes().expect("document serializes")
+    );
+}
+
+/// The route serves exactly the one document's bytes, 200.
+#[test]
+fn the_openapi_route_serves_the_documents_bytes() {
+    let _home = HomeSandbox::new();
+    let ctx = ctx_with(seeded_config());
+    let resp = call(&ctx, &req("GET", "/api/v1/openapi.json", Some(TOKEN), ""));
+    assert_eq!(resp.status, 200);
+    assert_eq!(
+        resp.body,
+        openapi_document_bytes().expect("document serializes")
+    );
+}
+
+/// Item 4: the document names the `bearer` http scheme, the status query
+/// parameters and its 304, and every error answer is the `ErrorBody` schema.
+#[test]
+fn the_document_names_the_bearer_scheme_queries_304_and_errors() {
+    let doc = <ApiDoc as utoipa::OpenApi>::openapi();
+
+    let components = doc
+        .components
+        .as_ref()
+        .expect("the document has components");
+    let scheme = components
+        .security_schemes
+        .get("bearer")
+        .expect("the bearer scheme exists");
+    match scheme {
+        utoipa::openapi::security::SecurityScheme::Http(http) => {
+            assert!(http.scheme == utoipa::openapi::security::HttpAuthScheme::Bearer);
+            assert_eq!(
+                http.description.as_deref(),
+                Some("Authorization: Bearer <device token>")
+            );
+        }
+        _ => panic!("bearer must be an http scheme"),
+    }
+
+    let status = doc_operation(&doc, "GET", "/status").expect("status operation");
+    let params = status
+        .parameters
+        .as_ref()
+        .expect("status names its parameters");
+    assert_eq!(params.len(), 3);
+    assert_eq!(params[0].name, "all");
+    assert_eq!(params[1].name, "wait");
+    assert_eq!(params[2].name, "If-None-Match");
+    assert!(
+        params[..2]
+            .iter()
+            .all(|param| param.parameter_in == utoipa::openapi::path::ParameterIn::Query),
+        "all and wait are query parameters"
+    );
+    assert!(
+        params[2].parameter_in == utoipa::openapi::path::ParameterIn::Header,
+        "If-None-Match is a header parameter"
+    );
+    assert!(
+        status.responses.responses.contains_key("304"),
+        "status documents its 304"
+    );
+
+    for (method, path, operation) in all_operations(&doc) {
+        for (status, response) in &operation.responses.responses {
+            let Ok(code) = status.parse::<u16>() else {
+                continue;
+            };
+            if code < 400 {
+                continue;
+            }
+            let utoipa::openapi::RefOr::T(response) = response else {
+                panic!("{method} {path} status {status} must be an inline error");
+            };
+            let content = response
+                .content
+                .get("application/json")
+                .unwrap_or_else(|| panic!("{method} {path} status {status} must be json"));
+            let Some(utoipa::openapi::RefOr::Ref(schema)) = content.schema.as_ref() else {
+                panic!("{method} {path} status {status} must reference ErrorBody");
+            };
+            assert_eq!(
+                schema.ref_location, "#/components/schemas/ErrorBody",
+                "{method} {path} status {status}"
+            );
+        }
+    }
+}
+
+/// Run `req` through the router and walk the answer's body against the schema
+/// the document names for `(method, path, status)`; a documented answer with no
+/// body must have arrived empty. The driven `(method, path, status)` is
+/// recorded, as is the `error` code of every `ErrorBody` answer keyed to that
+/// (operation, status), and for an `ErrorBody` answer its `error` code must
+/// appear inside backticks in the description the document gives that answer —
+/// so a produced answer the document misdescribes fails here by derivation,
+/// not by a copied string.
+fn check_answer(
+    doc: &utoipa::openapi::OpenApi,
+    method: &str,
+    path: &str,
+    status: u16,
+    resp: &Response,
+    driven: &mut std::collections::HashSet<(String, String, u16)>,
+    produced: &mut std::collections::HashSet<(String, String, u16, String)>,
+) {
+    assert_eq!(resp.status, status, "{method} {path}");
+    driven.insert((method.to_string(), path.to_string(), status));
+    let operation = doc_operation(doc, method, path)
+        .unwrap_or_else(|| panic!("{method} {path} is missing from the document"));
+    let response = operation
+        .responses
+        .responses
+        .get(&status.to_string())
+        .unwrap_or_else(|| panic!("{method} {path} must document {status}"));
+    let utoipa::openapi::RefOr::T(response) = response else {
+        panic!("{method} {path} {status} must be an inline response");
+    };
+    let Some(content) = response.content.get("application/json") else {
+        assert!(
+            resp.body.is_empty(),
+            "{method} {path} {status} documents no body but the answer carries one"
+        );
+        return;
+    };
+    let Some(schema) = content.schema.as_ref() else {
+        assert!(
+            resp.body.is_empty(),
+            "{method} {path} {status} documents no body but the answer carries one"
+        );
+        return;
+    };
+    let body = body_json(resp);
+    crate::testutil::schema_agrees(
+        &body,
+        schema,
+        doc.components
+            .as_ref()
+            .expect("the document has components"),
+    );
+    if let Some(code) = body.get("error").and_then(serde_json::Value::as_str) {
+        produced.insert((
+            method.to_string(),
+            path.to_string(),
+            status,
+            code.to_string(),
+        ));
+        assert!(
+            response.description.contains(&format!("`{code}`")),
+            "{method} {path} {status} must name `{code}` inside backticks in its description"
+        );
+    }
+}
+
+/// Every backtick-quoted token in a description, in order. Error descriptions
+/// name their `error` codes this way, so the reverse sweep can pin the named
+/// set to exactly the produced set without a hand-typed list. A description
+/// with an unmatched backtick is malformed and yields `Err`, never a truncated
+/// token stream.
+fn backtick_tokens(description: &str) -> Result<Vec<String>, ()> {
+    let mut tokens = Vec::new();
+    let mut rest = description;
+    while let Some(open) = rest.find('`') {
+        let after_open = &rest[open + 1..];
+        let Some(close) = after_open.find('`') else {
+            return Err(());
+        };
+        tokens.push(after_open[..close].to_string());
+        rest = &after_open[close + 1..];
+    }
+    Ok(tokens)
+}
+
+/// Drive the real router through each documented success answer and every
+/// documented error answer the fixtures reach in process, and walk each body
+/// against the schema the document names for that operation and status. A
+/// documented answer with no body (the status 304) must arrive empty, and so
+/// must every HEAD answer, whose body the serve loop strips one layer above the
+/// router. Every driven `ErrorBody` answer's `error` code must appear inside
+/// backticks in the description the document gives that (operation, status), every code an
+/// `ErrorBody` description names must be one a driven answer produced for that
+/// (operation, status), and every documented (operation, status) must be
+/// produced by at least one request below — so a produced answer the document
+/// misdescribes, a code the document names nothing produces, and a documented
+/// answer nothing produces all fail, each naming itself. The openapi document's own 200 is
+/// the one free-form body: utoipa documents `serde_json::Value` as an empty
+/// schema the walk refuses by design, so this test pins that contract and
+/// checks the bytes instead.
+#[test]
+fn every_reachable_answer_matches_the_schema_the_document_names() {
+    let _home = HomeSandbox::new();
+    let doc = <ApiDoc as utoipa::OpenApi>::openapi();
+    let config = seeded_config();
+    let ctx = ctx_with(std::sync::Arc::clone(&config));
+    let mut driven = std::collections::HashSet::new();
+    let mut produced = std::collections::HashSet::new();
+
+    // The switch_failed 500, posed the way the switch-failure route tests pose
+    // it: a diverged-looking live slot and the Discard default reach the link
+    // publish, and a directory at the live credentials path fails it. Driven
+    // before the successful switch so the outgoing profile is still alpha.
+    {
+        let mut cfg = config.lock().expect("config");
+        cfg.state.default_divergence = Some(DivergenceChoice::Discard);
+    }
+    let claude_dir = crate::profile::claude_dir().expect("claude dir");
+    std::fs::create_dir_all(claude_dir.join(".credentials.json")).expect("pose the wedge");
+    let switch_failed = call(
+        &ctx,
+        &req(
+            "POST",
+            "/api/v1/switch",
+            Some(TOKEN),
+            r#"{"profile":"beta"}"#,
+        ),
+    );
+    std::fs::remove_dir_all(claude_dir.join(".credentials.json")).expect("clear the wedge");
+    check_answer(
+        &doc,
+        "POST",
+        "/switch",
+        500,
+        &switch_failed,
+        &mut driven,
+        &mut produced,
+    );
+
+    // Success answers, in an order that leaves the store and state lock free.
+    let health = call(&ctx, &req("GET", "/api/v1/health", Some(TOKEN), ""));
+    check_answer(
+        &doc,
+        "GET",
+        "/health",
+        200,
+        &health,
+        &mut driven,
+        &mut produced,
+    );
+
+    let status = call(&ctx, &req("GET", "/api/v1/status", Some(TOKEN), ""));
+    check_answer(
+        &doc,
+        "GET",
+        "/status",
+        200,
+        &status,
+        &mut driven,
+        &mut produced,
+    );
+    let tag = status
+        .etag
+        .clone()
+        .expect("a status 200 carries an entity tag");
+    let not_modified = call(&ctx, &req_tagged("/api/v1/status", Some(TOKEN), &tag));
+    check_answer(
+        &doc,
+        "GET",
+        "/status",
+        304,
+        &not_modified,
+        &mut driven,
+        &mut produced,
+    );
+
+    let switched = call(
+        &ctx,
+        &req(
+            "POST",
+            "/api/v1/switch",
+            Some(TOKEN),
+            r#"{"profile":"beta"}"#,
+        ),
+    );
+    check_answer(
+        &doc,
+        "POST",
+        "/switch",
+        200,
+        &switched,
+        &mut driven,
+        &mut produced,
+    );
+
+    let code = pairing::begin(
+        &devices::DeviceName::parse("phone").expect("device name"),
+        Tier::View,
+    )
+    .expect("mint a pairing code")
+    .code()
+    .to_string();
+    let pair_body = serde_json::to_string(&serde_json::json!({"code": code})).expect("pair body");
+    let paired = call(&ctx, &req("POST", "/api/v1/pair", None, &pair_body));
+    check_answer(
+        &doc,
+        "POST",
+        "/pair",
+        201,
+        &paired,
+        &mut driven,
+        &mut produced,
+    );
+
+    // The document's own 200 is `body = serde_json::Value`: utoipa renders it
+    // as an empty schema, which the walk refuses by design.
+    let openapi = call(&ctx, &req("GET", "/api/v1/openapi.json", Some(TOKEN), ""));
+    assert_eq!(openapi.status, 200);
+    assert_eq!(
+        openapi.body,
+        openapi_document_bytes().expect("document serializes")
+    );
+    let openapi_op = doc_operation(&doc, "GET", "/openapi.json").expect("openapi.json operation");
+    let openapi_response = openapi_op
+        .responses
+        .responses
+        .get("200")
+        .expect("200 documented");
+    let utoipa::openapi::RefOr::T(openapi_response) = openapi_response else {
+        panic!("openapi.json 200 must be an inline response");
+    };
+    let openapi_content = openapi_response
+        .content
+        .get("application/json")
+        .expect("json content");
+    let openapi_schema = openapi_content.schema.as_ref().expect("a schema");
+    assert_eq!(
+        serde_json::to_value(openapi_schema).expect("schema serializes"),
+        serde_json::json!({}),
+        "openapi.json 200 must stay documented as the free-form serde_json::Value body"
+    );
+    driven.insert(("GET".to_string(), "/openapi.json".to_string(), 200));
+
+    // A second live code, for the pair arms past the redemption.
+    let code2 = pairing::begin(
+        &devices::DeviceName::parse("tablet").expect("device name"),
+        Tier::View,
+    )
+    .expect("mint a second pairing code")
+    .code()
+    .to_string();
+    let pair_body2 = serde_json::to_string(&serde_json::json!({"code": code2})).expect("pair body");
+
+    // The auth-layer answers: no bearer, then the two 403 arms.
+    for (method, path) in [
+        ("GET", "/health"),
+        ("GET", "/status"),
+        ("GET", "/openapi.json"),
+        ("POST", "/switch"),
+    ] {
+        let resp = call(&ctx, &req(method, &format!("{API_PREFIX}{path}"), None, ""));
+        check_answer(&doc, method, path, 401, &resp, &mut driven, &mut produced);
+    }
+    seed_device("viewer", Tier::View, OTHER_TOKEN);
+    let control_required = call(
+        &ctx,
+        &req(
+            "POST",
+            "/api/v1/switch",
+            Some(OTHER_TOKEN),
+            r#"{"profile":"beta"}"#,
+        ),
+    );
+    check_answer(
+        &doc,
+        "POST",
+        "/switch",
+        403,
+        &control_required,
+        &mut driven,
+        &mut produced,
+    );
+    let wall_token = "b".repeat(64);
+    seed_device("wall", Tier::Unknown("readonly".to_string()), &wall_token);
+    for (method, path) in [
+        ("GET", "/health"),
+        ("GET", "/status"),
+        ("GET", "/openapi.json"),
+        ("POST", "/switch"),
+    ] {
+        let body = if method == "POST" {
+            r#"{"profile":"beta"}"#
+        } else {
+            ""
+        };
+        let resp = call(
+            &ctx,
+            &req(
+                method,
+                &format!("{API_PREFIX}{path}"),
+                Some(&wall_token),
+                body,
+            ),
+        );
+        check_answer(&doc, method, path, 403, &resp, &mut driven, &mut produced);
+    }
+
+    // The switch error answers the fixtures reach without extra staging.
+    let bad = call(&ctx, &req("POST", "/api/v1/switch", Some(TOKEN), "{}"));
+    check_answer(
+        &doc,
+        "POST",
+        "/switch",
+        400,
+        &bad,
+        &mut driven,
+        &mut produced,
+    );
+    let unknown = call(
+        &ctx,
+        &req(
+            "POST",
+            "/api/v1/switch",
+            Some(TOKEN),
+            r#"{"profile":"ghost"}"#,
+        ),
+    );
+    check_answer(
+        &doc,
+        "POST",
+        "/switch",
+        404,
+        &unknown,
+        &mut driven,
+        &mut produced,
+    );
+
+    // The pair error answers: a body with no code, and a wrong code.
+    let pair_bad = call(&ctx, &req("POST", "/api/v1/pair", None, "{}"));
+    check_answer(
+        &doc,
+        "POST",
+        "/pair",
+        400,
+        &pair_bad,
+        &mut driven,
+        &mut produced,
+    );
+    let pair_refused = call(
+        &ctx,
+        &req("POST", "/api/v1/pair", None, r#"{"code":"ABCD-2345"}"#),
+    );
+    check_answer(
+        &doc,
+        "POST",
+        "/pair",
+        403,
+        &pair_refused,
+        &mut driven,
+        &mut produced,
+    );
+
+    // HEAD routes like GET at the router and arrive bodyless on the wire, the
+    // serve loop's strip the router never sees.
+    for path in ["/health", "/status", "/openapi.json"] {
+        let resp = call(
+            &ctx,
+            &req("HEAD", &format!("{API_PREFIX}{path}"), Some(TOKEN), ""),
+        );
+        assert_eq!(resp.status, 200, "HEAD {path}");
+        let head = resp.into_head();
+        assert!(head.body.is_empty(), "HEAD {path} must arrive with no body");
+    }
+
+    // A held state flock is the one retryable refusal, for both routes that
+    // take it. Seeded before the wedge, like the existing 503 pin.
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    let holder = crate::profile::open_state_file(&dir.join(crate::lock::LOCK_FILENAME))
+        .expect("open holder handle");
+    holder.lock().expect("hold the flock");
+    crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(100)));
+    let switch_locked = call(
+        &ctx,
+        &req(
+            "POST",
+            "/api/v1/switch",
+            Some(TOKEN),
+            r#"{"profile":"beta"}"#,
+        ),
+    );
+    check_answer(
+        &doc,
+        "POST",
+        "/switch",
+        503,
+        &switch_locked,
+        &mut driven,
+        &mut produced,
+    );
+    let pair_locked = call(&ctx, &req("POST", "/api/v1/pair", None, &pair_body2));
+    check_answer(
+        &doc,
+        "POST",
+        "/pair",
+        503,
+        &pair_locked,
+        &mut driven,
+        &mut produced,
+    );
+    crate::lock::set_state_lock_timeout_override(None);
+    drop(holder);
+
+    // A second switch while one is in flight answers 409 switch_in_progress,
+    // the gate held the way a_second_concurrent_switch_is_refused_immediately
+    // holds it, so that description arm is driven rather than only documented.
+    // The gate is released before the answer is walked: a failed assertion while
+    // the holder still waited would deadlock the scope's join.
+    let in_flight = {
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::sync::Arc::clone(&ctx);
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let _gate = holder.switch_gate.lock().expect("gate");
+                held_tx.send(()).expect("signal held");
+                let _ = release_rx.recv();
+            });
+            held_rx.recv().expect("gate taken");
+            let in_flight = call(
+                &ctx,
+                &req(
+                    "POST",
+                    "/api/v1/switch",
+                    Some(TOKEN),
+                    r#"{"profile":"beta"}"#,
+                ),
+            );
+            let _ = release_tx.send(());
+            in_flight
+        })
+    };
+    check_answer(
+        &doc,
+        "POST",
+        "/switch",
+        409,
+        &in_flight,
+        &mut driven,
+        &mut produced,
+    );
+
+    // A refused switch (a disabled target) answers 409.
+    {
+        let mut cfg = config.lock().expect("config");
+        let beta = cfg
+            .find_mut(&crate::profile::ProfileName::from("beta"))
+            .expect("beta");
+        beta.disabled = true;
+        save_profile(beta).expect("save");
+    }
+    let refused = call(
+        &ctx,
+        &req(
+            "POST",
+            "/api/v1/switch",
+            Some(TOKEN),
+            r#"{"profile":"beta"}"#,
+        ),
+    );
+    check_answer(
+        &doc,
+        "POST",
+        "/switch",
+        409,
+        &refused,
+        &mut driven,
+        &mut produced,
+    );
+
+    // An unreadable device list refuses every authenticated route with 500, and
+    // the pairing redemption hits the same store when it mints the device.
+    std::fs::write(
+        crate::profile::clauth_dir()
+            .expect("dir")
+            .join("devices.json"),
+        b"{ not json",
+    )
+    .expect("damage the device list");
+    for (method, path) in [
+        ("GET", "/health"),
+        ("GET", "/status"),
+        ("GET", "/openapi.json"),
+        ("POST", "/switch"),
+    ] {
+        let body = if method == "POST" {
+            r#"{"profile":"beta"}"#
+        } else {
+            ""
+        };
+        let resp = call(
+            &ctx,
+            &req(method, &format!("{API_PREFIX}{path}"), Some(TOKEN), body),
+        );
+        check_answer(&doc, method, path, 500, &resp, &mut driven, &mut produced);
+    }
+    let pair_failed = call(&ctx, &req("POST", "/api/v1/pair", None, &pair_body2));
+    check_answer(
+        &doc,
+        "POST",
+        "/pair",
+        500,
+        &pair_failed,
+        &mut driven,
+        &mut produced,
+    );
+
+    // Every documented (operation, status) must have been produced by a request
+    // above, so a documented answer nothing produces fails the test naming
+    // itself.
+    for (method, path, operation) in all_operations(&doc) {
+        for status in operation.responses.responses.keys() {
+            let Ok(code) = status.parse::<u16>() else {
+                continue;
+            };
+            assert!(
+                driven.contains(&(method.to_string(), path.to_string(), code)),
+                "{method} {path} {code} is documented but no request above produced it"
+            );
+        }
+    }
+
+    // Every code an `ErrorBody` description names must be one a driven answer
+    // produced for that (operation, status), so a ghost or misspelled code in a
+    // description fails here, naming itself.
+    for (method, path, operation) in all_operations(&doc) {
+        for (status, response) in &operation.responses.responses {
+            let Ok(code) = status.parse::<u16>() else {
+                continue;
+            };
+            if code < 400 {
+                continue;
+            }
+            let utoipa::openapi::RefOr::T(response) = response else {
+                continue;
+            };
+            let Some(content) = response.content.get("application/json") else {
+                continue;
+            };
+            let Some(utoipa::openapi::RefOr::Ref(schema)) = content.schema.as_ref() else {
+                continue;
+            };
+            if schema.ref_location != "#/components/schemas/ErrorBody" {
+                continue;
+            }
+            let tokens = backtick_tokens(&response.description).unwrap_or_else(|()| {
+                panic!(
+                    "{method} {path} {code} has an unmatched backtick in its description: {:?}",
+                    response.description
+                )
+            });
+            for token in tokens {
+                let produced_key = (method.to_string(), path.to_string(), code, token.clone());
+                assert!(
+                    produced.contains(&produced_key),
+                    "{method} {path} {code} backticks `{token}`: every backticked token in an ErrorBody description is a code claim, but no request above produced `{token}`; unbacktick the prose or make `{token}` a code the router produces"
+                );
+            }
+        }
+    }
 }
 
 /// AU-1: every route but the pairing redemption refuses an unpaired caller and
@@ -715,6 +1634,81 @@ fn health_reports_the_feed_schema() {
         body["schema"],
         serde_json::json!(crate::daemon::SCHEMA_VERSION),
         "a client refuses a daemon newer than it knows off this number"
+    );
+}
+
+/// The three answer bodies are typed structs now, and each serializes to
+/// exactly the bytes the `json!` it replaced produced. Declaration order is the
+/// wire key order and every value below is distinct, so a reordered or
+/// mis-typed field changes the bytes.
+#[test]
+fn the_answer_bodies_serialize_byte_identically_to_the_json_they_replaced() {
+    assert_eq!(
+        serde_json::to_vec(&HealthBody {
+            ok: true,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            schema: crate::daemon::SCHEMA_VERSION,
+        })
+        .expect("HealthBody serializes"),
+        serde_json::to_vec(&serde_json::json!({
+            "ok": true,
+            "version": env!("CARGO_PKG_VERSION"),
+            "schema": crate::daemon::SCHEMA_VERSION,
+        }))
+        .expect("json! serializes"),
+        "the health body is byte-identical"
+    );
+
+    assert_eq!(
+        serde_json::to_vec(&SwitchOk {
+            ok: true,
+            previous: Some("alpha".to_string()),
+            active: "beta".to_string(),
+        })
+        .expect("SwitchOk serializes"),
+        serde_json::to_vec(&serde_json::json!({
+            "ok": true,
+            "previous": "alpha",
+            "active": "beta",
+        }))
+        .expect("json! serializes"),
+        "the switch body is byte-identical"
+    );
+
+    // A switch from no active profile answers `previous: null` today, so the
+    // `Option` is serialized, never skipped.
+    assert_eq!(
+        serde_json::to_vec(&SwitchOk {
+            ok: true,
+            previous: None,
+            active: "beta".to_string(),
+        })
+        .expect("SwitchOk serializes"),
+        serde_json::to_vec(&serde_json::json!({
+            "ok": true,
+            "previous": null,
+            "active": "beta",
+        }))
+        .expect("json! serializes"),
+        "a missing previous profile is `null`, not a dropped key"
+    );
+
+    assert_eq!(
+        serde_json::to_vec(&PairOk {
+            ok: true,
+            name: "phone".to_string(),
+            tier: "control".to_string(),
+            token: "tok_0123456789".to_string(),
+        })
+        .expect("PairOk serializes"),
+        serde_json::to_vec(&serde_json::json!({
+            "ok": true,
+            "name": "phone",
+            "tier": "control",
+            "token": "tok_0123456789",
+        }))
+        .expect("json! serializes"),
+        "the pair body is byte-identical"
     );
 }
 

@@ -392,6 +392,28 @@ pub(crate) struct Response {
     pub(crate) etag: Option<String>,
 }
 
+/// One error body for every refused or failed answer, so a client generates a
+/// single error shape. `reason` rides only the refusals that carry one —
+/// today's `error()` answers have no `reason` key at all — so it is skipped
+/// when `None`, never serialized as `null`.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub(crate) struct ErrorBody {
+    pub(crate) ok: bool,
+    pub(crate) error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reason: Option<String>,
+}
+
+impl ErrorBody {
+    fn new(error: &str, reason: Option<&str>) -> Self {
+        Self {
+            ok: false,
+            error: error.to_string(),
+            reason: reason.map(str::to_string),
+        }
+    }
+}
+
 impl Response {
     /// A body that is already serialized JSON — the `status.json` passthrough.
     pub(crate) fn raw_json(status: u16, body: Vec<u8>) -> Self {
@@ -422,26 +444,34 @@ impl Response {
         }
     }
 
-    pub(crate) fn json(status: u16, value: &serde_json::Value) -> Self {
+    /// Serialize a typed body to JSON, with the one fallback every answer
+    /// shares: a serializer error — unreachable for the plain fields these
+    /// bodies hold — still answers the fixed `internal` body rather than
+    /// panicking.
+    pub(crate) fn serialize<T: serde::Serialize>(status: u16, value: &T) -> Self {
         let body = serde_json::to_vec(value)
             .unwrap_or_else(|_| br#"{"ok":false,"error":"internal"}"#.to_vec());
         Self::raw_json(status, body)
     }
 
+    /// A body already built as a `serde_json::Value`, for the tests that build
+    /// one directly.
+    #[cfg(test)]
+    pub(crate) fn json(status: u16, value: &serde_json::Value) -> Self {
+        Self::serialize(status, value)
+    }
+
     /// A fixed error code. `code` is always a literal from this crate, never
     /// anything read off the wire.
     pub(crate) fn error(status: u16, code: &str) -> Self {
-        Self::json(status, &serde_json::json!({ "ok": false, "error": code }))
+        Self::serialize(status, &ErrorBody::new(code, None))
     }
 
     /// An error carrying clauth's own explanation (a refused switch, say).
     /// `reason` originates in this crate; serde escapes it into the JSON string
     /// either way, so it cannot break out of the body.
     pub(crate) fn refused(status: u16, code: &str, reason: &str) -> Self {
-        Self::json(
-            status,
-            &serde_json::json!({ "ok": false, "error": code, "reason": reason }),
-        )
+        Self::serialize(status, &ErrorBody::new(code, Some(reason)))
     }
 
     pub(crate) fn unauthorized() -> Self {

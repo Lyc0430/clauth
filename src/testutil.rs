@@ -2,12 +2,17 @@
 //! (`tests/inline/*.rs`). Defined once here rather than copied per module so the
 //! home-sandbox, mtime, and key-event scaffolding stays in a single place.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use utoipa::ToSchema;
+use utoipa::openapi::RefOr;
+use utoipa::openapi::schema::{
+    AdditionalProperties, Array, ArrayItems, Components, Object, Schema, SchemaType, Type,
+};
 
 /// RAII home sandbox: acquires `HOME_TEST_LOCK` and redirects `home_dir()` into
 /// a tempdir for its lifetime, clearing the override on drop (even on panic).
@@ -1315,4 +1320,233 @@ pub(crate) fn bar_reset_in(
         )),
         ..bar(label, pct)
     }
+}
+
+/// Resolve a `$ref` through the component schemas, following ref chains until a
+/// concrete schema is reached.
+pub(crate) fn schema_deref<'a>(
+    schema: &'a RefOr<Schema>,
+    components: &'a BTreeMap<String, RefOr<Schema>>,
+) -> &'a Schema {
+    match schema {
+        RefOr::Ref(reference) => {
+            let name = reference
+                .ref_location
+                .strip_prefix("#/components/schemas/")
+                .unwrap_or_else(|| panic!("unexpected ref location {}", reference.ref_location));
+            let component = components
+                .get(name)
+                .unwrap_or_else(|| panic!("unresolved component {name}"));
+            schema_deref(component, components)
+        }
+        RefOr::T(schema) => schema,
+    }
+}
+
+/// The JSON type name a serialized value carries, with an integral number read
+/// as `integer` so a schema's `integer` admits only whole numbers.
+fn value_json_type(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(n) => {
+            if n.as_f64().is_some_and(|f| f.fract() == 0.0) {
+                "integer"
+            } else {
+                "number"
+            }
+        }
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+fn type_name(t: &Type) -> &'static str {
+    match t {
+        Type::Object => "object",
+        Type::String => "string",
+        Type::Integer => "integer",
+        Type::Number => "number",
+        Type::Boolean => "boolean",
+        Type::Array => "array",
+        Type::Null => "null",
+    }
+}
+
+/// The JSON type names a schema's `type` allows; empty for a typeless schema.
+fn allowed_type_names(schema_type: &SchemaType) -> Vec<&'static str> {
+    match schema_type {
+        SchemaType::Type(t) => vec![type_name(t)],
+        SchemaType::Array(ts) => ts.iter().map(type_name).collect(),
+        SchemaType::AnyValue => Vec::new(),
+    }
+}
+
+/// Whether `vtype` is admitted by one of the allowed names: `number` admits any
+/// numeric value, `integer` only integral ones.
+fn type_matches(vtype: &str, allowed: &[&str]) -> bool {
+    allowed.iter().any(|allowed| match *allowed {
+        "number" => vtype == "number" || vtype == "integer",
+        other => other == vtype,
+    })
+}
+
+/// Walk `value` against `schema`, resolving `$ref`s through the component map,
+/// and return the first mismatch named by its JSON path.
+fn walk(
+    value: &serde_json::Value,
+    schema: &RefOr<Schema>,
+    components: &BTreeMap<String, RefOr<Schema>>,
+    path: &str,
+) -> Result<(), String> {
+    match schema_deref(schema, components) {
+        Schema::Object(object) => object_agrees(value, object, components, path),
+        Schema::Array(array) => array_agrees(value, array, components, path),
+        Schema::OneOf(one_of) => {
+            if one_of
+                .items
+                .iter()
+                .any(|arm| walk(value, arm, components, path).is_ok())
+            {
+                Ok(())
+            } else {
+                Err(format!("{path}: the body {value} matches no oneOf arm"))
+            }
+        }
+        Schema::AnyOf(any_of) => {
+            if any_of
+                .items
+                .iter()
+                .any(|arm| walk(value, arm, components, path).is_ok())
+            {
+                Ok(())
+            } else {
+                Err(format!("{path}: the body {value} matches no anyOf arm"))
+            }
+        }
+        Schema::AllOf(all_of) => {
+            for arm in &all_of.items {
+                walk(value, arm, components, path)?;
+            }
+            Ok(())
+        }
+        _ => Err(format!(
+            "{path}: the schema is a shape the walk cannot check"
+        )),
+    }
+}
+
+/// Check `value` against a schema rendered as an [`Object`], which utoipa uses
+/// for every leaf type as well as for objects: the value's JSON type must be
+/// one the schema's `type` names, and an object value keeps today's key checks
+/// and recurses through `properties` and `additionalProperties`.
+fn object_agrees(
+    value: &serde_json::Value,
+    object: &Object,
+    components: &BTreeMap<String, RefOr<Schema>>,
+    path: &str,
+) -> Result<(), String> {
+    let allowed = allowed_type_names(&object.schema_type);
+    if allowed.is_empty() {
+        return Err(format!(
+            "{path}: the schema names no type, so the body cannot be checked"
+        ));
+    }
+    let vtype = value_json_type(value);
+    if !type_matches(vtype, &allowed) {
+        return Err(format!(
+            "{path}: the schema allows {} but the body is {vtype} ({value})",
+            allowed.join("|")
+        ));
+    }
+    if vtype == "object" {
+        check_object_body(
+            value.as_object().expect("json object"),
+            object,
+            components,
+            path,
+        )?;
+    }
+    Ok(())
+}
+
+fn check_object_body(
+    body: &serde_json::Map<String, serde_json::Value>,
+    object: &Object,
+    components: &BTreeMap<String, RefOr<Schema>>,
+    path: &str,
+) -> Result<(), String> {
+    for (property, property_schema) in &object.properties {
+        let property_path = format!("{path}.{property}");
+        if object.required.iter().any(|name| name == property) && !body.contains_key(property) {
+            return Err(format!(
+                "{property_path}: required schema property is absent from the body"
+            ));
+        }
+        if let Some(property_value) = body.get(property) {
+            walk(property_value, property_schema, components, &property_path)?;
+        }
+    }
+    for (key, key_value) in body {
+        if object.properties.contains_key(key) {
+            continue;
+        }
+        let key_path = format!("{path}.{key}");
+        match object.additional_properties.as_deref() {
+            Some(AdditionalProperties::RefOr(schema)) => {
+                walk(key_value, schema, components, &key_path)?;
+            }
+            Some(AdditionalProperties::FreeForm(_)) => {
+                return Err(format!(
+                    "{key_path}: additional properties are free-form, which the walk cannot check"
+                ));
+            }
+            None => {
+                return Err(format!("{key_path}: body key is absent from the schema"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn array_agrees(
+    value: &serde_json::Value,
+    array: &Array,
+    components: &BTreeMap<String, RefOr<Schema>>,
+    path: &str,
+) -> Result<(), String> {
+    let items = value
+        .as_array()
+        .ok_or_else(|| format!("{path}: the schema is an array but the body is {value}"))?;
+    if let ArrayItems::RefOrSchema(item_schema) = &array.items {
+        for (index, item) in items.iter().enumerate() {
+            walk(item, item_schema, components, &format!("{path}[{index}]"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Walk `value` against `schema`, resolving `$ref`s through the document's
+/// component schemas, and panic naming the JSON path of the first mismatch.
+pub(crate) fn schema_agrees(
+    value: &serde_json::Value,
+    schema: &RefOr<Schema>,
+    components: &Components,
+) {
+    if let Err(message) = walk(value, schema, &components.schemas, "$") {
+        panic!("{message}");
+    }
+}
+
+/// Derive the schema and component map from `T` and walk them against `value`:
+/// the one entry every body's schema-truth test calls, so the walk stays
+/// value-only and shared.
+pub(crate) fn schema_agrees_with_type<T: ToSchema>(value: &serde_json::Value) {
+    let mut schemas: Vec<(String, RefOr<Schema>)> = Vec::new();
+    T::schemas(&mut schemas);
+    schemas.push((T::name().into_owned(), T::schema()));
+    let mut components = Components::new();
+    components.schemas = schemas.into_iter().collect();
+    schema_agrees(value, &T::schema(), &components);
 }

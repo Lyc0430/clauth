@@ -27,6 +27,7 @@ use crate::oauth;
 use crate::profile::ConfigHandle;
 
 use super::devices::{self, Device, Tier};
+pub(crate) use super::http::ErrorBody;
 use super::http::{Request, Response, flatten_control_chars, sanitize_for_log};
 use super::pairing::{self, Code, Redeemed};
 
@@ -90,6 +91,18 @@ pub(crate) static ROUTES: &[Route] = &[
         path: "/status",
         access: Access::View,
         handler: status,
+    },
+    Route {
+        method: "GET",
+        path: "/openapi.json",
+        access: Access::View,
+        handler: openapi_document,
+    },
+    Route {
+        method: "HEAD",
+        path: "/openapi.json",
+        access: Access::View,
+        handler: openapi_document,
     },
     Route {
         method: "POST",
@@ -276,14 +289,34 @@ fn authorize(tier: &Tier, access: Access) -> Grant {
     }
 }
 
+/// `GET /api/v1/health` — the build's version and the feed schema, so a client
+/// refuses a daemon newer than it knows.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub(crate) struct HealthBody {
+    ok: bool,
+    version: String,
+    schema: u64,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/health",
+    responses(
+        (status = 200, description = "the build's version and the feed schema", body = HealthBody),
+        (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
+        (status = 403, description = "a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
+        (status = 500, description = "the device list does not read (`internal`)", body = ErrorBody)
+    ),
+    security(("bearer" = ["view"]))
+)]
 fn health(_: &ApiContext, _: &Request, _: &Caller<'_>) -> Response {
-    Response::json(
+    Response::serialize(
         200,
-        &serde_json::json!({
-            "ok": true,
-            "version": env!("CARGO_PKG_VERSION"),
-            "schema": crate::daemon::SCHEMA_VERSION,
-        }),
+        &HealthBody {
+            ok: true,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            schema: crate::daemon::SCHEMA_VERSION,
+        },
     )
 }
 
@@ -305,6 +338,23 @@ fn health(_: &ApiContext, _: &Request, _: &Caller<'_>) -> Response {
 /// `?all=1` never waits: it builds its body from config rather than the file,
 /// so there is no file to watch for it — but it is still conditional off its
 /// built body's tag, so a roster that has not moved answers 304.
+#[utoipa::path(
+    get,
+    path = "/api/v1/status",
+    params(
+        ("all" = Option<bool>, Query, description = "include disabled accounts (`all=1`)"),
+        ("wait" = Option<u64>, Query, description = "hold the request until the feed changes, at most 60 seconds, only with a matching If-None-Match", maximum = 60),
+        ("If-None-Match" = Option<String>, Header, description = "an `ETag` from an earlier answer; a match answers 304 or, with `wait`, holds the request")
+    ),
+    responses(
+        (status = 200, description = "the status feed", body = crate::daemon::status_json::StatusBody, headers(("ETag" = String, description = "the feed's entity tag"))),
+        (status = 304, description = "the feed has not changed", headers(("ETag" = String, description = "the feed's entity tag"))),
+        (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
+        (status = 403, description = "a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
+        (status = 500, description = "the device list does not read, or the status body failed to serialize (`internal`)", body = ErrorBody)
+    ),
+    security(("bearer" = ["view"]))
+)]
 fn status(ctx: &ApiContext, req: &Request, _: &Caller<'_>) -> Response {
     let include_disabled = req.flag("all");
     if !include_disabled {
@@ -444,9 +494,21 @@ const MAX_WAIT_SECS: u64 = 60;
 const WAIT_POLL: Duration = Duration::from_millis(250);
 
 /// The one field `POST /api/v1/switch` accepts.
-#[derive(serde::Deserialize)]
-struct SwitchBody {
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+pub(crate) struct SwitchBody {
     profile: String,
+}
+
+/// The answer a successful switch carries: the profile left behind and the one
+/// now active. `previous` is `None` exactly when there was no active profile to
+/// leave, which today's wire answers as `null` — so the `Option` is serialized,
+/// never skipped.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub(crate) struct SwitchOk {
+    ok: bool,
+    #[schema(required = true)]
+    previous: Option<String>,
+    active: String,
 }
 
 /// `POST /api/v1/switch` — relink the global active profile.
@@ -456,6 +518,22 @@ struct SwitchBody {
 /// gate (never install credentials a refresh has rejected), the disabled-target
 /// refusal, and the divergence policy all live inside it, so this endpoint
 /// cannot drift into a weaker switch than the rest of clauth performs.
+#[utoipa::path(
+    post,
+    path = "/api/v1/switch",
+    request_body = SwitchBody,
+    responses(
+        (status = 200, description = "the switch landed; the profile left behind and the one now active", body = SwitchOk),
+        (status = 400, description = "the body held no parseable profile (`bad_request`)", body = ErrorBody),
+        (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
+        (status = 403, description = "a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`), or a view-only device (`control_required`)", body = ErrorBody),
+        (status = 404, description = "the profile is not stored (`profile_not_found`)", body = ErrorBody),
+        (status = 409, description = "a switch is already in flight (`switch_in_progress`), or a switch was refused (`switch_refused`)", body = ErrorBody),
+        (status = 503, description = "the state flock is held (`state_locked`)", body = ErrorBody),
+        (status = 500, description = "the device list does not read (`internal`), or the switch failed (`switch_failed`)", body = ErrorBody)
+    ),
+    security(("bearer" = ["control"]))
+)]
 fn switch(ctx: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
     let Ok(parsed) = serde_json::from_slice::<SwitchBody>(&req.body) else {
         return Response::error(400, "bad_request");
@@ -519,9 +597,13 @@ fn switch(ctx: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
                     .map(crate::daemon::LiveSnapshot::signals)
                     .as_ref(),
             );
-            Response::json(
+            Response::serialize(
                 200,
-                &serde_json::json!({ "ok": true, "previous": previous, "active": active }),
+                &SwitchOk {
+                    ok: true,
+                    previous,
+                    active,
+                },
             )
         }
         Err(e) => {
@@ -567,9 +649,19 @@ fn switch(ctx: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
 }
 
 /// The one field `POST /api/v1/pair` accepts.
-#[derive(serde::Deserialize)]
-struct PairBody {
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+pub(crate) struct PairBody {
     code: String,
+}
+
+/// The answer a successful pairing carries: the device's name and tier, and the
+/// one-time token the device keeps from here.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub(crate) struct PairOk {
+    ok: bool,
+    name: String,
+    tier: String,
+    token: String,
 }
 
 /// `POST /api/v1/pair` — redeem the live pairing code for a device token.
@@ -579,6 +671,18 @@ struct PairBody {
 /// about the host's state from the answer. A body that holds no code at all is
 /// `400 bad_request` and costs no attempt: it is judged before the pairing is
 /// read. The token rides this one response and no log line.
+#[utoipa::path(
+    post,
+    path = "/api/v1/pair",
+    request_body = PairBody,
+    responses(
+        (status = 201, description = "the device is paired; the token rides this one response", body = PairOk),
+        (status = 400, description = "the body held no code (`bad_request`)", body = ErrorBody),
+        (status = 403, description = "the code did not pair a device (`pairing_refused`)", body = ErrorBody),
+        (status = 503, description = "the state flock is held (`state_locked`)", body = ErrorBody),
+        (status = 500, description = "pairing failed (`internal`)", body = ErrorBody)
+    )
+)]
 fn pair(_: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
     let Some(code) = serde_json::from_slice::<PairBody>(&req.body)
         .ok()
@@ -594,14 +698,14 @@ fn pair(_: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
                 sanitize_for_log(&name),
                 sanitize_for_log(tier.as_str())
             );
-            Response::json(
+            Response::serialize(
                 201,
-                &serde_json::json!({
-                    "ok": true,
-                    "name": name,
-                    "tier": tier.as_str(),
-                    "token": token,
-                }),
+                &PairOk {
+                    ok: true,
+                    name,
+                    tier: tier.as_str().to_string(),
+                    token,
+                },
             )
         }
         Ok(Redeemed::Refused) => Response::refused(403, "pairing_refused", PAIRING_REFUSED),
@@ -622,6 +726,69 @@ fn pair(_: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
                 ),
                 None => Response::error(500, "internal"),
             }
+        }
+    }
+}
+
+/// The one OpenAPI document, derived from the handlers. Every route's
+/// `#[utoipa::path]` feeds this struct, so the operations it emits are the
+/// same rows [`ROUTES`] serves; the test pins the two tables together so an
+/// endpoint cannot ship undocumented.
+#[derive(utoipa::OpenApi)]
+#[openapi(
+    paths(health, status, switch, pair, openapi_document),
+    modifiers(&BearerScheme)
+)]
+struct ApiDoc;
+
+/// Adds the `bearer` security scheme every operation but `POST /pair` names.
+struct BearerScheme;
+
+impl utoipa::Modify for BearerScheme {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        if let Some(components) = openapi.components.as_mut() {
+            components.add_security_scheme(
+                "bearer",
+                utoipa::openapi::security::SecurityScheme::Http(
+                    utoipa::openapi::security::HttpBuilder::new()
+                        .scheme(utoipa::openapi::security::HttpAuthScheme::Bearer)
+                        .description(Some("Authorization: Bearer <device token>"))
+                        .build(),
+                ),
+            );
+        }
+    }
+}
+
+/// The OpenAPI document as pretty JSON bytes. One function is the whole
+/// source: the `openapi.json` handler serves these bytes and `--dump-openapi`
+/// prints them, so the two cannot drift apart. A serializer failure is
+/// returned to the caller rather than answered with a stub.
+pub(crate) fn openapi_document_bytes() -> Result<Vec<u8>, String> {
+    <ApiDoc as utoipa::OpenApi>::openapi()
+        .to_pretty_json()
+        .map(|document| document.into_bytes())
+        .map_err(|e| format!("failed to serialize the OpenAPI document: {e}"))
+}
+
+/// `GET /api/v1/openapi.json` — this API's own contract.
+#[utoipa::path(
+    get,
+    path = "/api/v1/openapi.json",
+    responses(
+        (status = 200, description = "the OpenAPI document for this API", body = serde_json::Value, content_type = "application/json"),
+        (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
+        (status = 403, description = "a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
+        (status = 500, description = "the device list does not read, or the document failed to serialize (`internal`)", body = ErrorBody)
+    ),
+    security(("bearer" = ["view"]))
+)]
+fn openapi_document(_: &ApiContext, _: &Request, _: &Caller<'_>) -> Response {
+    match openapi_document_bytes() {
+        Ok(document) => Response::raw_json(200, document),
+        Err(e) => {
+            logline!("clauth api: {e}");
+            Response::error(500, "internal")
         }
     }
 }

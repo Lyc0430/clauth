@@ -300,6 +300,20 @@ pub(crate) enum Command {
         /// The private key for --cert (PKCS#8, PKCS#1 or SEC1)
         #[arg(long, value_name = "PATH", requires = "cert", requires = "listen")]
         key: Option<PathBuf>,
+        /// Print the OpenAPI document the REST API serves, and start nothing.
+        #[arg(
+            long,
+            conflicts_with_all = [
+                "standby",
+                "no_standby",
+                "replace",
+                "status",
+                "listen",
+                "cert",
+                "key",
+            ]
+        )]
+        dump_openapi: bool,
     },
 
     /// Pair, list, and revoke the devices that may call the REST API

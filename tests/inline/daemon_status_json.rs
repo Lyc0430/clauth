@@ -4,15 +4,18 @@
 //! These exercise the single-shot path (`live = None`, freshness/next-refresh
 //! from cache mtime) against a `HomeSandbox` so no real `~/.clauth` is touched.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use super::*;
 use crate::profile::{
     AppConfig, AppState, ClaudeCredentials, OAuthToken, Profile, ProfileName, save_profile,
 };
 use crate::profile_json::Window;
-use crate::testutil::HomeSandbox;
+use crate::testutil::{HomeSandbox, schema_agrees_with_type, schema_deref};
 use crate::usage::{FetchLeg, FetchStatus};
+use utoipa::PartialSchema;
+use utoipa::openapi::RefOr;
+use utoipa::openapi::schema::Schema;
 
 /// The typed body as a `Value`, for the tests that assert published values;
 /// key order and byte shape are pinned by the `*_bytes` tests.
@@ -2195,4 +2198,194 @@ fn status_body_never_leaks_a_credential() {
             );
         }
     }
+}
+
+/// The `ToSchema`-derived schema and a real `build_status` body agree key for
+/// key: every schema property is a present, required body key, every body key
+/// is a schema property, and the walk reaches every nested type through the
+/// registered components.
+#[test]
+fn status_schema_agrees_with_the_serialized_body() {
+    let _home = HomeSandbox::new();
+    let now_secs = crate::usage::now_epoch_secs();
+
+    // One OAuth profile in the fallback chain and the auto-start queue, a
+    // second chain member, and a third-party profile, with caches written
+    // through the crate's real writers so `windows` is non-empty.
+    let mut oauth = oauth_profile("schema-oauth");
+    oauth.auto_start = true;
+    save_profile(&oauth).unwrap();
+
+    let mut chain = oauth_profile("schema-chain");
+    chain.auto_start = true;
+    save_profile(&chain).unwrap();
+
+    let mut api = Profile::new(
+        "schema-api".to_string(),
+        Some("https://api.anthropic.com".to_string()),
+        Some("schema-api-key".to_string()),
+    );
+    api.auto_start = true;
+    save_profile(&api).unwrap();
+
+    crate::profile::save_app_state(&AppState {
+        active_profile: Some(oauth.name.clone()),
+        profiles: vec![oauth.name.clone(), chain.name.clone(), api.name.clone()],
+        fallback_chain: vec![oauth.name.clone(), chain.name.clone()],
+        auto_start_queue: true,
+        ..AppState::default()
+    })
+    .unwrap();
+
+    let window = |utilization: f64, hours: i64| crate::usage::UsageWindow {
+        utilization,
+        resets_at: Some(crate::usage::epoch_secs_to_iso(now_secs + hours * 3600)),
+    };
+    let oauth_reading = crate::usage::UsageInfo {
+        plan: Some(crate::usage::PlanInfo {
+            tier: crate::usage::PlanTier::Pro,
+            subscription_status: Some("active".to_string()),
+        }),
+        five_hour: Some(window(42.0, 3)),
+        seven_day: Some(window(13.0, 72)),
+        fetched_at: Some(crate::usage::now_ms() - 60_000),
+        ..Default::default()
+    };
+    crate::profile_cache::write_profile_cache(
+        &oauth.name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &oauth_reading,
+    );
+    crate::profile_cache::write_profile_cache(
+        &chain.name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &oauth_reading,
+    );
+    crate::profile_cache::write_profile_cache(
+        &api.name,
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &crate::providers::ThirdPartyStats {
+            is_available: true,
+            rows: vec![],
+            bars: vec![crate::providers::UsageBar {
+                label: crate::usage::LABEL_5H.to_string(),
+                pct: 25.0,
+                resets_at: Some(crate::usage::epoch_secs_to_iso(now_secs + 2 * 3600)),
+                used: None,
+                total: None,
+            }],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+
+    let config = crate::profile::load_config().unwrap();
+    let body = build_status(&config, 300_000, None, true);
+
+    // The fixture must exercise every nested schema, or the walk proves
+    // nothing about it.
+    assert!(
+        body.profiles.iter().any(|e| e.fallback.is_some()),
+        "fixture never populates a fallback object"
+    );
+    assert!(
+        body.profiles.iter().any(|e| e.auto_start_queue.is_some()),
+        "fixture never populates a queue entry"
+    );
+    assert!(
+        body.profiles.iter().any(|e| e.third_party.is_some()),
+        "fixture never populates a third-party object"
+    );
+    assert!(
+        body.profiles.iter().any(|e| !e.windows.is_empty()),
+        "fixture never populates a window"
+    );
+
+    let value = serde_json::to_value(&body).unwrap();
+    schema_agrees_with_type::<StatusBody>(&value);
+}
+
+/// The one always-serialized `Option` in the answer bodies is required in its
+/// schema (`previous` answers `null`, never a dropped key), and the one
+/// skip-when-absent `Option` (`ErrorBody.reason`) stays optional.
+#[test]
+fn always_serialized_option_fields_are_required_and_skipped_ones_are_not() {
+    use crate::daemon::api::routes::{ErrorBody, SwitchOk};
+
+    let no_components: BTreeMap<String, RefOr<Schema>> = BTreeMap::new();
+
+    let switch_ok_schema = SwitchOk::schema();
+    let switch_ok_object = match schema_deref(&switch_ok_schema, &no_components) {
+        Schema::Object(object) => object,
+        _ => panic!("SwitchOk must be an object"),
+    };
+    assert!(
+        switch_ok_object
+            .required
+            .iter()
+            .any(|name| name == "previous"),
+        "SwitchOk.previous is serialized on every answer, so its schema requires it"
+    );
+
+    let error_body_schema = ErrorBody::schema();
+    let error_body_object = match schema_deref(&error_body_schema, &no_components) {
+        Schema::Object(object) => object,
+        _ => panic!("ErrorBody must be an object"),
+    };
+    assert!(
+        !error_body_object
+            .required
+            .iter()
+            .any(|name| name == "reason"),
+        "ErrorBody.reason is skipped when absent, so its schema leaves it optional"
+    );
+}
+
+/// Every REST body's `ToSchema`-derived schema agrees with its wire shape: each
+/// required property present, each body key a schema property, required-ness
+/// matching presence. Request bodies are pinned by their literal JSON because
+/// they only deserialize.
+#[test]
+fn every_rest_body_schema_agrees_with_its_wire_shape() {
+    use crate::daemon::api::routes::{
+        ErrorBody, HealthBody, PairBody, PairOk, SwitchBody, SwitchOk,
+    };
+
+    schema_agrees_with_type::<HealthBody>(&serde_json::json!({
+        "ok": true,
+        "version": env!("CARGO_PKG_VERSION"),
+        "schema": crate::daemon::SCHEMA_VERSION,
+    }));
+
+    schema_agrees_with_type::<SwitchOk>(&serde_json::json!({
+        "ok": true,
+        "previous": "alpha",
+        "active": "beta",
+    }));
+    schema_agrees_with_type::<SwitchOk>(&serde_json::json!({
+        "ok": true,
+        "previous": null,
+        "active": "beta",
+    }));
+
+    schema_agrees_with_type::<PairOk>(&serde_json::json!({
+        "ok": true,
+        "name": "phone",
+        "tier": "control",
+        "token": "tok_0123456789",
+    }));
+
+    schema_agrees_with_type::<ErrorBody>(&serde_json::json!({
+        "ok": false,
+        "error": "bad_request",
+        "reason": "the fix",
+    }));
+    schema_agrees_with_type::<ErrorBody>(&serde_json::json!({
+        "ok": false,
+        "error": "bad_request",
+    }));
+
+    schema_agrees_with_type::<SwitchBody>(&serde_json::json!({"profile": "alpha"}));
+    schema_agrees_with_type::<PairBody>(&serde_json::json!({"code": "01234567"}));
 }

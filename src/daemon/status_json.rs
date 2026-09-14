@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use crate::profile::{AppConfig, Profile, ProfileName};
 use crate::profile_cache::{
@@ -106,7 +107,7 @@ fn iso_from_ms(ms: u64) -> String {
 /// 1-based), the utilization threshold auto-switch rotates away at, and whether
 /// this member is currently armed (`armed` = in the chain AND active). Field
 /// order is the published key order.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub(crate) struct Fallback {
     pub(crate) position: usize,
     pub(crate) threshold: f64,
@@ -153,15 +154,16 @@ fn auth_status_str(config: &AppConfig, p: &Profile, now_ms: i64) -> &'static str
 /// derivable yet (cold history); an anchored-but-due queue publishes
 /// `anchor + gap` even once that instant is past — readers compare it to now,
 /// exactly as wiki/Daemon.md contracts.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub(crate) struct QueueEntry {
     pub(crate) position: usize,
+    #[schema(required = true)]
     pub(crate) next_open_at: Option<String>,
 }
 
 /// The third-party availability object (`available`), for api-key accounts
 /// whose figures live in `third_party_cache.json`; `None` for OAuth accounts.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub(crate) struct ThirdPartyAvailability {
     pub(crate) available: bool,
 }
@@ -170,8 +172,9 @@ pub(crate) struct ThirdPartyAvailability {
 /// the writer ([`build_profile_entries`], serialized by [`build_status`]) and
 /// the reader (`clauth list`'s table rows) derive from, so a reader's field
 /// access cannot drift from what the writer emits. Contract: wiki/Daemon.md.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub(crate) struct ProfileEntry {
+    #[schema(value_type = String)]
     pub(crate) name: ProfileName,
     /// Active-profile marker source. The active profile is always kept, disabled
     /// or not: the top-level `active_profile` field names it unconditionally,
@@ -190,9 +193,11 @@ pub(crate) struct ProfileEntry {
     /// Display provider label: a recognised third-party name, else `anthropic`.
     pub(crate) provider: String,
     /// The third-party endpoint, `None` for the default Anthropic one.
+    #[schema(required = true)]
     pub(crate) base_url: Option<String>,
     /// Human tier label for an anthropic account (`Max 5x`); `None` for
     /// third-party/api-key profiles.
+    #[schema(required = true)]
     pub(crate) tier: Option<String>,
     /// A live `clauth start` session runs for this profile.
     pub(crate) has_live_session: bool,
@@ -200,6 +205,7 @@ pub(crate) struct ProfileEntry {
     pub(crate) auth_status: String,
     /// Freshness: a live daemon's verdict or the cache-mtime derivation; `None`
     /// when there is no cache at all.
+    #[schema(required = true)]
     pub(crate) fetch_status: Option<String>,
     /// Additive: true when this reading is distrusted, by
     /// either arm — a deep-slot stuck RateLimited, or reading age past
@@ -210,9 +216,11 @@ pub(crate) struct ProfileEntry {
     /// ISO-8601 UTC stamp of when the published figures were last fetched
     /// (OAuth: the body's `fetched_at`; third-party: the cache write);
     /// `None` when there is no cache or the body is undated.
+    #[schema(required = true)]
     pub(crate) fetched_at: Option<String>,
     /// ISO-8601 UTC stamp of the next scheduled refresh; `None` when none is
     /// pending (a spent skipped account, or no cache).
+    #[schema(required = true)]
     pub(crate) next_refresh_at: Option<String>,
     pub(crate) auto_start: bool,
     /// Additive: this profile's slot in the interleaved
@@ -220,10 +228,13 @@ pub(crate) struct ProfileEntry {
     /// it never opted into `auto_start`, or it cannot open a window.
     /// `default` so a reader stays additive-tolerant of an older writer.
     #[serde(default)]
+    #[schema(required = true)]
     pub(crate) auto_start_queue: Option<QueueEntry>,
+    #[schema(required = true)]
     pub(crate) bell_threshold: Option<f64>,
     /// The chain-membership object (`position` / `threshold` / `armed`), `None`
     /// when not a chain member.
+    #[schema(required = true)]
     pub(crate) fallback: Option<Fallback>,
     /// The 5h/7d usage rows: an OAuth account's own windows, or an api-key
     /// account's provider-derived ones. Empty when the cache behind them
@@ -231,6 +242,7 @@ pub(crate) struct ProfileEntry {
     pub(crate) windows: Vec<Window>,
     /// The third-party availability object (`available`), `None` for OAuth
     /// accounts.
+    #[schema(required = true)]
     pub(crate) third_party: Option<ThirdPartyAvailability>,
 }
 
@@ -524,11 +536,13 @@ pub(crate) fn build_profile_entries(
 
 /// The full `status.json` body. Field order is the published key order, and
 /// each `Option` field emits a present key holding `null` when absent.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub(crate) struct StatusBody {
     pub(crate) schema: u64,
     pub(crate) generated_at: String,
+    #[schema(required = true)]
     pub(crate) active_profile: Option<String>,
+    #[schema(required = true)]
     pub(crate) pending_switch: Option<String>,
     pub(crate) wrap_off: bool,
     pub(crate) refresh_interval_ms: u64,

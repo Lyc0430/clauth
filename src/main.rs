@@ -221,12 +221,14 @@ fn dispatch(cli: Cli) -> Result<()> {
             key,
             // The default's explicit spelling: nothing to branch on.
             no_standby: _,
+            dump_openapi,
         } => cmd_daemon(
             standby,
             replace,
             status,
             listen,
             daemon::api::tls::CertSource::from_flags(cert, key),
+            dump_openapi,
         ),
         Command::Devices { json, cmd } => cmd_devices(json, cmd),
         Command::Status {
@@ -257,7 +259,15 @@ fn cmd_daemon(
     status: bool,
     listen: Option<std::net::SocketAddr>,
     certs: daemon::api::tls::CertSource,
+    dump_openapi: bool,
 ) -> Result<()> {
+    // The dump arm is first: it must return before any listener, certificate
+    // read, singleton claim or home access, so CI can pin the spec without a
+    // daemon.
+    if dump_openapi {
+        let mut stdout = std::io::stdout().lock();
+        return write_openapi_document(&mut stdout);
+    }
     if status {
         daemon::status_probe()
     } else if replace {
@@ -266,6 +276,23 @@ fn cmd_daemon(
         daemon::serve(daemon::StartMode::Standby, listen, &certs)
     } else {
         daemon::serve(daemon::StartMode::ExitIfRunning, listen, &certs)
+    }
+}
+
+/// Write the OpenAPI document verbatim to `writer` — the exact bytes
+/// `GET /api/v1/openapi.json` serves, with no trailing newline or framing.
+/// Split out from [`cmd_daemon`] so the byte-for-byte contract is unit-testable
+/// without capturing stdout.
+fn write_openapi_document<W: std::io::Write>(writer: &mut W) -> Result<()> {
+    let document = daemon::api::routes::openapi_document_bytes().map_err(anyhow::Error::msg)?;
+    // The serializer always emits UTF-8; the check keeps the byte contract exact
+    // instead of a lossy conversion that could drop a byte.
+    let text = String::from_utf8(document).map_err(anyhow::Error::msg)?;
+    match crate::out::write_chunk(writer, format_args!("{text}"), false, "stdout") {
+        crate::out::Wrote::Yes => Ok(()),
+        // A reader that left ends the dump at Ok, exit 0 at the real entry: the
+        // pipeline reported what the reader returned, not this run failing.
+        crate::out::Wrote::ReaderGone => Ok(()),
     }
 }
 

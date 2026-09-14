@@ -7,6 +7,7 @@
 //! home for the shape keeps the three surfaces from drifting.
 
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use crate::profile::{Profile, ProfileName};
 use crate::profile_cache::{
@@ -332,10 +333,11 @@ pub(crate) fn cache_age_secs(name: &ProfileName, file: &str) -> Option<u64> {
 /// ([`usage_windows`] → the daemon's `status.json` feed and the MCP payloads)
 /// and the reader (`clauth list`'s 5h/7d columns) derive from this one struct,
 /// so a reader's key spelling cannot drift from what a writer emits.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub(crate) struct Window {
     pub(crate) label: String,
     pub(crate) utilization_pct: f64,
+    #[schema(required = true)]
     pub(crate) resets_at: Option<String>,
 }
 
