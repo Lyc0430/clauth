@@ -113,6 +113,7 @@ fn entry(input: f64, output: f64) -> PriceEntry {
         cache_read: 0.0,
         cache_write: 0.0,
         constraint: None,
+        window_only: false,
     }
 }
 
@@ -158,6 +159,7 @@ fn two_window_model() -> PricedModel {
                     start: "01:00".to_owned(),
                     end: "04:00".to_owned(),
                 }),
+                window_only: false,
             },
             PriceEntry {
                 input: 0.435e-6,
@@ -168,6 +170,7 @@ fn two_window_model() -> PricedModel {
                     start: "06:00".to_owned(),
                     end: "10:00".to_owned(),
                 }),
+                window_only: false,
             },
         ],
         effective_at: None,
@@ -646,11 +649,15 @@ fn distill_override_inherits_missing_axes_from_base() {
 }
 
 #[test]
-fn distill_skips_quota_only_entries() {
-    // `quota_multiplier` is a consumption weight, never a rate: an entry with
-    // no `rates` of its own is skipped at distill (the zai glm rows carry
-    // these), while a quota key ON a rated entry is ignored and the rates
-    // still contribute.
+fn distill_keeps_quota_only_windows_as_window_only_entries() {
+    // `quota_multiplier` is a consumption weight, never a rate: a rates-less
+    // entry with a window distills as a `window_only` entry that pricing
+    // never selects but the peak indicator reads (the zai glm rows carry
+    // these). A quota weight with NO window marks no hours and drops, and a
+    // quota key ON a rated entry is ignored while the rates still contribute.
+    // The last two models pin the days-only shapes: a RATED days-only override
+    // keeps pricing (date-gated, never intra-day), while a RATES-LESS one
+    // drops — a days-only weight marks no hours.
     let json = r#"{"version": 4, "sources": {"zai": {
         "glm-5.3-flash": {
             "rates": {"input": 0.075, "output": 0.25, "cache_read": 0.015},
@@ -667,14 +674,37 @@ fn distill_skips_quota_only_entries() {
                 {"when": {"window": [100, 400]}, "quota_multiplier": 1.5,
                  "rates": {"input": 0.5}}
             ]
+        },
+        "weekend-discount": {
+            "rates": {"input": 0.1, "output": 0.2},
+            "overrides": [
+                {"when": {"days": ["saturday", "sunday"]},
+                 "rates": {"input": 0.05, "output": 0.1}}
+            ]
+        },
+        "days-only-quota": {
+            "rates": {"input": 0.1, "output": 0.2},
+            "overrides": [
+                {"when": {"days": ["saturday", "sunday"]}, "quota_multiplier": 0.5}
+            ]
         }
     }}}"#;
     let models = distill(json, &all_first_party(json)).expect("distill ok");
-    assert_eq!(models.len(), 2);
-    assert_eq!(models[0].prices.len(), 1, "both quota entries skipped");
-    assert!((models[0].prices[0].input - 7.5e-8).abs() < 1e-15);
+    assert_eq!(models.len(), 4);
+    let glm = &models[0].prices;
+    assert_eq!(
+        glm.len(),
+        2,
+        "the windowless quota drops; the windowed one stays"
+    );
+    assert!((glm[0].input - 7.5e-8).abs() < 1e-15);
+    assert!(!glm[0].window_only, "the base entry prices");
+    assert!(glm[1].window_only, "the quota entry marks, never prices");
+    assert_eq!(glm[1].input, 0.0, "a weight carries no rates");
+    assert_eq!(glm[1].constraint, models[0].prices[1].constraint);
     let rated = &models[1].prices;
     assert_eq!(rated.len(), 2, "the rated entry survives");
+    assert!(!rated[1].window_only, "a rated entry always prices");
     assert!((rated[1].input - 5e-7).abs() < 1e-12);
     assert_eq!(
         rated[1].constraint,
@@ -682,6 +712,23 @@ fn distill_skips_quota_only_entries() {
             start: "01:00".to_owned(),
             end: "04:00".to_owned(),
         })
+    );
+    let weekend = &models[2].prices;
+    assert_eq!(weekend.len(), 2, "the rated days-only override survives");
+    assert!(!weekend[1].window_only, "it prices");
+    assert_eq!(
+        weekend[1].constraint,
+        Some(Constraint::Days {
+            days: vec!["saturday".to_owned(), "sunday".to_owned()],
+            start: None,
+            end: None,
+        })
+    );
+    let days_only_quota = &models[3].prices;
+    assert_eq!(
+        days_only_quota.len(),
+        1,
+        "a days-only weight marks no hours and drops"
     );
 }
 
@@ -1082,6 +1129,7 @@ fn rate_retries_propagate_date_and_hour() {
                     start: "01:00".to_owned(),
                     end: "04:00".to_owned(),
                 }),
+                window_only: false,
             },
         ],
         effective_at: None,
@@ -1145,6 +1193,7 @@ fn every_weekday_name_matches_the_feeds_spelling() {
                         start: None,
                         end: None,
                     }),
+                    window_only: false,
                 },
             ],
             effective_at: None,
@@ -1180,6 +1229,7 @@ fn time_window_hour_granularity_boundaries() {
                     start: "00:30:00Z".to_owned(),
                     end: "16:30:00Z".to_owned(),
                 }),
+                window_only: false,
             },
         ],
         effective_at: None,
@@ -1230,6 +1280,7 @@ fn no_active_entry_prices_nothing() {
                     start: "01:00".to_owned(),
                     end: "04:00".to_owned(),
                 }),
+                window_only: false,
             },
             PriceEntry {
                 input: 9e-6,
@@ -1240,6 +1291,7 @@ fn no_active_entry_prices_nothing() {
                     start: "06:00".to_owned(),
                     end: "10:00".to_owned(),
                 }),
+                window_only: false,
             },
         ],
         effective_at: None,
@@ -1699,6 +1751,7 @@ fn cost_sums_all_four_buckets() {
             cache_read: 1e-7,
             cache_write: 1.25e-6,
             constraint: None,
+            window_only: false,
         }],
         effective_at: None,
     }]);
@@ -1718,6 +1771,7 @@ fn cost_none_for_unpriced_model() {
             cache_read: 1e-7,
             cache_write: 1.25e-6,
             constraint: None,
+            window_only: false,
         }],
         effective_at: None,
     }]);
@@ -1882,15 +1936,19 @@ fn the_memo_keys_on_the_date_so_two_snapshots_do_not_bleed() {
 // ── the zai quota rows ───────────────────────────────────────────────────────
 
 #[test]
-fn zai_quota_entries_are_skipped() {
-    // The fixture's real glm-5.3-flash row: quota_multiplier-only window
-    // entries distill to nothing, so a weekday peak hour prices the flat base.
+fn zai_quota_entries_mark_windows_but_never_price() {
+    // The fixture's real glm-5.3-flash row: the quota_multiplier-only entries
+    // distill to `window_only` entries — the windowless one drops, the windowed
+    // one marks hours — so a weekday peak hour still prices the flat base and
+    // the peak indicator sees zai's 06:00–10:00 window.
     let models = distill(FIXTURE, &fixture_guard()).expect("fixture distills");
     let flash = models
         .iter()
         .find(|m| m.id == "glm-5.3-flash")
         .expect("row distills");
-    assert_eq!(flash.prices.len(), 1, "quota entries contribute no rates");
+    assert_eq!(flash.prices.len(), 2, "base plus the windowed quota marker");
+    assert!(!flash.prices[0].window_only, "the base entry prices");
+    assert!(flash.prices[1].window_only, "the quota entry never prices");
     let t = PriceTable::capture(
         models,
         Vec::new(),
@@ -1900,12 +1958,24 @@ fn zai_quota_entries_are_skipped() {
         0,
         Vec::new(),
     );
+    // 2026-08-28 is a Friday: hour 8 sits inside the window, yet the flat
+    // base prices it — a weight is not a rate.
     let rate = t.rate_at("glm-5.3-flash", "2026-08-28", 8).expect("priced");
     assert!(
         (rate.input - 7.5e-8).abs() < 1e-15,
         "no peak multiplier applies"
     );
     assert!((rate.output - 2.5e-7).abs() < 1e-15);
+    // And the indicator reads the window the pricing ignores.
+    let s = t
+        .peak_state_now(&["glm-5.3-flash"], at("2026-09-14 08:00"))
+        .expect("the quota window feeds the indicator");
+    assert!(s.peak, "08:00 UTC monday sits inside 06:00–10:00");
+    // Outside the window, off-peak.
+    let s = t
+        .peak_state_now(&["glm-5.3-flash"], at("2026-09-14 12:00"))
+        .expect("the quota window feeds the indicator");
+    assert!(!s.peak, "12:00 UTC monday sits outside the window");
 }
 
 // ── delisted rows ────────────────────────────────────────────────────────────
@@ -3124,6 +3194,7 @@ fn peak_state_crosses_the_weekend_off_peak() {
             start: Some(start.to_owned()),
             end: Some(end.to_owned()),
         }),
+        window_only: false,
     };
     let m = PricedModel {
         id: "deepseek-v4-pro".to_owned(),
@@ -3163,6 +3234,7 @@ fn peak_state_saturday_weekday_window_stays_off_peak() {
                     start: Some("06:00".to_owned()),
                     end: Some("10:00".to_owned()),
                 }),
+                window_only: false,
             },
         ],
         effective_at: None,
@@ -3263,6 +3335,7 @@ fn peak_state_ignores_a_window_shadowed_by_a_later_flat_entry() {
                     start: "00:00".to_owned(),
                     end: "24:00".to_owned(),
                 }),
+                window_only: false,
             },
             entry(1.0, 2.0),
         ],
@@ -3287,6 +3360,7 @@ fn peak_state_ignores_a_window_shadowed_by_a_later_flat_entry() {
                     start: "00:00".to_owned(),
                     end: "24:00".to_owned(),
                 }),
+                window_only: false,
             },
         ],
         effective_at: None,
@@ -3295,5 +3369,116 @@ fn peak_state_ignores_a_window_shadowed_by_a_later_flat_entry() {
     let s = t2
         .peak_state_now(&["winning"], at("2026-09-14 12:00"))
         .expect("an unshadowed window answers");
+    assert!(s.peak);
+}
+
+// ── peak_state_source / peak_state_for_profile (the provider path) ──────────
+
+/// A minimal store: one `deepseek` key carrying the two-window shape plus a
+/// `zai` key carrying a quota-only window, and one irrelevant `xai` key.
+fn provider_store_table() -> PriceTable {
+    let weekdays = r#"days": ["monday", "tuesday", "wednesday", "thursday", "friday"]"#;
+    let deepseek = concat!(
+        r#"{"schema":4,"source":"deepseek","model_id":"deepseek-v4-pro","observed_at":"2026-08-26","#,
+        r#""rates":{"input":0.66,"output":1.98,"cache_read":0.022},"#,
+        r#""overrides":[{"when":{"DAYS,"window":[100,400]},"rates":{"input":1.32,"output":3.96}},"#,
+        r#"{"when":{"DAYS,"window":[600,1000]},"rates":{"input":1.32,"output":3.96}}]}"#,
+        "\n"
+    )
+    .replace("DAYS", weekdays);
+    let zai = concat!(
+        r#"{"schema":4,"source":"zai","model_id":"glm-5.3-flash","observed_at":"2026-08-30","#,
+        r#""rates":{"input":0.075,"output":0.25,"cache_read":0.015},"#,
+        r#""overrides":[{"quota_multiplier":0.4},{"when":{"DAYS,"window":[130,530]},"quota_multiplier":1.2}]}"#,
+        "\n"
+    )
+    .replace("DAYS", weekdays);
+    let xai = concat!(
+        r#"{"schema":4,"source":"xai","model_id":"grok-4.5","observed_at":"2026-07-09","#,
+        r#""rates":{"input":4.0,"output":18.0}}"#,
+        "\n"
+    );
+    let ndjson = format!("{deepseek}{zai}{xai}");
+    PriceTable {
+        models: Vec::new(),
+        history: Vec::new(),
+        store: distill_history(&ndjson, &all_first_party_history(&ndjson))
+            .expect("history distills"),
+        aliases: Vec::new(),
+        canonical: CanonicalMap::default(),
+        fetched_at_ms: 0,
+        memo: Mutex::default(),
+    }
+}
+
+#[test]
+fn peak_state_source_reads_a_providers_own_rows() {
+    let t = provider_store_table();
+    // Monday 08:00 UTC: inside deepseek's 06:00–10:00 window.
+    let s = t
+        .peak_state_source("deepseek", at("2026-09-14 08:00"))
+        .expect("deepseek's rows answer");
+    assert!(s.peak, "08:00 UTC monday sits inside 06:00–10:00");
+    // The same store answers for zai through the QUOTA-ONLY window, on zai's
+    // OWN schedule (01:30–05:30 here — deliberately unlike deepseek's, so a
+    // wrong source mapping cannot pass): the multiplier entry marks the hours
+    // even though pricing never selects it.
+    let s = t
+        .peak_state_source("zai", at("2026-09-14 02:00"))
+        .expect("zai's quota window answers");
+    assert!(s.peak, "the quota window marks 01:30–05:30");
+    assert!(
+        !t.peak_state_source("zai", at("2026-09-14 08:00"))
+            .expect("zai's quota window answers")
+            .peak,
+        "08:00 is off-peak on zai's schedule, unlike deepseek's"
+    );
+    // A source with no windowed row answers nothing.
+    assert_eq!(t.peak_state_source("xai", at("2026-09-14 08:00")), None);
+    // A source the store does not carry answers nothing.
+    assert_eq!(t.peak_state_source("minimax", at("2026-09-14 08:00")), None);
+}
+
+#[test]
+fn peak_state_for_profile_prefers_the_provider_path() {
+    let t = provider_store_table();
+    // A deepseek profile pinning nothing: the provider path answers — this is
+    // the fleet the pins-only query could not see.
+    let s = t
+        .peak_state_for_profile(
+            Some(crate::providers::Provider::DeepSeek),
+            &[],
+            at("2026-09-14 08:00"),
+        )
+        .expect("the provider answers without pins");
+    assert!(s.peak);
+    // Pins never override the provider path: a deepseek profile pinning a
+    // flat model still reads deepseek's windows.
+    let s = t
+        .peak_state_for_profile(
+            Some(crate::providers::Provider::DeepSeek),
+            &["grok-4.5"],
+            at("2026-09-14 12:00"),
+        )
+        .expect("the provider path answers");
+    assert!(
+        !s.peak,
+        "12:00 UTC monday is off-peak on deepseek's schedule"
+    );
+    // OpenRouter has no store source: the pins path serves it.
+    assert_eq!(
+        t.peak_state_for_profile(
+            Some(crate::providers::Provider::OpenRouter),
+            &["grok-4.5"],
+            at("2026-09-14 12:00")
+        ),
+        None,
+        "a flat pin through a store-less provider answers nothing"
+    );
+    // A generic endpoint (no provider) falls to the pins path, which here
+    // finds the deepseek window through the store walk too.
+    let s = t
+        .peak_state_for_profile(None, &["deepseek-v4-pro"], at("2026-09-14 08:00"))
+        .expect("the pins path answers");
     assert!(s.peak);
 }

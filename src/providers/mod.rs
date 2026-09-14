@@ -170,6 +170,21 @@ impl Provider {
         matches!(self, Self::Zai | Self::Alibaba | Self::MiniMax)
     }
 
+    /// The source name this provider's own rows carry in the price store
+    /// (`StoreKey::source`): what a provider-keyed store query filters on.
+    /// `None` for OpenRouter — it publishes no first-party rows the resold
+    /// guard keeps, so no store query can reach it and its profiles price
+    /// through their pinned ids.
+    pub(crate) fn store_source(self) -> Option<&'static str> {
+        match self {
+            Self::DeepSeek => Some("deepseek"),
+            Self::Zai => Some("zai"),
+            Self::Alibaba => Some("dashscope"),
+            Self::OpenRouter => None,
+            Self::MiniMax => Some("minimax"),
+        }
+    }
+
     /// The vendor page where this endpoint's api key is minted, for a surface
     /// that offers to open it. [`alibaba`] answers with four different pages,
     /// since its four endpoints are two products across two consoles; the other

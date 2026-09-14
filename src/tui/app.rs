@@ -2353,14 +2353,19 @@ impl App {
     }
 
     /// The profile's peak-rate state off the live price table, sampled now:
-    /// the same window constraints cost pricing reads, over the profile's
-    /// pinned models. `None` when no table is loaded or no pin carries a
+    /// its recognized provider's own store rows when the base URL names one,
+    /// else the window constraints cost pricing reads over the profile's
+    /// pinned models. `None` when no table is loaded or neither path finds a
     /// time-varying rate — the Usage tab's `pricing` row and the overview's
     /// `▲` marker then do not render.
     pub(crate) fn peak_state_for(&self, profile: &Profile) -> Option<crate::pricing::PeakState> {
-        self.price_table
-            .as_ref()
-            .and_then(|t| t.peak_state_now(&profile.models.pinned(), now_ms() as i64 / 1000))
+        self.price_table.as_ref().and_then(|t| {
+            t.peak_state_for_profile(
+                profile.provider,
+                &profile.models.pinned(),
+                now_ms() as i64 / 1000,
+            )
+        })
     }
 
     /// UI-thread tail of bootstrap: rebuilds token snapshot, starts scheduler,

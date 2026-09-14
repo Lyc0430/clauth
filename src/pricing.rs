@@ -202,9 +202,22 @@ pub(crate) struct PriceEntry {
     pub(crate) cache_read: f64,
     pub(crate) cache_write: f64,
     pub(crate) constraint: Option<Constraint>,
+    /// A window the peak indicator reads but pricing never selects: the
+    /// distill of a rates-less override (a `quota_multiplier` weight), whose
+    /// span still marks the provider's peak hours. `false` on every entry
+    /// [`PriceTable::rate_at`] can pick.
+    #[serde(default)]
+    pub(crate) window_only: bool,
 }
 
 impl PriceEntry {
+    /// The same entry flagged [`window_only`](Self::window_only): the distill
+    /// of a rates-less override, marking hours without pricing them.
+    fn window_only_entry(mut self) -> Self {
+        self.window_only = true;
+        self
+    }
+
     /// Whether this entry is the pick at `(date, hour)`: unconstrained entries
     /// are always active; a constraint must hold. A constraint whose strings do
     /// not parse is never active, so entry selection falls through to the
@@ -666,14 +679,19 @@ impl PriceTable {
 
     /// Time-varying pricing state for one profile's pinned models, sampled at
     /// `now_secs` — the live peak indicator the Usage tab and the overview rows
-    /// render. Windows come from the SAME entries [`rate_at`] picks (the alias
-    /// ladder and the `effective_at` gate included), never a second opinion.
-    /// `None` when no model matches, or every match carries only flat rates —
-    /// such a profile never pays a time-varying rate and gets no indicator.
+    /// render. The PINS path of [`PriceTable::peak_state_for_profile`]: a
+    /// recognized provider answers through its store rows there, so this walk
+    /// serves the generic endpoints (and any pin set a provider query cannot
+    /// answer). Windows come from the SAME entries [`rate_at`] picks (the alias
+    /// ladder and the `effective_at` gate included), never a second opinion,
+    /// plus any [`window_only`](PriceEntry::window_only) entries the distill
+    /// kept. `None` when no model matches, or every match carries only flat
+    /// rates — such a profile never pays a time-varying rate and gets no
+    /// indicator.
     ///
     /// The feed models a peak tier as a windowed override over a cheaper flat
-    /// base (deepseek v4, glm-5.3), so an active window IS peak; the state is
-    /// the window predicate, not a rate comparison.
+    /// base (deepseek v4), so an active window IS peak; the state is the window
+    /// predicate, not a rate comparison.
     pub(crate) fn peak_state_now(&self, models: &[&str], now_secs: i64) -> Option<PeakState> {
         let utc = DateTime::from_timestamp(now_secs, 0)?;
         let date = utc.date_naive();
@@ -688,53 +706,124 @@ impl PriceTable {
             let Some((set, idx)) = self.matched(id, &date_s) else {
                 continue;
             };
-            let priced = &set[idx];
-            if priced
-                .effective_at
-                .as_deref()
-                .is_some_and(|effective| date_s.as_str() < effective)
-            {
+            push_model_windows(&set[idx], &date_s, date, &mut windows);
+        }
+        finish_peak_state(windows, date, hour, now_secs)
+    }
+
+    /// The provider path of the peak indicator: windows from every row the
+    /// named store `source` (see [`Provider::store_source`](crate::providers::Provider::store_source))
+    /// itself prices today, regardless of what the profile pins. A recognized
+    /// provider's peak schedule is a property of the provider, not of the
+    /// models a profile happens to pin — an unpinned profile is served the
+    /// endpoint's own aliased models and pays the same windows. `None` when
+    /// the source holds no keys or none of its winning rows carries a
+    /// time-varying entry.
+    pub(crate) fn peak_state_source(&self, source: &str, now_secs: i64) -> Option<PeakState> {
+        let utc = DateTime::from_timestamp(now_secs, 0)?;
+        let date = utc.date_naive();
+        let date_s = date.format("%Y-%m-%d").to_string();
+        let hour = utc.hour() as u8;
+        let mut windows: Vec<Constraint> = Vec::new();
+        for key in &self.store {
+            if key.source != source {
                 continue;
             }
-            for (entry_idx, entry) in priced.prices.iter().enumerate() {
-                // Only entries that can WIN at some hour feed the indicator:
-                // entry selection is last-active-wins, so a window shadowed
-                // by a later flat entry never prices and must not indicate
-                // either. An entry loses to a later entry only where that
-                // later one is active, so a windowed entry is shadowed
-                // exactly at hours some LATER non-window entry covers.
-                let Some(c) = entry.constraint.as_ref() else {
-                    continue;
-                };
-                if !is_window(c) {
-                    continue;
-                }
-                let shadowed_at = |date: &str, hour: u8| {
-                    priced
-                        .prices
-                        .iter()
-                        .enumerate()
-                        .any(|(j, later)| j > entry_idx && later.active(date, hour))
-                };
-                // Sampled across the next 7 days, not one: a weekday-gated
-                // window sampled on its off day must still count as a window.
-                let ever_wins = (0..7 * 24).any(|k| {
-                    let d = date + TimeDelta::days(k / 24);
-                    let h = (k % 24) as u8;
-                    let d = d.format("%Y-%m-%d").to_string();
-                    constraint_active(c, &d, h) && !shadowed_at(&d, h)
-                });
-                if ever_wins && !windows.contains(c) {
-                    windows.push(c.clone());
-                }
+            if let Some(priced) = key.row_for(&date_s) {
+                push_model_windows(priced, &date_s, date, &mut windows);
             }
         }
-        if windows.is_empty() {
-            return None;
-        }
-        let peak = windows.iter().any(|c| constraint_active(c, &date_s, hour));
-        Some(PeakState::new(peak, windows, date, hour, now_secs))
+        finish_peak_state(windows, date, hour, now_secs)
     }
+
+    /// The peak indicator for a whole profile: its provider's own store rows
+    /// when the base URL names a provider the store carries, else the pinned
+    /// ids. The provider path answers whenever it can — a recognized provider
+    /// charges its windows whatever the profile pins — and the pins path
+    /// covers the generic endpoints, the providers whose rows never survive
+    /// the resold guard (OpenRouter), and any window a pin set holds that the
+    /// provider walk cannot see.
+    pub(crate) fn peak_state_for_profile(
+        &self,
+        provider: Option<crate::providers::Provider>,
+        pins: &[&str],
+        now_secs: i64,
+    ) -> Option<PeakState> {
+        if let Some(source) = provider.and_then(|p| p.store_source())
+            && let Some(state) = self.peak_state_source(source, now_secs)
+        {
+            return Some(state);
+        }
+        self.peak_state_now(pins, now_secs)
+    }
+}
+
+/// The time-varying windows one priced row marks today, appended to `windows`
+/// deduped — the per-model half both peak queries share. Only entries that can
+/// WIN at some hour feed the indicator: entry selection is last-active-wins, so
+/// a window shadowed by a later flat entry never prices and must not indicate
+/// either. An entry loses to a later entry only where that later one is active,
+/// so a windowed entry is shadowed exactly at hours some LATER non-window
+/// (pricing-eligible) entry covers. `window_only` entries can never be shadowed
+/// and never price — they are pure indicators — so they feed the walk whenever
+/// their window can be active in the 7-day sample, which `ever_wins` decides
+/// for every entry alike. A row whose `effective_at` is after `date` is skipped
+/// outright: it prices nothing today.
+fn push_model_windows(
+    priced: &PricedModel,
+    date: &str,
+    date_parsed: NaiveDate,
+    windows: &mut Vec<Constraint>,
+) {
+    if priced
+        .effective_at
+        .as_deref()
+        .is_some_and(|effective| date < effective)
+    {
+        return;
+    }
+    for (entry_idx, entry) in priced.prices.iter().enumerate() {
+        let Some(c) = entry.constraint.as_ref() else {
+            continue;
+        };
+        if !is_window(c) {
+            continue;
+        }
+        let shadowed_at =
+            |date: &str, hour: u8| {
+                priced.prices.iter().enumerate().any(|(j, later)| {
+                    j > entry_idx && !later.window_only && later.active(date, hour)
+                })
+            };
+        // Sampled across the next 7 days, not one: a weekday-gated window
+        // sampled on its off day must still count as a window.
+        let ever_wins = (0..7 * 24).any(|k| {
+            let d = date_parsed + TimeDelta::days(k / 24);
+            let d = d.format("%Y-%m-%d").to_string();
+            let h = (k % 24) as u8;
+            constraint_active(c, &d, h) && !shadowed_at(&d, h)
+        });
+        if ever_wins && !windows.contains(c) {
+            windows.push(c.clone());
+        }
+    }
+}
+
+/// The shared tail of both peak queries: no windows — no indicator; else the
+/// sampled state plus the next flip.
+fn finish_peak_state(
+    windows: Vec<Constraint>,
+    date: NaiveDate,
+    hour: u8,
+    now_secs: i64,
+) -> Option<PeakState> {
+    if windows.is_empty() {
+        return None;
+    }
+    let peak = windows
+        .iter()
+        .any(|c| constraint_active(c, &date.format("%Y-%m-%d").to_string(), hour));
+    Some(PeakState::new(peak, windows, date, hour, now_secs))
 }
 
 /// The peak-indicator query result: the sampled state plus the next flip.
@@ -956,7 +1045,8 @@ fn form_index(models: &[PricedModel], id: &str) -> Option<usize> {
 /// matching ones, so a window entry beats the flat base entry it overlaps.
 /// `None` when the row's `effective_at` is after `date` (the row prices
 /// nothing yet) or no entry is active. The only half of resolution the hour
-/// reaches.
+/// reaches. `window_only` entries never price — they mark hours for the peak
+/// indicator, and a weight multiplier is not a rate.
 fn entry_rate(priced: &PricedModel, date: &str, hour: u8) -> Option<ModelRate> {
     if priced
         .effective_at
@@ -965,7 +1055,11 @@ fn entry_rate(priced: &PricedModel, date: &str, hour: u8) -> Option<ModelRate> {
     {
         return None;
     }
-    let entry = priced.prices.iter().rev().find(|e| e.active(date, hour))?;
+    let entry = priced
+        .prices
+        .iter()
+        .rev()
+        .find(|e| !e.window_only && e.active(date, hour))?;
     Some(ModelRate {
         input: entry.input,
         output: entry.output,
@@ -1534,6 +1628,7 @@ impl RawRates {
             cache_read: to_per_token(self.cache_read.or(base.cache_read).unwrap_or(0.0)),
             cache_write: to_per_token(self.cache_write.or(base.cache_write).unwrap_or(0.0)),
             constraint,
+            window_only: false,
         }
     }
 }
@@ -1559,7 +1654,8 @@ struct RawWhen {
 /// One `overrides` entry: a `when` plus override `rates`, a
 /// `quota_multiplier`, or both. `quota_multiplier` is deliberately NOT
 /// declared — it is a consumption weight, never a rate — so an entry with no
-/// `rates` of its own carries nothing clauth can price.
+/// `rates` of its own carries no rate; with a window it still marks hours for
+/// the peak indicator (see [`RawOverride::to_entry`]).
 #[derive(Deserialize)]
 struct RawOverride {
     #[serde(default)]
@@ -1569,13 +1665,15 @@ struct RawOverride {
 }
 
 impl RawOverride {
-    /// `None` for an entry clauth cannot express as a time-of-day rate: one
-    /// with no `rates` of its own (a quota-only entry), one whose `when`
-    /// names a `min_tokens` volume tier, or one whose window is malformed.
-    /// All three are dropped, never widened into an always-active entry that
-    /// would price every hour and every request size at that entry's rate.
+    /// `None` for an entry clauth cannot use: one whose `when` names a
+    /// `min_tokens` volume tier, or a RATES-LESS entry without a window (a
+    /// windowless quota weight marks no hours). Both are dropped, never widened
+    /// into an always-active entry that would price every hour and every
+    /// request size at the entry's rate. A rates-less entry WITH a usable
+    /// window distills as a [`window_only`](PriceEntry::window_only) entry:
+    /// pricing never selects it (a `quota_multiplier` is a consumption weight,
+    /// not a rate), but the peak indicator reads the window it marks.
     fn to_entry(&self, base: &RawRates) -> Option<PriceEntry> {
-        let rates = self.rates.as_ref()?;
         let when = self.when.as_ref();
         if when.is_some_and(|when| when.min_tokens.is_some()) {
             return None;
@@ -1591,6 +1689,8 @@ impl RawOverride {
                 end: Some(end),
             }),
             (Some((start, end)), None) => Some(Constraint::TimeWindow { start, end }),
+            // Days without a window: date-gated, never intra-day (`is_window`
+            // is false for it, so the indicator is unaffected either way).
             (None, Some(days)) => Some(Constraint::Days {
                 days: days.to_vec(),
                 start: None,
@@ -1598,7 +1698,23 @@ impl RawOverride {
             }),
             (None, None) => None,
         };
-        Some(rates.entry(base, constraint))
+        match self.rates.as_ref() {
+            Some(rates) => Some(rates.entry(base, constraint)),
+            // The rates-less path needs a real window: a `window_only` entry
+            // exists to mark hours, and a days-only or bare quota weight
+            // marks none (`is_window` is false for a windowless `Days`).
+            None => {
+                let c = constraint?;
+                if !is_window(&c) {
+                    return None;
+                }
+                Some(
+                    RawRates::default()
+                        .entry(&RawRates::default(), Some(c))
+                        .window_only_entry(),
+                )
+            }
+        }
     }
 }
 

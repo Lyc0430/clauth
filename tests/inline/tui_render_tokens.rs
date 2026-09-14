@@ -43,6 +43,7 @@ fn flat_entry(input: f64, output: f64, cache_read: f64, cache_write: f64) -> Pri
         cache_read,
         cache_write,
         constraint: None,
+        window_only: false,
     }
 }
 
@@ -69,6 +70,7 @@ fn windowed_model(id: &str, peak: (f64, f64), off_peak: (f64, f64)) -> PricedMod
                     start: "00:30:00Z".to_owned(),
                     end: "16:30:00Z".to_owned(),
                 }),
+                window_only: false,
             },
         ],
     )
