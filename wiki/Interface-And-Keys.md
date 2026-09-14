@@ -114,6 +114,7 @@ The account list ends in an action row: `+ new`, which turns this pane into the 
 | `on mismatch` | `ask`, `overwrite`, `new`, `discard` | `ask` |
 | `refresh` | 15 / 30 / 60 / 90 / 120 / 300 s, or a typed value from 10 s to 1 h | `90s` |
 | `refresh spent` | keep polling accounts already at 100% | on |
+| `context nudge` | off / 300k / 400k / 600k / 900k, or a typed value from 50k to 2M tokens | off |
 | `auto-start queue` | space `auto_start` accounts' 5h window opens `5h / N` apart | off |
 | `rotation` | `lazy`, `preemptive` | `preemptive` |
 | `weekly limit` | chain-wide 7d exhaustion line, 50-100% | `98%` |

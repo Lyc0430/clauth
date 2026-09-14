@@ -133,6 +133,7 @@ clauth keeps no file for the queue: it derives the last open from `usage_history
 | `profiles` | list | `[]` | display order |
 | `fallback_chain` | list | `[]` | ordered chain members ([Auto-switch](Auto-Switch)) |
 | `refresh_interval_ms` | int | `90000` | usage poll cadence, 10 s to 1 h |
+| `context_nudge_threshold_tokens` | int | none | context-window nudge threshold in tokens, 50k to 2M |
 | `refresh_spent_accounts` | bool | `true` | keep polling accounts at 100% |
 | `auto_start_queue` | bool | `false` | interleave the `auto_start` ping so windows open `5h / N` apart |
 | `preemptive_rotation` | bool | `true` | rotate OAuth ahead of expiry; `false` waits for a rejection |

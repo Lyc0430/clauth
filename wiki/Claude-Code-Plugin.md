@@ -18,7 +18,7 @@ To wire the server by hand instead, add this to `mcpServers` in `~/.claude.json`
 "clauth": { "type": "stdio", "command": "clauth", "args": ["mcp"] }
 ```
 
-The TUI's Plugin tab writes exactly that entry for you with <kbd>f</kbd>. The manual route gives you the same four tools, minus the bundled hooks. Without the plugin, a backgrounded `delegate` result has to be collected with `monitor`, and a conversation is never told when the account behind it changes.
+The TUI's Plugin tab writes exactly that entry for you with <kbd>f</kbd>. The manual route gives you the same four tools, minus the bundled hooks. Without the plugin, a backgrounded `delegate` result has to be collected with `monitor`, and a conversation is never told when the account behind it changes or its context crosses the configured threshold.
 
 ## Tools
 
