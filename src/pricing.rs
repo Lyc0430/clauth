@@ -94,7 +94,8 @@ use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
-use chrono::{Datelike, NaiveDate, Weekday};
+use chrono::TimeDelta;
+use chrono::{DateTime, Datelike, NaiveDate, Timelike, Weekday};
 use serde::{Deserialize, Serialize};
 
 use crate::logline::logline;
@@ -209,19 +210,38 @@ impl PriceEntry {
     /// not parse is never active, so entry selection falls through to the
     /// unconstrained base entry instead of failing the whole table.
     fn active(&self, date: &str, hour: u8) -> bool {
-        match &self.constraint {
-            None => true,
-            Some(Constraint::TimeWindow { start, end }) => window_contains(start, end, hour),
-            Some(Constraint::Days { days, start, end }) => {
-                let weekday = date_weekday(date).is_some_and(|w| days.iter().any(|d| d == w));
-                weekday
-                    && match (start, end) {
-                        (Some(s), Some(e)) => window_contains(s, e, hour),
-                        (None, None) => true,
-                        (_, _) => false,
-                    }
-            }
+        self.constraint
+            .as_ref()
+            .is_none_or(|c| constraint_active(c, date, hour))
+    }
+}
+
+/// Whether a constraint holds at `(date, hour)`: the constraint half of
+/// [`PriceEntry::active`], split out so [`PriceTable::peak_state`] can evaluate
+/// a window set without holding entries. A constraint whose strings do not
+/// parse is never active.
+fn constraint_active(c: &Constraint, date: &str, hour: u8) -> bool {
+    match c {
+        Constraint::TimeWindow { start, end } => window_contains(start, end, hour),
+        Constraint::Days { days, start, end } => {
+            let weekday = date_weekday(date).is_some_and(|w| days.iter().any(|d| d == w));
+            weekday
+                && match (start, end) {
+                    (Some(s), Some(e)) => window_contains(s, e, hour),
+                    (None, None) => true,
+                    (_, _) => false,
+                }
         }
+    }
+}
+
+/// Whether the constraint names a daily time window: an hour-varying rate, the
+/// shape the peak indicator reads. A day-only `Days` gate (no window) varies by
+/// date, never intra-day, so it is not a peak window.
+fn is_window(c: &Constraint) -> bool {
+    match c {
+        Constraint::TimeWindow { .. } => true,
+        Constraint::Days { start, end, .. } => start.is_some() && end.is_some(),
     }
 }
 
@@ -642,6 +662,125 @@ impl PriceTable {
                 + h.cache_create as f64 * r.cache_write;
         }
         Some(total)
+    }
+
+    /// Time-varying pricing state for one profile's pinned models, sampled at
+    /// `now_secs` — the live peak indicator the Usage tab and the overview rows
+    /// render. Windows come from the SAME entries [`rate_at`] picks (the alias
+    /// ladder and the `effective_at` gate included), never a second opinion.
+    /// `None` when no model matches, or every match carries only flat rates —
+    /// such a profile never pays a time-varying rate and gets no indicator.
+    ///
+    /// The feed models a peak tier as a windowed override over a cheaper flat
+    /// base (deepseek v4, glm-5.3), so an active window IS peak; the state is
+    /// the window predicate, not a rate comparison.
+    pub(crate) fn peak_state_now(&self, models: &[&str], now_secs: i64) -> Option<PeakState> {
+        let utc = DateTime::from_timestamp(now_secs, 0)?;
+        let date = utc.date_naive();
+        let date_s = date.format("%Y-%m-%d").to_string();
+        let hour = utc.hour() as u8;
+        // Distinct windows across the matched models (two pinned models of one
+        // provider carry the same schedule — dedupe to one). An unmatched pin
+        // contributes nothing rather than voiding the query: the other pins
+        // still price what they price.
+        let mut windows: Vec<Constraint> = Vec::new();
+        for id in models {
+            let Some((set, idx)) = self.matched(id, &date_s) else {
+                continue;
+            };
+            let priced = &set[idx];
+            if priced
+                .effective_at
+                .as_deref()
+                .is_some_and(|effective| date_s.as_str() < effective)
+            {
+                continue;
+            }
+            for (entry_idx, entry) in priced.prices.iter().enumerate() {
+                // Only entries that can WIN at some hour feed the indicator:
+                // entry selection is last-active-wins, so a window shadowed
+                // by a later flat entry never prices and must not indicate
+                // either. An entry loses to a later entry only where that
+                // later one is active, so a windowed entry is shadowed
+                // exactly at hours some LATER non-window entry covers.
+                let Some(c) = entry.constraint.as_ref() else {
+                    continue;
+                };
+                if !is_window(c) {
+                    continue;
+                }
+                let shadowed_at = |date: &str, hour: u8| {
+                    priced
+                        .prices
+                        .iter()
+                        .enumerate()
+                        .any(|(j, later)| j > entry_idx && later.active(date, hour))
+                };
+                // Sampled across the next 7 days, not one: a weekday-gated
+                // window sampled on its off day must still count as a window.
+                let ever_wins = (0..7 * 24).any(|k| {
+                    let d = date + TimeDelta::days(k / 24);
+                    let h = (k % 24) as u8;
+                    let d = d.format("%Y-%m-%d").to_string();
+                    constraint_active(c, &d, h) && !shadowed_at(&d, h)
+                });
+                if ever_wins && !windows.contains(c) {
+                    windows.push(c.clone());
+                }
+            }
+        }
+        if windows.is_empty() {
+            return None;
+        }
+        let peak = windows.iter().any(|c| constraint_active(c, &date_s, hour));
+        Some(PeakState::new(peak, windows, date, hour, now_secs))
+    }
+}
+
+/// The peak-indicator query result: the sampled state plus the next flip.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PeakState {
+    /// A window is active at the sampled hour.
+    pub(crate) peak: bool,
+    /// The next state change at an hour boundary — the granularity the pricing
+    /// itself samples at, so a `00:30` window end reads as a `01:00` flip.
+    /// `(to_peak, secs until)`. `None` when no flip lands within the 8-day
+    /// scan horizon.
+    pub(crate) next_flip: Option<(bool, i64)>,
+}
+
+impl PeakState {
+    /// Scan forward hour-boundary by hour-boundary for the first sampled-state
+    /// change. `now_secs` may sit mid-hour; the flip lands at the boundary
+    /// where the sampled state differs from `peak`. `date`/`hour` are the
+    /// already-parsed parts of the sample instant, so parsing cannot fail
+    /// here.
+    fn new(
+        peak: bool,
+        windows: Vec<Constraint>,
+        date: NaiveDate,
+        hour: u8,
+        now_secs: i64,
+    ) -> PeakState {
+        let hour_start = now_secs - now_secs.rem_euclid(3600);
+        for k in 1..=8 * 24 {
+            let total = hour as i64 + k as i64;
+            let d = date + TimeDelta::days(total / 24);
+            let h = (total % 24) as u8;
+            let active = windows
+                .iter()
+                .any(|c| constraint_active(c, &d.format("%Y-%m-%d").to_string(), h));
+            if active != peak {
+                return PeakState {
+                    peak,
+                    next_flip: Some((active, hour_start + k as i64 * 3600 - now_secs)),
+                };
+            }
+        }
+        PeakState {
+            peak,
+            next_flip: None,
+        }
     }
 }
 

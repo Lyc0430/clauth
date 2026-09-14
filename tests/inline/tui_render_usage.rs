@@ -601,6 +601,7 @@ fn header_lines_plan_falls_back_to_account_tier() {
         kick_block: None,
         queue_slot: None,
         diag: DiagFlags::default(),
+        peak: None,
     };
     let plan_row: String = header_lines(&profile, &header, 52)
         .first()
@@ -666,6 +667,7 @@ fn header_lines_plan_shows_a_hybrid_oauth_profiles_fetched_tier() {
         kick_block: None,
         queue_slot: None,
         diag: DiagFlags::default(),
+        peak: None,
     };
     let plan_row: String = header_lines(&profile, &header, 52)
         .first()
@@ -708,6 +710,7 @@ fn header_lines_plan_dashes_when_no_tier_is_known() {
         kick_block: None,
         queue_slot: None,
         diag: DiagFlags::default(),
+        peak: None,
     };
     let lines = header_lines(&profile, &header, 52);
     let plan_line = lines.first().expect("plan row");
@@ -756,6 +759,7 @@ fn header_lines_auto_start_kick_text_reads_the_later_of_gate_and_own_reset() {
             kick_block: None,
             queue_slot: slot,
             diag: DiagFlags::default(),
+            peak: None,
         };
         header_lines(&profile, &header, 52)
             .iter()
@@ -872,6 +876,7 @@ fn header_lines_kick_text_truncates_then_drops_on_tight_rows() {
             next_in: Some(8880),
         }),
         diag: DiagFlags::default(),
+        peak: None,
     };
     let row = |w: u16| {
         header_lines(&profile, &header, w)[0]
@@ -918,6 +923,7 @@ fn a_key_without_an_endpoint_renders_through_the_oauth_arm() {
         kick_block: None,
         queue_slot: None,
         diag: DiagFlags::default(),
+        peak: None,
     };
     let plan_row: String = header_lines(&profile, &header, 52)
         .first()
@@ -965,6 +971,7 @@ fn header_lines_plan_keeps_api_for_api_key_profiles() {
         kick_block: None,
         queue_slot: None,
         diag: DiagFlags::default(),
+        peak: None,
     };
     let plan_row: String = header_lines(&profile, &header, 52)
         .first()
@@ -1005,6 +1012,7 @@ fn status_lines_shows_canceled_from_a_prior_sessions_cached_plan() {
         kick_block: None,
         queue_slot: None,
         diag: DiagFlags::default(),
+        peak: None,
     };
     let text = |ls: Vec<Line<'_>>| -> String {
         ls.iter()
@@ -1059,6 +1067,7 @@ fn status_lines_no_canceled_pill_when_subscription_is_active() {
         kick_block: None,
         queue_slot: None,
         diag: DiagFlags::default(),
+        peak: None,
     };
     let text = |ls: Vec<Line<'_>>| -> String {
         ls.iter()
@@ -1094,6 +1103,7 @@ fn disabled_rung_header(kick: bool) -> HeaderState {
         }),
         queue_slot: None,
         diag: DiagFlags::default(),
+        peak: None,
     }
 }
 
@@ -1123,6 +1133,7 @@ fn status_lines_renders_stale_cue_from_age_alone() {
         kick_block: None,
         queue_slot: None,
         diag: DiagFlags::default(),
+        peak: None,
     };
 
     let mut stale = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
@@ -1160,6 +1171,7 @@ fn status_lines_stale_cue_coexists_with_cached_fetch_status() {
         kick_block: None,
         queue_slot: None,
         diag: DiagFlags::default(),
+        peak: None,
     };
     let rendered = status_text(&status_lines(&profile, &header, 120));
     assert!(rendered.contains("cached"), "got {rendered:?}");
@@ -1282,6 +1294,7 @@ fn kick_block_pins_its_own_pill_even_on_a_fresh_row() {
         kick_block,
         queue_slot: None,
         diag: DiagFlags::default(),
+        peak: None,
     };
     let text = |ls: Vec<Line<'_>>| -> String {
         ls.iter()
@@ -1373,6 +1386,7 @@ fn the_block_leads_its_own_line_and_never_abuts_the_fetch_state() {
             }),
             queue_slot: None,
             diag: DiagFlags::default(),
+            peak: None,
         },
         52,
     )
@@ -1457,6 +1471,7 @@ fn status_lines_connects_two_plus_hints_into_one_rail() {
                 budget_spent: true,
                 ..DiagFlags::default()
             },
+            peak: None,
         },
         120,
     )
@@ -1516,6 +1531,7 @@ fn status_lines_single_hint_has_no_rail() {
             auth_broken: true,
             ..DiagFlags::default()
         },
+        peak: None,
     };
     let lines: Vec<String> = status_lines(&profile, &header, 120)
         .iter()
@@ -1564,6 +1580,7 @@ fn status_lines_wrapped_non_last_hint_bridges_its_continuation() {
                 auto_start: true,
                 ..DiagFlags::default()
             },
+            peak: None,
         },
         30,
     )
@@ -1615,6 +1632,7 @@ fn status_lines_no_hint_row_after_closed_rail_stays_unbridged() {
                 budget_spent: true,
                 ..DiagFlags::default()
             },
+            peak: None,
         },
         120,
     )
@@ -1650,6 +1668,7 @@ fn rate_limited_suffix_counts_the_retry() {
         kick_block: None,
         queue_slot: None,
         diag: DiagFlags::default(),
+        peak: None,
     };
     let text = |ls: Vec<Line<'_>>| -> String {
         ls.iter()
@@ -1692,6 +1711,7 @@ fn a_failing_refresh_names_itself_on_the_cached_row() {
         kick_block: None,
         queue_slot: None,
         diag: DiagFlags::default(),
+        peak: None,
     };
     let text = |ls: Vec<Line<'_>>| -> String {
         ls.iter()
@@ -1749,6 +1769,7 @@ fn a_streak_pill_turns_red_only_once_it_is_stuck() {
         kick_block: None,
         queue_slot: None,
         diag: DiagFlags::default(),
+        peak: None,
     };
 
     for (status, axis) in [
@@ -1812,6 +1833,7 @@ fn spent_skipped_account_pill_is_bare() {
         kick_block: None,
         queue_slot: None,
         diag: DiagFlags::default(),
+        peak: None,
     };
     let with_window = |util: f64| {
         let mut p = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
@@ -1992,6 +2014,7 @@ fn status_lines_renders_the_auto_start_divergence() {
                     auto_start,
                     ..DiagFlags::default()
                 },
+                peak: None,
             },
             120,
         ))
@@ -2027,6 +2050,7 @@ fn uncapped_outranks_budget_spent_in_the_status_block() {
                 budget_spent: true,
                 ..DiagFlags::default()
             },
+            peak: None,
         },
         120,
     ));
@@ -2074,6 +2098,7 @@ fn auth_broken_suppresses_the_lesser_pills() {
                 spend_uncapped: true,
                 ..DiagFlags::default()
             },
+            peak: None,
         },
         120,
     ));
@@ -2123,6 +2148,7 @@ fn auth_broken_does_not_render_a_reassuring_idle_line() {
                 auth_broken: true,
                 ..DiagFlags::default()
             },
+            peak: None,
         },
         120,
     ));
@@ -2134,4 +2160,209 @@ fn auth_broken_does_not_render_a_reassuring_idle_line() {
         !out.contains("up to date"),
         "no idle dot may sit under a dead-login pill: {out}"
     );
+}
+
+// ── pricing row (peak-rate indicator) ───────────────────────────────────────
+
+/// `pricing_line` names the peak state as a charged pill plus the countdown
+/// to the next flip, all as spans a key/value header row expects.
+#[test]
+fn pricing_line_peak_pill_and_countdown() {
+    let line = pricing_line(crate::pricing::PeakState {
+        peak: true,
+        next_flip: Some((false, 90 * 60)),
+    });
+    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(text.contains("pricing"), "key cell present: {text}");
+    assert!(text.contains("[ peak rate ]"), "charged peak pill: {text}");
+    let countdown = line
+        .spans
+        .iter()
+        .find(|s| s.content.contains("starts in"))
+        .expect("a countdown span");
+    assert_eq!(countdown.content, "off-peak starts in 1h 30m");
+    let pill = line
+        .spans
+        .iter()
+        .find(|s| s.content == "peak rate")
+        .unwrap();
+    assert_eq!(pill.style.fg, theme::warning().fg);
+    assert!(
+        pill.style
+            .add_modifier
+            .contains(ratatui::style::Modifier::BOLD)
+    );
+}
+
+/// Off-peak is the neutral resting state: dim pill, countdown names peak.
+#[test]
+fn pricing_line_off_peak_pill() {
+    let line = pricing_line(crate::pricing::PeakState {
+        peak: false,
+        next_flip: Some((true, 3600)),
+    });
+    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(
+        text.contains("[ off-peak ]"),
+        "neutral off-peak pill: {text}"
+    );
+    // Exact-span pin: a substring check cannot separate `peak starts in` from
+    // `off-peak starts in`.
+    let countdown = line
+        .spans
+        .iter()
+        .find(|s| s.content.contains("starts in"))
+        .expect("a countdown span");
+    assert_eq!(countdown.content, "peak starts in 1h 0m");
+    let pill = line.spans.iter().find(|s| s.content == "off-peak").unwrap();
+    assert_eq!(pill.style.fg, theme::dim().fg);
+}
+
+/// No flip inside the query horizon → pill only, no countdown clause.
+#[test]
+fn pricing_line_without_flip_has_no_countdown() {
+    let line = pricing_line(crate::pricing::PeakState {
+        peak: true,
+        next_flip: None,
+    });
+    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(text.contains("[ peak rate ]"), "{text}");
+    assert!(!text.contains("starts in"), "{text}");
+}
+
+/// The row renders between plan and status only when the profile's pricing
+/// is time-varying; a `None` peak (flat rates, OAuth, no table) renders no
+/// `pricing` key at all.
+#[test]
+fn header_lines_pricing_row_only_with_windows() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("ds"));
+    let base = HeaderState {
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: None,
+        tick: 0,
+        streaks: StreakCounts::default(),
+        kick_block: None,
+        queue_slot: None,
+        diag: DiagFlags::default(),
+        peak: Some(crate::pricing::PeakState {
+            peak: true,
+            next_flip: Some((false, 60)),
+        }),
+    };
+    let rows: Vec<String> = header_lines(&profile, &base, 60)
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+        .collect();
+    assert!(
+        rows.iter().any(|r| r.contains("pricing")),
+        "windowed profile gets the row: {rows:?}"
+    );
+    // The row sits directly under `plan` and above the `status` block.
+    let idx = rows.iter().position(|r| r.contains("pricing")).unwrap();
+    assert!(idx == 1, "second header row, under plan: {rows:?}");
+
+    let flat = HeaderState { peak: None, ..base };
+    let rows: Vec<String> = header_lines(&profile, &flat, 60)
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+        .collect();
+    assert!(
+        !rows.iter().any(|r| r.contains("pricing")),
+        "flat pricing renders no row: {rows:?}"
+    );
+}
+
+/// A table whose one model is windowed all day — `peak_state_now` on it is
+/// peak whatever the real clock says.
+fn windowed_table_fixture() -> crate::pricing::PriceTable {
+    crate::pricing::PriceTable::capture(
+        vec![crate::pricing::PricedModel {
+            id: "deepseek-v4-pro".to_owned(),
+            prices: vec![
+                crate::pricing::PriceEntry {
+                    input: 0.5,
+                    output: 1.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                    constraint: None,
+                },
+                crate::pricing::PriceEntry {
+                    input: 1.0,
+                    output: 2.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                    constraint: Some(crate::pricing::Constraint::TimeWindow {
+                        start: "00:00".to_owned(),
+                        end: "24:00".to_owned(),
+                    }),
+                },
+            ],
+            effective_at: None,
+        }],
+        Vec::new(),
+        Vec::new(),
+        crate::pricing::CanonicalMap::default(),
+        crate::tokens::today_date(),
+        0,
+        Vec::new(),
+    )
+}
+
+/// `App::peak_state_for` wires the pinned models to the live table: a pinned
+/// windowed model answers, a pinned flat model does not, and an unpinned
+/// (OAuth-style) profile never does.
+#[test]
+fn peak_state_for_reads_pinned_models_off_the_table() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let table = windowed_table_fixture();
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("ds"));
+    profile.models.default = Some("deepseek-v4-pro".to_owned());
+    let config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![profile.clone()],
+    };
+    let mut app = App::new(config);
+    assert!(
+        app.peak_state_for(&profile).is_none(),
+        "no table loaded → no indicator"
+    );
+    app.price_table = Some(table);
+    let s = app
+        .peak_state_for(&profile)
+        .expect("pinned windowed model answers");
+    assert!(s.peak, "the all-day fixture window is always active");
+
+    // Flat model pinned → None.
+    let flat_table = crate::pricing::PriceTable::capture(
+        vec![crate::pricing::PricedModel {
+            id: "flat".to_owned(),
+            prices: vec![crate::pricing::PriceEntry {
+                input: 1.0,
+                output: 2.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+                constraint: None,
+            }],
+            effective_at: None,
+        }],
+        Vec::new(),
+        Vec::new(),
+        crate::pricing::CanonicalMap::default(),
+        crate::tokens::today_date(),
+        0,
+        Vec::new(),
+    );
+    let mut flat_profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("f"));
+    flat_profile.models.default = Some("flat".to_owned());
+    app.price_table = Some(flat_table);
+    assert!(app.peak_state_for(&flat_profile).is_none());
+
+    // Nothing pinned → None even with a windowed table loaded: an unpinned
+    // (OAuth-style) profile must not pick up some other model's windows.
+    // The windowed table is rebuilt here — the previous sub-case consumed it
+    // with the flat one.
+    app.price_table = Some(windowed_table_fixture());
+    let bare = crate::testutil::blank_profile(&crate::profile::ProfileName::from("b"));
+    assert!(app.peak_state_for(&bare).is_none());
 }

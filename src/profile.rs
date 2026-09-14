@@ -1185,6 +1185,28 @@ impl ModelSettings {
             && self.fable.is_none()
             && self.subagent.is_none()
     }
+
+    /// The distinct model ids this profile pins, sorted — what a
+    /// third-party endpoint actually serves this account, and therefore the
+    /// id list the peak-rate indicator prices. A profile pinning nothing
+    /// (plain OAuth, or a provider front with no model overrides) serves
+    /// whatever its endpoint's default is and pins nothing to price.
+    pub(crate) fn pinned(&self) -> Vec<&str> {
+        let mut ids: Vec<&str> = [
+            self.default.as_deref(),
+            self.opus.as_deref(),
+            self.sonnet.as_deref(),
+            self.haiku.as_deref(),
+            self.fable.as_deref(),
+            self.subagent.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
 }
 
 /// Which Alibaba Model Studio front the console session belongs to. The two

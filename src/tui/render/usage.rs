@@ -73,6 +73,10 @@ struct HeaderState {
     kick_block: Option<KickBlock>,
     /// Config-derived diagnostic flags driving the `└` fix hints.
     diag: DiagFlags,
+    /// The shown profile's peak-rate state, sampled now off the price table's
+    /// own window constraints. `None` = flat rates or no pinned model prices —
+    /// no `pricing` row renders at all.
+    peak: Option<crate::pricing::PeakState>,
     /// The shown profile's auto-start queue slot, resolved before the Config
     /// guard (rank order) like the chain card used to; `None` when the queue
     /// toggle is off or the profile holds no slot. The `usage auto-start`
@@ -165,6 +169,7 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
             }
         },
         queue_slot: QueueView::new(&cfg, &kick_lifts, queue_anchor).slot(&profile.name),
+        peak: app.peak_state_for(profile),
     };
 
     let show_estimates = cfg.state.show_estimates;
@@ -774,8 +779,35 @@ fn header_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
         ));
     }
     let mut lines = vec![Line::from(plan_spans)];
+    if let Some(peak) = header.peak {
+        lines.push(pricing_line(peak));
+    }
     lines.extend(status_lines(profile, header, inner_w));
     lines
+}
+
+/// The `pricing` header row: the peak-rate state sampled now, named as a pill
+/// plus the countdown to the next flip. Peak is a charged state (WARNING);
+/// off-peak is the neutral resting state. No trailing countdown when no flip
+/// lands inside the query horizon. Windows come from the price table's own
+/// constraints — the same schedule cost pricing uses, never a second opinion.
+fn pricing_line(peak: crate::pricing::PeakState) -> Line<'static> {
+    let (label, style) = if peak.peak {
+        ("peak rate", theme::warning().bold())
+    } else {
+        ("off-peak", theme::dim().bold())
+    };
+    let mut spans = vec![key_span("pricing")];
+    spans.extend(pill(label.to_string(), style));
+    if let Some((to_peak, secs)) = peak.next_flip {
+        let verb = if to_peak { "peak" } else { "off-peak" };
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("{verb} starts in {}", humanize_duration(secs)),
+            theme::faint(),
+        ));
+    }
+    Line::from(spans)
 }
 
 /// The `usage auto-start in …` value, shown for ANY account that opted into

@@ -2315,3 +2315,132 @@ fn five_hour_stamp_never_lost_without_a_7d_bar_gain() {
         "5h stamp present at 97 cols (the defect width)"
     );
 }
+
+// ── peak-rate marker (▲) ─────────────────────────────────────────────────────
+
+/// A table holding one model with a flat base plus a `start`–`end` window:
+/// "00:00"–"24:00" covers every hour (peak whatever the real clock says),
+/// "12:00"–"12:00" no hour (never peak) — the two deterministic fixtures the
+/// marker tests need, time-independent by construction.
+fn windowed_table(start: &str, end: &str) -> crate::pricing::PriceTable {
+    crate::pricing::PriceTable::capture(
+        vec![crate::pricing::PricedModel {
+            id: "deepseek-v4-pro".to_owned(),
+            prices: vec![
+                crate::pricing::PriceEntry {
+                    input: 0.5,
+                    output: 1.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                    constraint: None,
+                },
+                crate::pricing::PriceEntry {
+                    input: 1.0,
+                    output: 2.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                    constraint: Some(crate::pricing::Constraint::TimeWindow {
+                        start: start.to_owned(),
+                        end: end.to_owned(),
+                    }),
+                },
+            ],
+            effective_at: None,
+        }],
+        Vec::new(),
+        Vec::new(),
+        crate::pricing::CanonicalMap::default(),
+        crate::tokens::today_date(),
+        0,
+        Vec::new(),
+    )
+}
+
+/// A profile with one pinned model, active or not, over the shared `profile`
+/// fixture shape.
+fn pinned_profile(name: &str, model: &str) -> Profile {
+    let mut p = profile(name, 40.0, 20.0, 3600);
+    p.models.default = Some(model.to_owned());
+    p
+}
+
+/// While the row's pinned models price at a peak window, `▲` (WARNING) takes
+/// the marker slot in place of the active `●`.
+#[test]
+fn peak_marker_replaces_the_active_dot() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let config = config_with(
+        vec![pinned_profile("a", "deepseek-v4-pro")],
+        Some("a"),
+        vec![],
+    );
+    let mut app = App::new(config);
+    app.price_table = Some(windowed_table("00:00", "24:00"));
+    let widths = OverviewWidths::new(80, &app);
+    let line = render_overview_row(&app, 0, &widths, false, true);
+    let text = line_text(&line);
+    assert!(text.contains('▲'), "peak row renders ▲: {text}");
+    assert!(!text.contains('●'), "▲ replaces the active dot: {text}");
+    let marker = line.spans.iter().find(|s| s.content == "▲").unwrap();
+    assert_eq!(marker.style.fg, theme::warning().fg);
+}
+
+/// A profile whose window is never active (off-peak by fixture) keeps its
+/// `●` and renders no `▲` — off-peak is the resting state and stays clean.
+#[test]
+fn off_peak_row_keeps_the_active_dot() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    // An empty window ("12:00"–"12:00") is active at no hour.
+    let config = config_with(
+        vec![pinned_profile("a", "deepseek-v4-pro")],
+        Some("a"),
+        vec![],
+    );
+    let mut app = App::new(config);
+    app.price_table = Some(windowed_table("12:00", "12:00"));
+    let widths = OverviewWidths::new(80, &app);
+    let text = line_text(&render_overview_row(&app, 0, &widths, false, true));
+    assert!(text.contains('●'), "off-peak active row keeps ●: {text}");
+    assert!(!text.contains('▲'), "no peak marker off-peak: {text}");
+}
+
+/// A usage alert (`!`) outranks the peak marker, like every other marker.
+#[test]
+fn bell_outranks_the_peak_marker() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let config = config_with(
+        vec![pinned_profile("a", "deepseek-v4-pro")],
+        Some("a"),
+        vec![],
+    );
+    let mut app = App::new(config);
+    app.price_table = Some(windowed_table("00:00", "24:00"));
+    app.bell_fired.insert("a".into(), true);
+    let widths = OverviewWidths::new(80, &app);
+    let text = line_text(&render_overview_row(&app, 0, &widths, false, true));
+    assert!(text.contains('!'), "{text}");
+    assert!(
+        !text.contains('▲'),
+        "bell yields to nothing but ⊖×⊘: {text}"
+    );
+}
+
+/// Without a price table (still loading, or a failed fetch) no row claims
+/// peak — an element with no status shows nothing.
+#[test]
+fn no_table_no_peak_marker() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = config_with(
+        vec![pinned_profile("a", "deepseek-v4-pro")],
+        Some("a"),
+        vec![],
+    );
+    let app = App::new(config);
+    let widths = OverviewWidths::new(80, &app);
+    let text = line_text(&render_overview_row(&app, 0, &widths, false, true));
+    assert!(!text.contains('▲'), "no table, no marker: {text}");
+    assert!(text.contains('●'), "the active dot is untouched: {text}");
+}

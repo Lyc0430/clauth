@@ -3074,3 +3074,226 @@ fn dated_row(observed: &str, applies: &str, removed: bool, model: Option<PricedM
         model,
     }
 }
+
+// ── peak_state_now (the live peak indicator query) ──────────────────────────
+
+/// Seconds into a UTC instant: "YYYY-MM-DD HH:MM" → epoch secs.
+fn at(datetime: &str) -> i64 {
+    chrono::NaiveDateTime::parse_from_str(datetime, "%Y-%m-%d %H:%M")
+        .expect("parse test datetime")
+        .and_utc()
+        .timestamp()
+}
+
+#[test]
+fn peak_state_prices_the_two_window_shape_hour_by_hour() {
+    let t = table(vec![two_window_model()]);
+    // 2026-09-14 is a monday. Inside the 06:00–10:00Z window.
+    let s = t
+        .peak_state_now(&["deepseek-v4-pro"], at("2026-09-14 08:30"))
+        .expect("windowed model answers");
+    assert!(s.peak, "08:30 UTC monday sits inside 06:00–10:00");
+    // Off-peak starts at the 10:00 boundary.
+    assert_eq!(s.next_flip, Some((false, 90 * 60)));
+    // Between the windows (04:00–06:00) is off-peak, peak resumes at 06:00.
+    let s = t
+        .peak_state_now(&["deepseek-v4-pro"], at("2026-09-14 05:00"))
+        .expect("windowed model answers");
+    assert!(!s.peak, "05:00 UTC monday sits between the windows");
+    assert_eq!(s.next_flip, Some((true, 3600)));
+    // Inside the first window, off-peak resumes at 04:00.
+    let s = t
+        .peak_state_now(&["deepseek-v4-pro"], at("2026-09-14 02:00"))
+        .expect("windowed model answers");
+    assert!(s.peak, "02:00 UTC monday sits inside 01:00–04:00");
+    assert_eq!(s.next_flip, Some((false, 2 * 3600)));
+}
+
+#[test]
+fn peak_state_crosses_the_weekend_off_peak() {
+    // TimeWindow entries carry no `days` set (the V3-era shape), so the
+    // weekend is peak too; pin the WEEKDAY shape instead: a Days+window model.
+    let weekdays = ["monday", "tuesday", "wednesday", "thursday", "friday"];
+    let weekday_window = |start: &str, end: &str| PriceEntry {
+        input: 1.0,
+        output: 2.0,
+        cache_read: 0.0,
+        cache_write: 0.0,
+        constraint: Some(Constraint::Days {
+            days: weekdays.iter().map(|d| (*d).to_owned()).collect(),
+            start: Some(start.to_owned()),
+            end: Some(end.to_owned()),
+        }),
+    };
+    let m = PricedModel {
+        id: "deepseek-v4-pro".to_owned(),
+        prices: vec![
+            entry(0.5, 1.0),
+            weekday_window("01:00", "04:00"),
+            weekday_window("06:00", "10:00"),
+        ],
+        effective_at: None,
+    };
+    let t = table(vec![m]);
+    // Friday 22:00 UTC: off-peak until monday 01:00 — the weekend crossing.
+    let s = t
+        .peak_state_now(&["deepseek-v4-pro"], at("2026-09-11 22:00"))
+        .expect("windowed model answers");
+    assert!(!s.peak, "friday evening is off-peak");
+    let (to_peak, secs) = s.next_flip.expect("flip lands inside the horizon");
+    assert!(to_peak, "the next flip enters peak");
+    // Sat 00:00 − Fri 22:00 = 2h, then Sat..Mon = 2d, then Mon 00:00→01:00.
+    assert_eq!(secs, (2 + 2 * 24 + 1) * 3600);
+}
+
+#[test]
+fn peak_state_saturday_weekday_window_stays_off_peak() {
+    let weekdays = ["monday", "tuesday", "wednesday", "thursday", "friday"];
+    let m = PricedModel {
+        id: "m".to_owned(),
+        prices: vec![
+            entry(0.5, 1.0),
+            PriceEntry {
+                input: 1.0,
+                output: 2.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+                constraint: Some(Constraint::Days {
+                    days: weekdays.iter().map(|d| (*d).to_owned()).collect(),
+                    start: Some("06:00".to_owned()),
+                    end: Some("10:00".to_owned()),
+                }),
+            },
+        ],
+        effective_at: None,
+    };
+    let t = table(vec![m]);
+    // Saturday 08:00 UTC — inside the window's hours but outside its days.
+    let s = t
+        .peak_state_now(&["m"], at("2026-09-12 08:00"))
+        .expect("answers");
+    assert!(!s.peak, "a weekday-gated window is off-peak on saturday");
+    let (to_peak, _) = s.next_flip.expect("flip lands inside the horizon");
+    assert!(to_peak, "the next flip enters monday's peak");
+}
+
+#[test]
+fn peak_state_none_for_flat_rates_and_unmatched_models() {
+    // A flat-only model: no indicator, whatever the hour.
+    let t = table(vec![eq_model("flat", 1.0, 2.0)]);
+    assert_eq!(t.peak_state_now(&["flat"], at("2026-09-14 03:00")), None);
+    // An unmatched model id: same read as the flat case — nothing to show.
+    let t2 = table(vec![two_window_model()]);
+    assert_eq!(
+        t2.peak_state_now(&["no-such-model"], at("2026-09-14 03:00")),
+        None
+    );
+}
+
+#[test]
+fn peak_state_before_effective_at_is_none() {
+    // A row not yet effective prices nothing, so it must not claim a peak
+    // window either — the same gate `entry_rate` applies.
+    let mut m = two_window_model();
+    m.effective_at = Some("2026-12-01".to_owned());
+    let t = table(vec![m]);
+    assert_eq!(
+        t.peak_state_now(&["deepseek-v4-pro"], at("2026-09-14 03:00")),
+        None
+    );
+}
+
+#[test]
+fn peak_state_dedupes_windows_across_pinned_models() {
+    // Two pinned models of one provider carry the same schedule: one window
+    // set, one flip answer. Distinguished only by the state holding — a
+    // duplicate window cannot change `peak` or `next_flip`, so the observable
+    // is that the query still answers with the single-window values.
+    let mut second = two_window_model();
+    second.id = "deepseek-v4-flash".to_owned();
+    let t = table(vec![two_window_model(), second]);
+    let s = t
+        .peak_state_now(
+            &["deepseek-v4-pro", "deepseek-v4-flash"],
+            at("2026-09-14 07:00"),
+        )
+        .expect("answers");
+    assert!(s.peak);
+    assert_eq!(s.next_flip, Some((false, 3 * 3600)));
+}
+
+#[test]
+fn peak_state_flip_lands_on_the_hour_boundary_from_mid_hour() {
+    let t = table(vec![two_window_model()]);
+    // 03:59:30 — 30s before the boundary; the flip still reads as 04:00, the
+    // granularity the pricing itself samples at.
+    let s = t
+        .peak_state_now(&["deepseek-v4-pro"], at("2026-09-14 03:59") + 30)
+        .expect("answers");
+    assert!(s.peak);
+    assert_eq!(s.next_flip, Some((false, 30)));
+}
+
+#[test]
+fn peak_state_skips_an_unmatched_pin_but_keeps_the_windowed_one() {
+    let t = table(vec![two_window_model()]);
+    let s = t
+        .peak_state_now(
+            &["no-such-model", "deepseek-v4-pro"],
+            at("2026-09-14 07:00"),
+        )
+        .expect("the windowed pin still answers");
+    assert!(s.peak);
+}
+
+#[test]
+fn peak_state_ignores_a_window_shadowed_by_a_later_flat_entry() {
+    // Entry selection is last-active-wins: this row puts the window FIRST and
+    // a flat catch-all AFTER it, so the window never prices — the indicator
+    // must not claim it either.
+    let shadowed = PricedModel {
+        id: "shadowed".to_owned(),
+        prices: vec![
+            PriceEntry {
+                input: 2.0,
+                output: 4.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+                constraint: Some(Constraint::TimeWindow {
+                    start: "00:00".to_owned(),
+                    end: "24:00".to_owned(),
+                }),
+            },
+            entry(1.0, 2.0),
+        ],
+        effective_at: None,
+    };
+    let t = table(vec![shadowed]);
+    assert_eq!(
+        t.peak_state_now(&["shadowed"], at("2026-09-14 12:00")),
+        None
+    );
+    // Control: the same window AFTER the flat entry prices peak all day.
+    let winning = PricedModel {
+        id: "winning".to_owned(),
+        prices: vec![
+            entry(1.0, 2.0),
+            PriceEntry {
+                input: 2.0,
+                output: 4.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+                constraint: Some(Constraint::TimeWindow {
+                    start: "00:00".to_owned(),
+                    end: "24:00".to_owned(),
+                }),
+            },
+        ],
+        effective_at: None,
+    };
+    let t2 = table(vec![winning]);
+    let s = t2
+        .peak_state_now(&["winning"], at("2026-09-14 12:00"))
+        .expect("an unshadowed window answers");
+    assert!(s.peak);
+}
