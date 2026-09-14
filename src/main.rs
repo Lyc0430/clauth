@@ -8,6 +8,7 @@ mod daemon;
 mod fallback;
 mod format;
 mod herdr;
+mod hook_context;
 mod hook_note;
 mod jobs_cli;
 mod jsonsync;

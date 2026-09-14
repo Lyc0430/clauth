@@ -831,6 +831,14 @@ pub(crate) struct AppState {
     pub(crate) count_cache: bool,
     #[serde(default = "default_refresh_interval")]
     pub(crate) refresh_interval_ms: u64,
+    /// Context-window nudge threshold, tokens: at or past it, the hook's
+    /// context leg (`hook_context`) tells the conversation once per value.
+    /// `None` = off. Read through
+    /// [`AppState::context_nudge_threshold_tokens`], which resets a
+    /// hand-edited out-of-band value to off. Valid range
+    /// [`MIN_CONTEXT_NUDGE_TOKENS`]..=[`MAX_CONTEXT_NUDGE_TOKENS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) context_nudge_threshold_tokens: Option<u64>,
     /// Default action when credential divergence is detected. `None` = show the
     /// Divergence modal (current behavior).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -941,6 +949,15 @@ impl AppState {
             .filter(|v| (MIN_REFRESH_INTERVAL_MS..=MAX_REFRESH_INTERVAL_MS).contains(v))
             .unwrap_or(DEFAULT_BURN_HORIZON_MS)
     }
+
+    /// The effective context-nudge threshold: an out-of-band hand-edit reads
+    /// as off (reset-to-`None`, never clamp — the same fail-safe rationale as
+    /// [`AppState::weekly_switch_threshold_pct`], off having no default to
+    /// reset to).
+    pub(crate) fn context_nudge_threshold_tokens(&self) -> Option<u64> {
+        self.context_nudge_threshold_tokens
+            .filter(|v| (MIN_CONTEXT_NUDGE_TOKENS..=MAX_CONTEXT_NUDGE_TOKENS).contains(v))
+    }
 }
 
 fn default_show_estimates() -> bool {
@@ -1001,6 +1018,10 @@ pub(crate) const MIN_WEEKLY_SWITCH_PCT: f64 = 50.0;
 /// hard-cap behavior (switch only once the API already refuses).
 pub(crate) const MAX_WEEKLY_SWITCH_PCT: f64 = 100.0;
 
+/// Bounds of [`AppState::context_nudge_threshold_tokens`], tokens.
+pub(crate) const MIN_CONTEXT_NUDGE_TOKENS: u64 = 50_000;
+pub(crate) const MAX_CONTEXT_NUDGE_TOKENS: u64 = 2_000_000;
+
 /// Default burn-aware floor (percent). 98 mirrors the weekly default: a safe
 /// backstop that never lets a projected switch waste more than 2% of the
 /// window, while the horizon cap does the common-case reclaiming. Tune up for
@@ -1043,6 +1064,7 @@ impl Default for AppState {
             show_pace: false,
             count_cache: false,
             refresh_interval_ms: default_refresh_interval(),
+            context_nudge_threshold_tokens: None,
             default_divergence: None,
             weekly_switch_threshold: None,
             burn_switch_floor_pct: None,
@@ -2052,6 +2074,9 @@ pub(crate) fn load_app_state() -> Result<AppState> {
     }
     if state.burn_horizon_cap_ms.is_some() {
         state.burn_horizon_cap_ms = Some(state.burn_horizon_cap_ms());
+    }
+    if state.context_nudge_threshold_tokens.is_some() {
+        state.context_nudge_threshold_tokens = state.context_nudge_threshold_tokens();
     }
     Ok(state)
 }
