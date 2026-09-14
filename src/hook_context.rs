@@ -36,6 +36,7 @@
 //! A failure is silence at exit 0, never an error: a hook that errors on a
 //! tool call breaks the conversation it exists to inform.
 
+use crate::format::format_threshold_tokens;
 use crate::hook_note::{Payload, ScopeLock, load_record, record_path, store_record};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -194,13 +195,7 @@ fn render_context_note(
     agents: usize,
     delegates: usize,
 ) -> String {
-    let threshold = if threshold.is_multiple_of(1_000_000) {
-        format!("{}M", threshold / 1_000_000)
-    } else if threshold < 1_000_000 && threshold.is_multiple_of(1000) {
-        format!("{}k", threshold / 1000)
-    } else {
-        threshold.to_string()
-    };
+    let threshold = format_threshold_tokens(threshold);
     let mut note = format!("clauth: context window usage has exceeded {threshold} tokens.");
     if auto_compact {
         note.push_str(" auto-compaction is turned on.");

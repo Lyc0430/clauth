@@ -355,6 +355,19 @@ fn format_pct_shows_fractional_percent() {
     assert_eq!(format_pct(42.3), "42.3%");
 }
 
+/// The one threshold spelling, pinned per branch so a drift on one branch
+/// cannot ride the others green: exact millions as `{n}M`, whole thousands
+/// below a million as `{n}k`, anything else plain.
+#[test]
+fn threshold_tokens_formats_m_k_and_plain() {
+    assert_eq!(format_threshold_tokens(1_000_000), "1M");
+    assert_eq!(format_threshold_tokens(2_000_000), "2M");
+    assert_eq!(format_threshold_tokens(600_000), "600k");
+    assert_eq!(format_threshold_tokens(50_000), "50k");
+    assert_eq!(format_threshold_tokens(450_500), "450500");
+    assert_eq!(format_threshold_tokens(1_500_000), "1500000");
+}
+
 /// `local_stamp` is the one prose-stamp formatter: epoch seconds → `YYYY-MM-DD
 /// HH:MM:SS` in local wall clock. Pinned on a fixed epoch so the SHAPE asserts
 /// independently of the operator's zone — the wall-clock digits shift with the

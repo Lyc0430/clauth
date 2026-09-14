@@ -35,15 +35,16 @@ use crate::claude::{
     live_credentials_are_shell, read_claude_credentials, snapshot_active_credentials,
 };
 use crate::fallback::{DEFAULT_THRESHOLD, SwitchAction, auto_switch_if_needed, threshold_for};
-use crate::format::format_pct;
+use crate::format::{format_pct, format_threshold_tokens};
 use crate::lock::with_state_lock;
 use crate::lockorder::{RankedGuard, RankedMutex};
 use crate::oauth;
 use crate::profile::{
     AppConfig, ClockFormat, ConfigHandle, ConsoleSite, DivergenceChoice, HerdrSettings,
-    MAX_REFRESH_INTERVAL_MS, MAX_WEEKLY_SWITCH_PCT, MIN_REFRESH_INTERVAL_MS, MIN_WEEKLY_SWITCH_PCT,
-    ModelSettings, PopupWidth, Profile, ProfileName, ReloadFingerprint, ResetDisplay, ThemeName,
-    load_config, reload_fingerprint, save_app_state, save_profile,
+    MAX_CONTEXT_NUDGE_TOKENS, MAX_REFRESH_INTERVAL_MS, MAX_WEEKLY_SWITCH_PCT,
+    MIN_CONTEXT_NUDGE_TOKENS, MIN_REFRESH_INTERVAL_MS, MIN_WEEKLY_SWITCH_PCT, ModelSettings,
+    PopupWidth, Profile, ProfileName, ReloadFingerprint, ResetDisplay, ThemeName, load_config,
+    reload_fingerprint, save_app_state, save_profile,
 };
 use crate::profile_cache::{USAGE_CACHE_FILE, load_profile_cache, profile_cache_mtime_ms};
 use crate::profile_json::{stale_after_ms, usage_cache_file};
@@ -329,6 +330,12 @@ pub(crate) enum GlobalConfigRow {
     /// Global refresh interval; space cycles presets in-place, ⏎ opens the
     /// custom-value editor (10–3600 s).
     RefreshInterval,
+    /// Context-window nudge threshold in tokens
+    /// (`AppState.context_nudge_threshold_tokens`, default off): at or past it,
+    /// the context hook tells a running session once per value. Space cycles
+    /// off → 300k → 400k → 600k → 900k → off; ⏎ opens the custom-value editor
+    /// (50k-2M tokens, trailing `k` allowed).
+    ContextNudge,
     /// Default action when CC overwrites the credentials symlink. ⏎/space cycles.
     DivergenceDefault,
     /// Opt-in burn-aware auto-switch (`AppState.burn_aware_switching`, issue #8
@@ -1640,6 +1647,9 @@ pub(crate) struct App {
     /// `Some` while the refresh-interval custom-value field is open (⏎ opens,
     /// owns keyboard). Space/`+`/`-` still cycle the presets when `None`.
     pub(crate) refresh_interval_draft: Option<InputState>,
+    /// In-flight custom value for the Config tab's context-nudge editor
+    /// (`None` = not editing). Same lifecycle as `refresh_interval_draft`.
+    pub(crate) context_nudge_draft: Option<InputState>,
     /// In-flight custom value for the Config tab's weekly-threshold editor
     /// (`None` = not editing). Same lifecycle as `refresh_interval_draft`.
     pub(crate) weekly_threshold_draft: Option<InputState>,
@@ -2097,6 +2107,7 @@ impl App {
             fallback_weekly_draft: None,
             global_config_cursor: 0,
             refresh_interval_draft: None,
+            context_nudge_draft: None,
             weekly_threshold_draft: None,
             config_draft: None,
             chain_cursor: 0,
@@ -2961,6 +2972,12 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // Same for the Config-tab context-nudge custom-value editor.
+    if app.tab == Tab::Config && app.context_nudge_draft.is_some() {
+        handle_context_nudge_edit_key(app, key);
+        return;
+    }
+
     // And the Config-tab weekly-threshold custom-value editor.
     if app.tab == Tab::Config && app.weekly_threshold_draft.is_some() {
         handle_weekly_threshold_edit_key(app, key);
@@ -3276,6 +3293,7 @@ fn switch_tab(app: &mut App, tab: Tab) {
         Tab::Config => {
             app.global_config_cursor = 0;
             app.refresh_interval_draft = None;
+            app.context_nudge_draft = None;
             app.weekly_threshold_draft = None;
         }
         Tab::Status => {
@@ -4684,13 +4702,14 @@ pub(crate) const FALLBACK_ROWS: [FallbackRow; 8] = [
 /// Rows on the program-wide Config tab, in display order. Related knobs sit
 /// together instead of interleaving halt above detection; [`GlobalConfigRow::band`]
 /// names each run, and the renderer turns a band change into an eyebrow header.
-pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 15] = [
+pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 16] = [
     GlobalConfigRow::Theme,
     GlobalConfigRow::ResetShape,
     GlobalConfigRow::ClockNotation,
     GlobalConfigRow::DivergenceDefault,
     GlobalConfigRow::RefreshInterval,
     GlobalConfigRow::RefreshSpentAccounts,
+    GlobalConfigRow::ContextNudge,
     GlobalConfigRow::AutoStartQueue,
     GlobalConfigRow::PreemptiveRotation,
     GlobalConfigRow::WeeklyThreshold,
@@ -4715,6 +4734,7 @@ impl GlobalConfigRow {
             GlobalConfigRow::DivergenceDefault
             | GlobalConfigRow::RefreshInterval
             | GlobalConfigRow::RefreshSpentAccounts
+            | GlobalConfigRow::ContextNudge
             | GlobalConfigRow::AutoStartQueue
             | GlobalConfigRow::PreemptiveRotation => "scheduler",
             GlobalConfigRow::WeeklyThreshold
@@ -4731,8 +4751,9 @@ impl GlobalConfigRow {
 
 /// Config tab keymap (enumerated rows only, per the unified value-row grammar):
 /// ↑↓ walks rows; space cycles every row's value forward, wrapping the top
-/// value back to the first; ⏎ opens the refresh-interval and weekly-threshold
-/// custom-value editors and otherwise mirrors space. No row here binds `+`/`-`
+/// value back to the first; ⏎ opens the refresh-interval, context-nudge and
+/// weekly-threshold custom-value editors and otherwise mirrors space. No row
+/// here binds `+`/`-`
 /// (that's reserved for the Fallback tab's continuous `rotate at` threshold).
 fn handle_global_config_key(app: &mut App, key: KeyEvent) {
     let last = GLOBAL_CONFIG_ROWS.len() - 1;
@@ -4759,6 +4780,8 @@ fn handle_global_config_key(app: &mut App, key: KeyEvent) {
             let row = GLOBAL_CONFIG_ROWS[app.global_config_cursor];
             if row == GlobalConfigRow::RefreshInterval {
                 begin_refresh_interval_edit(app);
+            } else if row == GlobalConfigRow::ContextNudge {
+                begin_context_nudge_edit(app);
             } else if row == GlobalConfigRow::WeeklyThreshold {
                 begin_weekly_threshold_edit(app);
             } else {
@@ -4787,6 +4810,7 @@ fn run_global_config_row(app: &mut App, row: GlobalConfigRow) {
         GlobalConfigRow::SwitchOffWhenSpent => toggle_wrap_off(app),
         GlobalConfigRow::WeeklyThreshold => step_weekly_threshold(app),
         GlobalConfigRow::RefreshInterval => step_refresh_interval(app),
+        GlobalConfigRow::ContextNudge => step_context_nudge(app),
         GlobalConfigRow::BurnAware => toggle_burn_aware_switching(app),
         // Inert while burn-aware is off (rendered dimmed): the floor/cap only
         // shape the projection, which the static path never runs.
@@ -5197,6 +5221,25 @@ fn step_refresh_interval(app: &mut App) {
     app.last_reload_fp = reload_fingerprint();
 }
 
+/// Advance the context-nudge threshold to the next-greater preset, wrapping
+/// past the top back to off — space always cycles forward, never clamps. A
+/// custom off-ladder value lands on the next preset above it, not one past it;
+/// past the top preset it wraps to off, the cycle's first step.
+fn step_context_nudge(app: &mut App) {
+    const PRESETS: [u64; 4] = [300_000, 400_000, 600_000, 900_000];
+    let current = app.config().state.context_nudge_threshold_tokens();
+    let next = match current {
+        None => Some(PRESETS[0]),
+        Some(v) => PRESETS.iter().copied().find(|&p| p > v),
+    };
+    {
+        let mut cfg = app.config();
+        cfg.state.context_nudge_threshold_tokens = next;
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_reload_fp = reload_fingerprint();
+}
+
 /// Open the inline custom-value editor for the global refresh interval, seeded
 /// with the current value in whole seconds. ⏎ commits, ⎋ discards.
 fn begin_refresh_interval_edit(app: &mut App) {
@@ -5245,6 +5288,70 @@ pub(crate) fn parse_refresh_secs(raw: &str) -> Option<u64> {
     (MIN_REFRESH_INTERVAL_MS..=MAX_REFRESH_INTERVAL_MS)
         .contains(&ms)
         .then_some(ms)
+}
+
+/// Open the inline custom-value editor for the context-nudge threshold, seeded
+/// with the current value in the row's own vocabulary (`600k`); from off it
+/// seeds the first preset, the value one space-press would pick. ⏎ commits, ⎋
+/// discards.
+fn begin_context_nudge_edit(app: &mut App) {
+    let current = app.config().state.context_nudge_threshold_tokens();
+    let seed = match current {
+        None => String::from("300k"),
+        // Exact millions seed in k form (`2000k`), never `2M`: the parser's
+        // grammar takes digits or a single trailing k, so an M-form seed
+        // would open the editor in DANGER.
+        Some(v) if v.is_multiple_of(1_000_000) => format!("{}k", v / 1000),
+        Some(v) => format_threshold_tokens(v),
+    };
+    app.context_nudge_draft = Some(InputState::new(&seed));
+}
+
+/// Keystrokes while the context-nudge field is open: ⏎ saves, ⎋ discards.
+fn handle_context_nudge_edit_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => app.context_nudge_draft = None,
+        KeyCode::Enter => commit_context_nudge_edit(app),
+        _ => {
+            if let Some(input) = app.context_nudge_draft.as_mut() {
+                apply_input_edit(input, key);
+            }
+        }
+    }
+}
+
+/// Parse and persist the typed threshold. Invalid input keeps the draft open
+/// so the Config card's inline Invalid-input treatment (DANGER value +
+/// `└ 50k-2M tokens` tooltip) stays on screen until corrected — no toast.
+fn commit_context_nudge_edit(app: &mut App) {
+    let Some(raw) = app.context_nudge_draft.as_ref().map(|i| i.trimmed()) else {
+        return;
+    };
+    let Some(tokens) = parse_context_nudge_tokens(raw) else {
+        return;
+    };
+    {
+        let mut cfg = app.config();
+        cfg.state.context_nudge_threshold_tokens = Some(tokens);
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_reload_fp = reload_fingerprint();
+    app.context_nudge_draft = None;
+}
+
+/// A typed context-nudge threshold is valid only as whole tokens — a plain
+/// number or one with a single trailing `k` (case-insensitive, `600k` → 600
+/// 000) — that lands in `MIN_CONTEXT_NUDGE_TOKENS..=MAX_CONTEXT_NUDGE_TOKENS`.
+/// Shared by the commit path and the Config card's inline check.
+pub(crate) fn parse_context_nudge_tokens(raw: &str) -> Option<u64> {
+    let (digits, scale) = match raw.strip_suffix(['k', 'K']) {
+        Some(prefix) => (prefix, 1_000u64),
+        None => (raw, 1u64),
+    };
+    let tokens = digits.parse::<u64>().ok()?.checked_mul(scale)?;
+    (MIN_CONTEXT_NUDGE_TOKENS..=MAX_CONTEXT_NUDGE_TOKENS)
+        .contains(&tokens)
+        .then_some(tokens)
 }
 
 /// Step the weekly exhaustion line forward through the preset ladder (space on

@@ -568,6 +568,20 @@ pub(crate) fn format_amount(n: f64) -> String {
     }
 }
 
+/// A token threshold in its display form: exact millions as `{n}M` (`2M`),
+/// whole thousands below a million as `{n}k` (`600k`), anything else plain.
+/// The one rule behind the hook note, the Config row's custom-value append,
+/// its hint, and the editor seed.
+pub(crate) fn format_threshold_tokens(v: u64) -> String {
+    if v.is_multiple_of(1_000_000) {
+        format!("{}M", v / 1_000_000)
+    } else if v < 1_000_000 && v.is_multiple_of(1000) {
+        format!("{}k", v / 1000)
+    } else {
+        v.to_string()
+    }
+}
+
 /// The one LOCAL prose-stamp formatter: an epoch-seconds instant as
 /// `YYYY-MM-DD HH:MM:SS` in the operator's local wall clock. A second spelling
 /// of a LOCAL stamp is a bug in its caller, not a new helper. Machine timestamps

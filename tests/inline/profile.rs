@@ -128,6 +128,30 @@ fn usage_gates_round_trip_through_config_toml() {
 // every existing profiles.toml written before this field existed keeps
 // loading unchanged, matching the `last_resort` guarantee above at the
 // `AppState` level.
+// `context_nudge_threshold_tokens` defaults to off (`None`), so the key is
+// omitted from a stock profiles.toml; a set threshold must round-trip exactly.
+#[test]
+fn context_nudge_threshold_defaults_off_and_round_trips() {
+    let off = AppState::default();
+    let rendered_off = toml::to_string_pretty(&off).expect("render default state");
+    assert!(
+        !rendered_off.contains("context_nudge"),
+        "off (default) must be omitted, got:\n{rendered_off}"
+    );
+
+    let on = AppState {
+        context_nudge_threshold_tokens: Some(600_000),
+        ..AppState::default()
+    };
+    let rendered_on = toml::to_string_pretty(&on).expect("render on state");
+    assert!(
+        rendered_on.contains("context_nudge_threshold_tokens = 600000"),
+        "on must render explicitly, got:\n{rendered_on}"
+    );
+    let reparsed: AppState = toml::from_str(&rendered_on).expect("reparse on state");
+    assert_eq!(reparsed.context_nudge_threshold_tokens, Some(600_000));
+}
+
 #[test]
 fn app_state_burn_aware_switching_defaults_false() {
     let state: AppState = toml::from_str("profiles = []\n").expect("parse state");

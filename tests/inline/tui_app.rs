@@ -4937,6 +4937,7 @@ fn preemptive_rotation_space_toggles_on_every_platform() {
 
 // ── refresh interval custom value ──────────────────────────────────────────
 
+use super::parse_context_nudge_tokens;
 use super::parse_refresh_secs;
 
 /// Park the Config cursor on the refresh-interval row.
@@ -4945,6 +4946,15 @@ fn on_refresh_row(app: &mut App) {
     app.global_config_cursor = GLOBAL_CONFIG_ROWS
         .iter()
         .position(|r| *r == GlobalConfigRow::RefreshInterval)
+        .unwrap();
+}
+
+/// Park the Config cursor on the context-nudge row.
+fn on_nudge_row(app: &mut App) {
+    app.tab = Tab::Config;
+    app.global_config_cursor = GLOBAL_CONFIG_ROWS
+        .iter()
+        .position(|r| *r == GlobalConfigRow::ContextNudge)
         .unwrap();
 }
 
@@ -5125,6 +5135,249 @@ fn refresh_interval_esc_discards_editor() {
         app.refresh_interval.load(Ordering::Relaxed),
         before,
         "esc leaves the interval unchanged"
+    );
+}
+
+// ── context nudge ───────────────────────────────────────────────────────────
+
+#[test]
+fn parse_context_nudge_tokens_accepts_in_range_only() {
+    // Raw tokens: a plain number or one trailing `k` (case-insensitive), landing
+    // in 50_000..=2_000_000.
+    assert_eq!(parse_context_nudge_tokens("600000"), Some(600_000));
+    assert_eq!(parse_context_nudge_tokens("600k"), Some(600_000));
+    assert_eq!(parse_context_nudge_tokens("600K"), Some(600_000));
+    assert_eq!(parse_context_nudge_tokens("50000"), Some(50_000));
+    assert_eq!(parse_context_nudge_tokens("2000000"), Some(2_000_000));
+    assert!(
+        parse_context_nudge_tokens("49999").is_none(),
+        "below the 50k floor"
+    );
+    assert!(
+        parse_context_nudge_tokens("2000001").is_none(),
+        "above the 2m cap"
+    );
+    assert!(parse_context_nudge_tokens("1.5m").is_none(), "no m suffix");
+    assert!(
+        parse_context_nudge_tokens("k").is_none(),
+        "bare k has no digits"
+    );
+    assert!(parse_context_nudge_tokens("").is_none());
+    assert!(parse_context_nudge_tokens("abc").is_none());
+    assert!(
+        parse_context_nudge_tokens(" 600k").is_none(),
+        "whitespace invalidates"
+    );
+    assert!(
+        parse_context_nudge_tokens("600 k").is_none(),
+        "internal whitespace"
+    );
+}
+
+#[test]
+fn context_nudge_space_cycles_the_full_ladder_wrapping_to_off() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    on_nudge_row(&mut app);
+
+    let expect = [
+        Some(300_000),
+        Some(400_000),
+        Some(600_000),
+        Some(900_000),
+        None,
+        Some(300_000),
+    ];
+    for want in expect {
+        super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
+        assert_eq!(
+            app.config().state.context_nudge_threshold_tokens(),
+            want,
+            "space steps off → 300k → 400k → 600k → 900k → off, wrapping"
+        );
+    }
+    assert!(
+        app.context_nudge_draft.is_none(),
+        "space cycles presets, never opens the editor"
+    );
+}
+
+#[test]
+fn context_nudge_space_from_custom_lands_on_next_preset_or_off() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    on_nudge_row(&mut app);
+    app.config().state.context_nudge_threshold_tokens = Some(450_000); // between 400k and 600k
+
+    super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
+    assert_eq!(
+        app.config().state.context_nudge_threshold_tokens(),
+        Some(600_000),
+        "space from an off-ladder custom value steps to the next preset above it"
+    );
+
+    app.config().state.context_nudge_threshold_tokens = Some(1_500_000); // custom past the top preset
+    super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
+    assert_eq!(
+        app.config().state.context_nudge_threshold_tokens(),
+        None,
+        "space from a custom value past the top preset wraps to off"
+    );
+}
+
+#[test]
+fn context_nudge_space_persists_through_profiles_toml() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    on_nudge_row(&mut app);
+    super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
+
+    let reloaded = crate::profile::load_app_state().expect("read profiles.toml");
+    assert_eq!(
+        reloaded.context_nudge_threshold_tokens,
+        Some(300_000),
+        "space's step lands on disk the way a relaunch would read it"
+    );
+}
+
+#[test]
+fn context_nudge_enter_opens_editor_seeded() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    on_nudge_row(&mut app);
+
+    assert!(app.context_nudge_draft.is_none());
+    super::handle_global_config_key(&mut app, key(KeyCode::Enter));
+    let draft = app
+        .context_nudge_draft
+        .as_ref()
+        .expect("⏎ opens the custom-value editor");
+    assert_eq!(
+        draft.value, "300k",
+        "off seeds the first preset, the value one space-press would pick"
+    );
+
+    // From a preset the seed is the row's own `k` vocabulary.
+    app.context_nudge_draft = None;
+    app.config().state.context_nudge_threshold_tokens = Some(600_000);
+    super::handle_global_config_key(&mut app, key(KeyCode::Enter));
+    assert_eq!(
+        app.context_nudge_draft.as_ref().expect("editor open").value,
+        "600k",
+        "a preset seeds in k form"
+    );
+
+    // An exact million seeds in k form too: the parser's grammar takes digits
+    // or one trailing k, so an M-form seed would open the editor in DANGER.
+    app.context_nudge_draft = None;
+    app.config().state.context_nudge_threshold_tokens = Some(2_000_000);
+    super::handle_global_config_key(&mut app, key(KeyCode::Enter));
+    assert_eq!(
+        app.context_nudge_draft.as_ref().expect("editor open").value,
+        "2000k",
+        "an exact million seeds as typeable k, never M"
+    );
+}
+
+/// A custom threshold committed, the editor reopened: the seed renders the
+/// plain token count and parses — the editor opens out of DANGER.
+#[test]
+fn context_nudge_reopened_editor_seeds_a_custom_value_as_plain_tokens() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    on_nudge_row(&mut app);
+    app.config().state.context_nudge_threshold_tokens = Some(450_500);
+
+    super::handle_global_config_key(&mut app, key(KeyCode::Enter));
+    let draft = app
+        .context_nudge_draft
+        .as_ref()
+        .expect("⏎ reopens the custom-value editor");
+    assert_eq!(
+        draft.value, "450500",
+        "a custom value seeds as plain tokens"
+    );
+    assert!(
+        parse_context_nudge_tokens(&draft.value).is_some(),
+        "the seed is typeable — the editor opens out of DANGER"
+    );
+}
+
+#[test]
+fn context_nudge_custom_value_commits_and_clears() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    on_nudge_row(&mut app);
+
+    super::handle_global_config_key(&mut app, key(KeyCode::Enter));
+    // Clear the seeded "300k", type "600k".
+    for _ in 0..4 {
+        super::handle_context_nudge_edit_key(&mut app, key(KeyCode::Backspace));
+    }
+    for c in "600k".chars() {
+        super::handle_context_nudge_edit_key(&mut app, key(KeyCode::Char(c)));
+    }
+    super::handle_context_nudge_edit_key(&mut app, key(KeyCode::Enter));
+
+    assert!(
+        app.context_nudge_draft.is_none(),
+        "a valid commit clears the draft"
+    );
+    assert_eq!(
+        app.config().state.context_nudge_threshold_tokens(),
+        Some(600_000)
+    );
+    let reloaded = crate::profile::load_app_state().expect("read profiles.toml");
+    assert_eq!(
+        reloaded.context_nudge_threshold_tokens,
+        Some(600_000),
+        "the commit lands on disk the way a relaunch would read it"
+    );
+}
+
+#[test]
+fn context_nudge_out_of_range_keeps_editor_open() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    on_nudge_row(&mut app);
+
+    super::handle_global_config_key(&mut app, key(KeyCode::Enter));
+    for _ in 0..4 {
+        super::handle_context_nudge_edit_key(&mut app, key(KeyCode::Backspace));
+    }
+    for c in "49999".chars() {
+        super::handle_context_nudge_edit_key(&mut app, key(KeyCode::Char(c)));
+    }
+    super::handle_context_nudge_edit_key(&mut app, key(KeyCode::Enter));
+
+    assert!(
+        app.context_nudge_draft.is_some(),
+        "an out-of-range value keeps the editor open for correction"
+    );
+    assert_eq!(
+        app.config().state.context_nudge_threshold_tokens(),
+        None,
+        "threshold stays put while the typed value is invalid"
+    );
+}
+
+#[test]
+fn context_nudge_esc_discards_editor() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    on_nudge_row(&mut app);
+
+    super::handle_global_config_key(&mut app, key(KeyCode::Enter));
+    for c in "900k".chars() {
+        super::handle_context_nudge_edit_key(&mut app, key(KeyCode::Char(c)));
+    }
+    super::handle_context_nudge_edit_key(&mut app, key(KeyCode::Esc));
+
+    assert!(app.context_nudge_draft.is_none(), "esc discards the editor");
+    assert_eq!(
+        app.config().state.context_nudge_threshold_tokens(),
+        None,
+        "esc leaves the threshold unchanged"
     );
 }
 

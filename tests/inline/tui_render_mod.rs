@@ -426,6 +426,36 @@ fn config_refresh_interval_custom_editor_renders() {
 }
 
 #[test]
+fn config_context_nudge_custom_editor_renders() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::{GLOBAL_CONFIG_ROWS, GlobalConfigRow, InputState, Tab};
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    app.tab = Tab::Config;
+    app.global_config_cursor = GLOBAL_CONFIG_ROWS
+        .iter()
+        .position(|r| *r == GlobalConfigRow::ContextNudge)
+        .unwrap();
+
+    app.context_nudge_draft = Some(InputState::new("600k"));
+    let valid = dump(&app, 90, 20);
+    assert!(valid.contains("context nudge"), "nudge row label renders");
+    assert!(valid.contains("600k"), "typed tokens render in the field");
+    assert!(
+        valid.contains("50k-2M tokens"),
+        "valid-range tooltip renders"
+    );
+
+    // An out-of-range buffer still renders (DANGER value) without panicking.
+    app.context_nudge_draft = Some(InputState::new("49999"));
+    let invalid = dump(&app, 90, 20);
+    assert!(invalid.contains("49999"));
+    assert!(invalid.contains("50k-2M tokens"));
+}
+
+#[test]
 fn fallback_threshold_editor_shows_range_tooltip() {
     let _home = crate::testutil::HomeSandbox::new();
     use crate::tui::app::{FallbackFocus, InputState, Tab};
