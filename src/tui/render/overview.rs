@@ -438,15 +438,17 @@ fn render_overview_row(
     let mut spans = vec![cursor];
     // A disabled row flattens every semantic hue to dim — the whole row reads as
     // one inert unit rather than a live row wearing a dim name. The GLYPHS stay:
-    // cloudy-tui never lets state ride on hue alone, so `⊖`/`×`/`⊘`/`!`/`●` still
-    // distinguish themselves without the color.
+    // cloudy-tui never lets state ride on hue alone, so `⊖`/`×`/`⊘`/`!`/`●`/`▲`
+    // still distinguish themselves without the color.
     let hue = |s: Style| if disabled { theme::dim() } else { s };
     // Marker precedence: canceled subscription (⊖) > broken login (×) > token
-    // danger (⊘) > bell (!) > active (●). Canceled is dead-first (the org 403s
-    // every request, matching the Fallback ladder where `Canceled` outranks
-    // `AuthBroken`); a dead login makes usage alerts moot until re-login; a dead /
-    // mis-filled long-lived token signs sessions out on the next switch, so it
-    // outranks a bell.
+    // danger (⊘) > bell (!) > active (●) > peak hours (▲). Canceled is
+    // dead-first (the org 403s every request, matching the Fallback ladder
+    // where `Canceled` outranks `AuthBroken`); a dead login makes usage alerts
+    // moot until re-login; a dead / mis-filled long-lived token signs sessions
+    // out on the next switch, so it outranks a bell. The active dot outranks
+    // the peak marker — naming which account a bare `claude` authenticates as
+    // beats a schedule the Usage tab's pricing row already names.
     if crate::fallback::is_canceled(profile) {
         spans.push(Span::styled("⊖", hue(theme::danger())));
         spans.push(Span::raw(" "));
@@ -459,19 +461,18 @@ fn render_overview_row(
     } else if app.bell_fired.contains_key(profile.name.as_str()) {
         spans.push(Span::styled("!", hue(theme::danger())));
         spans.push(Span::raw(" "));
-    } else if peak_live(app, profile) {
-        // Peak-rate marker: while the row's provider is on peak hours it
-        // takes the marker slot IN PLACE OF the active `●` — the
-        // account is paying the surcharged rate right now, which outranks
-        // naming which account a bare `claude` authenticates as. The pricing
-        // row on the Usage tab names the schedule and the flip countdown.
-        spans.push(Span::styled("▲", hue(theme::warning())));
-        spans.push(Span::raw(" "));
     } else if active {
         spans.push(Span::styled(
             "●",
             hue(Style::default().fg(theme::accent_2_color())),
         ));
+        spans.push(Span::raw(" "));
+    } else if peak_live(app, profile) {
+        // Peak-rate marker, non-active rows only: the active `●` outranks it,
+        // so an active profile on peak hours keeps its dot and the `▲` reads
+        // "this other account is on the surcharged rate right now". The
+        // pricing row on the Usage tab names the schedule and the flip.
+        spans.push(Span::styled("▲", hue(theme::warning())));
         spans.push(Span::raw(" "));
     } else {
         spans.push(Span::raw("  "));

@@ -2366,10 +2366,10 @@ fn peak_profile(name: &str) -> Profile {
     p
 }
 
-/// While the row's pinned models price at a peak window, `▲` (WARNING) takes
-/// the marker slot in place of the active `●`.
+/// An active profile on peak hours keeps its `●` — the active dot outranks
+/// the peak marker, so `▲` never takes its slot.
 #[test]
-fn peak_marker_replaces_the_active_dot() {
+fn active_dot_outranks_the_peak_marker() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let config = config_with(vec![peak_profile("a")], Some("a"), vec![]);
@@ -2378,10 +2378,61 @@ fn peak_marker_replaces_the_active_dot() {
     let widths = OverviewWidths::new(80, &app);
     let line = render_overview_row(&app, 0, &widths, false, true);
     let text = line_text(&line);
-    assert!(text.contains('▲'), "peak row renders ▲: {text}");
-    assert!(!text.contains('●'), "▲ replaces the active dot: {text}");
+    assert!(text.contains('●'), "active peak row keeps ●: {text}");
+    assert!(
+        !text.contains('▲'),
+        "the dot outranks the peak marker: {text}"
+    );
+    let marker = line.spans.iter().find(|s| s.content == "●").unwrap();
+    assert_eq!(marker.style.fg, Some(theme::accent_2_color()));
+}
+
+/// A non-active profile on peak hours shows `▲` — the marker names the
+/// surcharged rate on every row the active dot doesn't already claim.
+#[test]
+fn peak_marker_renders_on_inactive_rows() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let config = config_with(
+        vec![peak_profile("a"), peak_profile("b")],
+        Some("a"),
+        vec![],
+    );
+    let mut app = App::new(config);
+    app.price_table = Some(windowed_table("00:00", "24:00"));
+    let widths = OverviewWidths::new(80, &app);
+    let line = render_overview_row(&app, 1, &widths, false, true);
+    let text = line_text(&line);
+    assert!(text.contains('▲'), "inactive peak row renders ▲: {text}");
+    assert!(
+        !text.contains('●'),
+        "no active dot on the inactive row: {text}"
+    );
     let marker = line.spans.iter().find(|s| s.content == "▲").unwrap();
     assert_eq!(marker.style.fg, theme::warning().fg);
+}
+
+/// A disabled non-active profile on peak hours keeps its `▲` glyph, but the
+/// `hue` closure flattens it to dim like every other marker on a disabled row.
+#[test]
+fn disabled_peak_row_dims_the_marker() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut p = peak_profile("a");
+    p.disabled = true;
+    let config = config_with(vec![p], None, vec![]);
+    let mut app = App::new(config);
+    app.price_table = Some(windowed_table("00:00", "24:00"));
+    let widths = OverviewWidths::new(80, &app);
+    let line = render_overview_row(&app, 0, &widths, false, true);
+    let text = line_text(&line);
+    assert!(text.contains('▲'), "disabled peak row keeps ▲: {text}");
+    let marker = line.spans.iter().find(|s| s.content == "▲").unwrap();
+    assert_eq!(
+        marker.style.fg,
+        theme::dim().fg,
+        "the ▲ dims like every marker on a disabled row"
+    );
 }
 
 /// A profile whose window is never active (off-peak by fixture) keeps its
