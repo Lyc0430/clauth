@@ -339,6 +339,26 @@ pub(crate) fn serve_endpoints(
     max: usize,
     reply: impl Fn(&str, usize) -> (u16, String) + Send + 'static,
 ) -> (String, std::thread::JoinHandle<Vec<String>>) {
+    let (base, inner) = serve_endpoints_recording(max, reply);
+    let handle = std::thread::spawn(move || {
+        inner
+            .join()
+            .expect("recording listener")
+            .into_iter()
+            .map(|(path, _body)| path)
+            .collect()
+    });
+    (base, handle)
+}
+
+/// [`serve_endpoints`] that also hands back each request's BODY, for a leg
+/// whose correctness is in what it sent (the paste door's `redirect_uri` and
+/// `state`) rather than in which endpoint it reached. Same listener, same
+/// deadlines; `serve_endpoints` is a projection of this one.
+pub(crate) fn serve_endpoints_recording(
+    max: usize,
+    reply: impl Fn(&str, usize) -> (u16, String) + Send + 'static,
+) -> (String, std::thread::JoinHandle<Vec<(String, String)>>) {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::time::{Duration, Instant};
@@ -354,7 +374,7 @@ pub(crate) fn serve_endpoints(
         .set_nonblocking(true)
         .expect("nonblocking listener");
     let handle = std::thread::spawn(move || {
-        let mut seen: Vec<String> = Vec::new();
+        let mut seen: Vec<(String, String)> = Vec::new();
         for i in 0..max {
             let deadline = Instant::now()
                 + if seen.is_empty() {
@@ -410,6 +430,10 @@ pub(crate) fn serve_endpoints(
                 .and_then(|l| l.split_whitespace().nth(1))
                 .unwrap_or("")
                 .to_string();
+            let request_body = text
+                .split_once("\r\n\r\n")
+                .map(|(_, b)| b.to_string())
+                .unwrap_or_default();
             let (status, body) = reply(&path, i);
             let _ = sock.write_all(
                 format!(
@@ -421,7 +445,7 @@ pub(crate) fn serve_endpoints(
             );
             let _ = sock.write_all(body.as_bytes());
             let _ = sock.shutdown(std::net::Shutdown::Write);
-            seen.push(path);
+            seen.push((path, request_body));
         }
         seen
     });

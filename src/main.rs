@@ -578,27 +578,230 @@ fn collect_api_reauth_snapshot(
     Ok(api_reauth_snapshot(base_url, api_key, stored))
 }
 
-/// Run the browser OAuth flow (preamble, authorize-URL paste fallback, minted
-/// tokens, login summary, identity-anchor seed) and wrap it in a capture
-/// snapshot. Shared by `cmd_login`'s new and reauth OAuth arms so the two stay
-/// in lockstep.
-fn run_oauth_browser(reauth: bool, target: &str) -> Result<actions::CaptureSnapshot> {
+/// One line of pasted `code#state` from a non-TTY stdin, for a driver that
+/// read the link off stdout and feeds the code back to the SAME process (the
+/// code is bound to this process's PKCE verifier). Reads through a `take` so
+/// at most `MANUAL_CODE_MAX + 3` bytes are ever buffered (the cap, a CRLF,
+/// and one byte to tell "exactly the cap" from "over it"): a longer line with
+/// no newline is refused before it is held, not after. The cap is judged on
+/// the line minus its terminator, so a code of exactly the cap still passes.
+/// A line ended by EOF is as good as one ended by `\n` (the driver may close
+/// stdin after writing). An EOF or a blank line is `Ok(None)`: nobody is there
+/// to answer, so the browser door keeps waiting.
+fn read_manual_code_from(reader: impl std::io::BufRead) -> Result<Option<String>> {
+    use std::io::BufRead as _;
+    let cap = oauth_login::MANUAL_CODE_MAX;
+    let mut line = String::new();
+    reader.take(cap as u64 + 3).read_line(&mut line)?;
+    if line.trim_end_matches(['\r', '\n']).len() > cap {
+        anyhow::bail!("{}", oauth_login::ManualCodeError::TooLong.message());
+    }
+    if line.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(line))
+}
+
+/// One keystroke of the paste prompt's raw-mode loop, decided without a
+/// terminal: the loop calls this, the tests drive it. A `Char` appends unless
+/// the buffer is already at the cap (the overflow is dropped, never echoed);
+/// `Backspace` pops; `Enter` submits; `Esc` or ctrl-`c` cancels. Only a
+/// `Press` counts — Windows delivers release events too.
+enum PasteKey {
+    Continue,
+    Submit,
+    Cancel,
+}
+
+fn feed_paste_key(buffer: &mut String, key: ratatui::crossterm::event::KeyEvent) -> PasteKey {
+    use ratatui::crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+    if key.kind != KeyEventKind::Press {
+        return PasteKey::Continue;
+    }
+    match key.code {
+        KeyCode::Enter => PasteKey::Submit,
+        KeyCode::Esc => PasteKey::Cancel,
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => PasteKey::Cancel,
+        KeyCode::Char(c) => {
+            if buffer.len() < oauth_login::MANUAL_CODE_MAX {
+                buffer.push(c);
+            }
+            PasteKey::Continue
+        }
+        KeyCode::Backspace => {
+            buffer.pop();
+            PasteKey::Continue
+        }
+        _ => PasteKey::Continue,
+    }
+}
+
+/// Re-enters cooked mode on every exit from the paste loop, an early `?` included.
+struct RawModeGuard;
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = ratatui::crossterm::terminal::disable_raw_mode();
+    }
+}
+
+/// Why the paste loop stopped: a submit, a cancel, or the worker no longer
+/// needing a code (the other door landed first, or it gave up with none).
+enum TtyExit {
+    Submit,
+    Cancel,
+    WorkerDone,
+}
+
+/// Between keystrokes the paste loop asks the progress channel whether the
+/// worker still wants a code. A landed door (`ExchangingCode`, whichever door)
+/// ends the prompt; so does a worker that returned with none (`Disconnected`:
+/// the login timeout, a declined or state-mismatched callback, an accept
+/// error), or the prompt would outlive the login and hide its error behind
+/// `login canceled`. `outcome_rx` then says which it was.
+fn worker_done(
+    progress: std::result::Result<oauth_login::LoginProgress, std::sync::mpsc::TryRecvError>,
+) -> bool {
+    use std::sync::mpsc::TryRecvError;
+    match progress {
+        Ok(oauth_login::LoginProgress::ExchangingCode(_)) | Err(TryRecvError::Disconnected) => true,
+        Ok(oauth_login::LoginProgress::Verifying) | Err(TryRecvError::Empty) => false,
+    }
+}
+
+/// Feed the paste door from a TTY: echo-off, no line buffering, and a 100 ms
+/// poll so the worker can end the wait ([`worker_done`]). A bad paste prints
+/// the canned refusal and re-prompts against the same login; a submit sends
+/// the code; a cancel bails.
+fn feed_paste_tty(
+    links: &oauth_login::LoginLinks,
+    paste_tx: &std::sync::mpsc::Sender<oauth_login::ManualCode>,
+    progress_rx: &std::sync::mpsc::Receiver<oauth_login::LoginProgress>,
+) -> Result<()> {
+    use ratatui::crossterm::event::{Event, poll, read};
+    use ratatui::crossterm::terminal::enable_raw_mode;
+    use std::time::Duration;
+
+    let mut buffer = String::new();
+    loop {
+        out!("Paste code here if prompted: ");
+        let exit = {
+            let _guard = RawModeGuard;
+            enable_raw_mode().map_err(|e| anyhow::anyhow!("failed to read the code: {e}"))?;
+            loop {
+                if poll(Duration::from_millis(100))
+                    .map_err(|e| anyhow::anyhow!("failed to read the code: {e}"))?
+                    && let Event::Key(key) =
+                        read().map_err(|e| anyhow::anyhow!("failed to read the code: {e}"))?
+                {
+                    match feed_paste_key(&mut buffer, key) {
+                        PasteKey::Submit => break TtyExit::Submit,
+                        PasteKey::Cancel => break TtyExit::Cancel,
+                        PasteKey::Continue => {}
+                    }
+                }
+                if worker_done(progress_rx.try_recv()) {
+                    break TtyExit::WorkerDone;
+                }
+            }
+        };
+        // Raw mode does not translate `\n`; print nothing else while it is on.
+        outln!("");
+        match exit {
+            TtyExit::Submit => match links.parse(&buffer) {
+                Ok(code) => {
+                    // A late paste is never read (`run` already picked its
+                    // door), so the send's result is discarded; the outcome
+                    // channel carries the result.
+                    let _ = paste_tx.send(code);
+                    return Ok(());
+                }
+                Err(e) => {
+                    errln!("clauth: {}. Try again.", e.message());
+                    buffer.clear();
+                }
+            },
+            TtyExit::Cancel => anyhow::bail!("login canceled"),
+            TtyExit::WorkerDone => return Ok(()),
+        }
+    }
+}
+
+/// Feed the paste door from a piped stdin: no prompt, no raw mode, one line.
+/// The reader owns the paste sender, so EOF, a blank line, or a bad paste
+/// closes only the paste door and the browser door keeps waiting.
+fn feed_paste_piped(
+    links: oauth_login::LoginLinks,
+    paste_tx: std::sync::mpsc::Sender<oauth_login::ManualCode>,
+) {
+    let _ = std::thread::spawn(
+        move || match read_manual_code_from(std::io::stdin().lock()) {
+            Ok(Some(line)) => match links.parse(&line) {
+                Ok(code) => {
+                    let _ = paste_tx.send(code);
+                }
+                Err(e) => errln!("clauth: {}", e.message()),
+            },
+            Ok(None) => {}
+            Err(e) => errln!("clauth: {e}"),
+        },
+    );
+}
+
+/// The one "browser didn't open" line every CLI login prints under its
+/// preamble, so the OAuth login and the Alibaba console capture cannot drift
+/// into two spellings of it again.
+fn print_browser_fallback(url: &str) {
+    outln!("\nBrowser didn't open? Use the url below to sign in\n{url}\n");
+}
+
+/// Run an OAuth login (preamble, the links, minted tokens, login summary,
+/// identity-anchor seed) and wrap it in a capture snapshot. One flow, two
+/// doors: the browser opens as today, the hosted link is printed under the
+/// fallback line, and a pasted `code#state` competes with the loopback
+/// callback — whichever lands first wins. Shared by `cmd_login`'s new and
+/// reauth OAuth arms so the two stay in lockstep.
+fn run_oauth(reauth: bool, target: &str) -> Result<actions::CaptureSnapshot> {
+    use std::io::IsTerminal as _;
+
+    // CLI stderr: name the HTTP status too. This lands on the `errln!`
+    // backstop below, a terminal with no companion log open, and a fresh login
+    // failing on a 400 is the case that ruling exists for.
+    let cli_err = |e: oauth_login::LoginError| anyhow::anyhow!("{}", e.cli_message());
     if reauth {
         outln!("clauth: re-authenticating existing profile '{target}', opening a browser…");
     } else {
         outln!("clauth: opening a browser to log in to a new account for '{target}'…");
     }
-    let outcome = oauth_login::login_with(|progress| {
-        // The CLI surfaces only the paste-fallback URL; the later milestones
-        // are TUI-modal fodder and would just be noise between the prints here.
-        if let oauth_login::LoginProgress::AuthorizeUrl(url) = progress {
-            outln!("\nIf the browser didn't open, visit this URL to authorize:\n{url}\n");
-        }
-    })
-    // CLI stderr: name the HTTP status too. This lands on the `errln!`
-    // backstop below, a terminal with no companion log open, and a fresh login
-    // failing on a 400 is the case that ruling exists for.
-    .map_err(|e| anyhow::anyhow!("{}", e.cli_message()))?;
+    let pending = oauth_login::begin_login().map_err(cli_err)?;
+    let links = pending.links().clone();
+    print_browser_fallback(&links.hosted_url);
+    let _ = crate::platform::open_url(&links.browser_url);
+
+    let (paste_tx, paste_rx) = std::sync::mpsc::channel::<oauth_login::ManualCode>();
+    let (outcome_tx, outcome_rx) =
+        std::sync::mpsc::channel::<Result<oauth_login::LoginOutcome, oauth_login::LoginError>>();
+    let (progress_tx, progress_rx) = std::sync::mpsc::channel::<oauth_login::LoginProgress>();
+
+    // The listener and the exchange run off the main thread; the paste loop
+    // below owns the main thread and only learns a door landed via `progress`.
+    std::thread::spawn(move || {
+        let progress = move |p| {
+            let _ = progress_tx.send(p);
+        };
+        let _ = outcome_tx.send(pending.run(paste_rx, progress));
+    });
+
+    if std::io::stdin().is_terminal() {
+        feed_paste_tty(&links, &paste_tx, &progress_rx)?;
+    } else {
+        feed_paste_piped(links, paste_tx);
+    }
+
+    let outcome = outcome_rx
+        .recv()
+        .map_err(|_| anyhow::anyhow!("the login worker ended without a result"))?
+        .map_err(cli_err)?;
     outln!(
         "clauth: login complete.\n{}",
         oauth_login::login_summary(&outcome.credentials)
@@ -680,10 +883,9 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
     // and NOTHING else. Not the api key: the callback returns a workspace key
     // for a different product, and `actions::store_console_login` exists to
     // keep it off the profile.
-    if !is_api
-        && reauth
-        && config.find(&target).and_then(|p| p.provider) == Some(providers::Provider::Alibaba)
-    {
+    let is_alibaba = reauth
+        && config.find(&target).and_then(|p| p.provider) == Some(providers::Provider::Alibaba);
+    if !is_api && is_alibaba {
         return cmd_login_console(&mut config, &target, args.model.as_deref());
     }
 
@@ -710,7 +912,7 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
                 std::io::stdin().is_terminal(),
             )?
         } else {
-            run_oauth_browser(true, &target)?
+            run_oauth(true, &target)?
         };
         actions::overwrite_captured_profile(&mut config, &target, snapshot)?;
         // On a reauth `--model` is an explicit override; without it the
@@ -748,7 +950,7 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
         )?;
         outln!("clauth: captured into profile '{target}'. Switch to it with:  clauth {target}");
     } else {
-        let snapshot = run_oauth_browser(false, &target)?;
+        let snapshot = run_oauth(false, &target)?;
         // The requested default model rides the capture's own save, so the
         // profile's sessions route there from the first launch.
         actions::capture_into_profile(
@@ -808,9 +1010,7 @@ fn cmd_login_console(config: &mut AppConfig, target: &str, model: Option<&str>) 
     outln!(
         "clauth: opening the Alibaba Model Studio console to capture a usage session for '{target}'…"
     );
-    let outcome = alibaba_login::login_with(site, region, |url| {
-        outln!("\nIf the browser didn't open, visit this URL to sign in:\n{url}\n");
-    })?;
+    let outcome = alibaba_login::login_with(site, region, print_browser_fallback)?;
     actions::store_console_login(config, &target, outcome.console.clone())?;
     if let Some(model) = model {
         actions::set_profile_default_model(config, &target, model)?;

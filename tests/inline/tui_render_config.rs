@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! The Setup-tab `model` row is a segmented alias cycle sharing the Config-tab
 //! contract: bare labels when blurred, the active option bracketed only on focus
 //! (the row widens by 2 on focus — the bracket pair is the only width change).
@@ -1079,4 +1080,33 @@ fn stalled_rolling_fix_line_uses_the_title_that_survives_a_draft() {
         joined.contains("clauth rolling-token acct re-arms"),
         "the fix line reads the title, which a draft never blanks: {joined}"
     );
+}
+
+/// One login row, one pair of labels: `+ login` until a credential exists,
+/// `re-login` after, whichever of its three flows the account routes to.
+#[test]
+fn login_labels_read_the_same_for_every_flow() {
+    let input = InputState::new("");
+    let text = |snap: &Snap, row: ConfigRow| {
+        line_text(&detail_row(row, false, false, None, snap, &input))
+            .trim()
+            .to_string()
+    };
+    let mut snap = Snap::blank("a");
+    assert_eq!(text(&snap, ConfigRow::Login), "+ login");
+    snap.logged_in = true;
+    assert_eq!(text(&snap, ConfigRow::Login), "re-login");
+
+    // An api-key account: the row re-enters the key.
+    snap.login_is_oauth = false;
+    assert_eq!(text(&snap, ConfigRow::Login), "re-login");
+    snap.logged_in = false;
+    assert_eq!(text(&snap, ConfigRow::Login), "+ login");
+
+    // A Model Studio account is api-typed too, and its row opens the console.
+    snap.login_is_oauth = true;
+    snap.console_login = true;
+    assert_eq!(text(&snap, ConfigRow::Login), "+ login");
+    snap.logged_in = true;
+    assert_eq!(text(&snap, ConfigRow::Login), "re-login");
 }

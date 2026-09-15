@@ -65,9 +65,10 @@ pub(crate) enum Command {
     /// Add a new account, or re-authenticate an existing one in place
     ///
     /// Neither switches to it. Bare (no --base-url/--api-key) runs the browser
-    /// OAuth flow and writes the minted tokens into the profile; passing either
-    /// endpoint flag captures an API-key account instead, prompting for
-    /// whatever a flag omitted (the key is read echo-off).
+    /// OAuth flow and writes the minted tokens into the profile; the bare login
+    /// also prints a link to open on any device and takes the code that page
+    /// shows. Passing either endpoint flag captures an API-key account instead,
+    /// prompting for whatever a flag omitted (the key is read echo-off).
     ///
     /// An existing name re-authenticates in place: the fresh credential set
     /// replaces the old one while the profile's chain slot, env, and model

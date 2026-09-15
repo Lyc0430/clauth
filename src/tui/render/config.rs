@@ -612,7 +612,7 @@ fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
             "log into alibaba console to see this account's usage"
         }
         ConfigRow::Login if api_login => "re-enter the base URL + API key for this account",
-        ConfigRow::Login => "browser OAuth login; mints fresh tokens for this account",
+        ConfigRow::Login => "browser OAuth login",
         ConfigRow::CaptureLogin => "save the current global credentials into a new account",
         ConfigRow::DeleteCreds if api_login => "clears the stored API key",
         ConfigRow::DeleteCreds => "clears the stored OAuth login",

@@ -3052,3 +3052,157 @@ fn cli_delete_refuses_while_a_rotation_holds_the_lock() {
         "'cli-held' has a token rotation in progress, retry in a moment"
     );
 }
+
+// ── login paste door: the piped reader and the raw-mode key loop ─────────────
+
+/// The piped-stdin reader behind the paste door: a driver writes one line and
+/// may close stdin without a newline; an EOF or a blank line is `Ok(None)`
+/// (the browser door keeps waiting), and nothing longer than the cap is held.
+#[test]
+fn read_manual_code_from_accepts_one_bounded_line() {
+    use std::io::Cursor;
+    let ok = |s: &str| super::read_manual_code_from(Cursor::new(s.as_bytes().to_vec()));
+    let line = |s: &str| ok(s).expect("must read").map(|l| l.trim().to_string());
+    assert_eq!(line("abc#st\n").as_deref(), Some("abc#st"));
+    assert_eq!(
+        line("abc#st").as_deref(),
+        Some("abc#st"),
+        "a line ended by EOF passes"
+    );
+    assert_eq!(
+        line("abc#st\nsecond line\n").as_deref(),
+        Some("abc#st"),
+        "only the first line is the code"
+    );
+    assert!(ok("").expect("immediate eof").is_none(), "EOF is Ok(None)");
+    assert!(
+        ok("   \n").expect("blank line").is_none(),
+        "a blank line is Ok(None)"
+    );
+    // The cap is judged on the code, not the line: exactly the cap passes
+    // with a `\n`, a CRLF, or EOF behind it, and one byte more is refused
+    // however the line ends.
+    let exact = "a".repeat(crate::oauth_login::MANUAL_CODE_MAX);
+    for tail in ["\n", "\r\n", ""] {
+        let got = ok(&format!("{exact}{tail}")).unwrap_or_else(|e| panic!("{tail:?}: {e}"));
+        assert_eq!(
+            got.as_deref().map(|s| s.trim_end_matches(['\r', '\n'])),
+            Some(exact.as_str()),
+            "{tail:?}"
+        );
+    }
+    let long = "a".repeat(crate::oauth_login::MANUAL_CODE_MAX + 1);
+    for tail in ["\n", "\r\n", ""] {
+        let err = ok(&format!("{long}{tail}")).expect_err("one over the cap");
+        assert_eq!(
+            err.to_string(),
+            crate::oauth_login::ManualCodeError::TooLong.message(),
+            "{tail:?}: the canned message, never the input"
+        );
+        assert!(!err.to_string().contains("aaaa"), "never echoes the input");
+    }
+}
+
+/// The raw-mode paste loop's pure step: which keystrokes edit, submit, or
+/// cancel, and that a non-`Press` event (Windows delivers release events too)
+/// changes nothing.
+#[test]
+fn feed_paste_key_decides_append_cap_backspace_submit_and_cancel() {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
+    let mut buf = String::new();
+    assert!(matches!(
+        super::feed_paste_key(&mut buf, crate::testutil::key(KeyCode::Char('a'))),
+        super::PasteKey::Continue
+    ));
+    assert_eq!(buf, "a");
+    super::feed_paste_key(&mut buf, crate::testutil::key(KeyCode::Char('#')));
+    assert_eq!(buf, "a#");
+    assert!(matches!(
+        super::feed_paste_key(&mut buf, crate::testutil::key(KeyCode::Backspace)),
+        super::PasteKey::Continue
+    ));
+    assert_eq!(buf, "a");
+    assert!(matches!(
+        super::feed_paste_key(&mut buf, crate::testutil::key(KeyCode::Enter)),
+        super::PasteKey::Submit
+    ));
+    assert!(matches!(
+        super::feed_paste_key(&mut buf, crate::testutil::key(KeyCode::Esc)),
+        super::PasteKey::Cancel
+    ));
+    assert!(matches!(
+        super::feed_paste_key(
+            &mut buf,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+        ),
+        super::PasteKey::Cancel
+    ));
+    // A non-Press event is a no-op.
+    let before = buf.clone();
+    assert!(matches!(
+        super::feed_paste_key(
+            &mut buf,
+            KeyEvent::new_with_kind(
+                KeyCode::Char('x'),
+                KeyModifiers::NONE,
+                KeyEventKind::Release
+            )
+        ),
+        super::PasteKey::Continue
+    ));
+    assert_eq!(buf, before, "a Release must not edit the buffer");
+    // A Char at the cap is dropped, never echoed: the buffer stays at the cap.
+    let mut full = "a".repeat(crate::oauth_login::MANUAL_CODE_MAX);
+    assert!(matches!(
+        super::feed_paste_key(&mut full, crate::testutil::key(KeyCode::Char('b'))),
+        super::PasteKey::Continue
+    ));
+    assert_eq!(
+        full.len(),
+        crate::oauth_login::MANUAL_CODE_MAX,
+        "cap is exact"
+    );
+    super::feed_paste_key(&mut full, crate::testutil::key(KeyCode::Backspace));
+    assert_eq!(full.len(), crate::oauth_login::MANUAL_CODE_MAX - 1);
+}
+
+/// The paste loop's other exit, decided between keystrokes off the progress
+/// channel: a landed door ends the prompt, and so does a worker that returned
+/// with none (the channel disconnects), or the prompt would outlive the login
+/// and its error would print as `login canceled`. A verify bump cannot arrive
+/// before the door it follows, and an empty channel keeps the prompt.
+#[test]
+fn the_paste_prompt_ends_on_a_landed_door_or_a_finished_worker() {
+    use crate::oauth_login::{LoginMethod, LoginProgress};
+    use std::sync::mpsc::TryRecvError;
+    for door in [LoginMethod::Browser, LoginMethod::Manual] {
+        assert!(
+            super::worker_done(Ok(LoginProgress::ExchangingCode(door))),
+            "{door:?}: a landed door ends the prompt"
+        );
+    }
+    assert!(
+        super::worker_done(Err(TryRecvError::Disconnected)),
+        "a worker that gave up ends the prompt"
+    );
+    assert!(
+        !super::worker_done(Ok(LoginProgress::Verifying)),
+        "a verify bump keeps it"
+    );
+    assert!(
+        !super::worker_done(Err(TryRecvError::Empty)),
+        "an empty channel keeps it"
+    );
+}
+
+/// `--manual` is gone: an argv naming it is now an unknown-flag refusal, like
+/// any other flag that never existed.
+#[test]
+fn login_rejects_the_removed_manual_flag() {
+    assert_eq!(
+        parse_exit_code(&["login", "acme", "--manual"]),
+        2,
+        "a removed flag must be a usage error, not silently ignored"
+    );
+}
