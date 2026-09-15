@@ -206,9 +206,10 @@ const CLAIM_RETRY: Duration = Duration::from_millis(100);
 const _: () = assert!(CLAIM_ATTEMPTS > 1 && !CLAIM_RETRY.is_zero());
 
 /// How long `--replace` waits for a terminated holder's flock to auto-release on
-/// death before it escalates (SIGTERM → SIGKILL) and, after the escalation,
-/// before it gives up. A dying process releases its advisory flock within a
-/// handful of scheduler ticks; 5 s is generous headroom over that.
+/// death before it escalates (SIGTERM → SIGKILL on unix, another `/F` on
+/// Windows) and, after the escalation, before it gives up. A dying process
+/// releases its advisory flock within a handful of scheduler ticks; 5 s is
+/// generous headroom over that.
 const REPLACE_WAIT: Duration = Duration::from_secs(5);
 /// Poll spacing while `--replace` waits for the freed flock. Two orders of
 /// magnitude below [`REPLACE_WAIT`], well under any human-visible delay.
@@ -313,8 +314,10 @@ fn claim_once(dir: &Path, standby: bool) -> Result<Claim> {
 /// Nothing running (a free or missing lock) means nothing to replace: take the
 /// lock like a normal start. A running daemon whose pid can't be read (a torn or
 /// in-handover [`PID_FILE`] sidecar) bails rather than signal a pid it can't
-/// confirm. Otherwise it SIGTERMs the holder, waits for the flock to
-/// auto-release on death (bounded), escalates to SIGKILL once, then claims. The
+/// confirm. Otherwise it signals the holder (SIGTERM then SIGKILL on unix;
+/// `taskkill /F` on both passes on Windows, where no graceful kill exists for
+/// a console daemon), waits for the flock to auto-release on death (bounded),
+/// escalates once, then claims. The
 /// identity guard narrows the recycled-pid window [`holder_pid`] documents by
 /// requiring the pid to still be a running `clauth daemon` (not merely a clauth
 /// process — `clauth start`/`mcp`/`tui` share the binary name), so a stale pid
@@ -377,20 +380,21 @@ pub(crate) fn claim_by_replacing_retry_with(
     if let Some(lock) = wait_for_active(dir, wait, poll) {
         return Ok(Claim::Active(lock));
     }
-    // A graceful term didn't free the lock in time: force-kill, wait once more.
+    // The first pass didn't free the lock in time: escalate (SIGKILL on unix,
+    // another `taskkill /F` on Windows) and wait once more.
     let sent_kill = terminate_pid(pid, true);
     if let Some(lock) = wait_for_active(dir, wait, poll) {
         return Ok(Claim::Active(lock));
     }
     if !sent_term && !sent_kill {
         anyhow::bail!(
-            "could not signal the running clauth daemon (pid {pid}): the `kill` command is not on \
-             PATH; kill it manually, then start"
+            "could not signal the running clauth daemon (pid {pid}): no kill tool is on PATH \
+             (`kill` on unix, `taskkill` on Windows); kill it manually, then start"
         );
     }
     anyhow::bail!(
-        "the running clauth daemon (pid {pid}) did not release the lock within {}s of SIGKILL; \
-         it may be wedged uninterruptibly",
+        "the running clauth daemon (pid {pid}) did not release the lock within {}s of the force \
+         kill; it may be wedged uninterruptibly",
         wait.as_secs()
     )
 }
@@ -437,16 +441,17 @@ fn terminate_pid(pid: u32, hard: bool) -> bool {
 
 #[cfg(windows)]
 fn terminate_pid(pid: u32, hard: bool) -> bool {
+    // A console daemon has no window to accept the graceful WM_CLOSE, so a
+    // soft taskkill can never work here: every pass is a force kill. The
+    // first (soft) pass is the expected-success path and stays silenced; the
+    // hard pass only runs when that first kill failed, so it keeps stderr as
+    // the wedged-process diagnosis. stdout never carries anything the caller
+    // reads (taskkill prints its SUCCESS line there).
     let mut cmd = std::process::Command::new("taskkill");
-    cmd.args(["/PID", &pid.to_string()]);
-    // A console daemon has no window to accept the graceful WM_CLOSE, so the
-    // first (soft) pass usually no-ops and the caller escalates here with /F.
-    // Its refusal lines are expected noise: silence the soft pass's output;
-    // the hard pass stays loud as the wedged-process diagnosis.
-    if hard {
-        cmd.arg("/F");
-    } else {
-        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+    cmd.args(["/PID", &pid.to_string(), "/F"]);
+    cmd.stdout(Stdio::null());
+    if !hard {
+        cmd.stderr(Stdio::null());
     }
     cmd.status().is_ok()
 }
@@ -455,8 +460,8 @@ fn terminate_pid(pid: u32, hard: bool) -> bool {
 /// it, narrowing the recycled-pid window [`holder_pid`] documents. The check is
 /// on the daemon ROLE, not the binary name: `clauth start` (resident around a
 /// live Claude Code session), `clauth mcp`, and `clauth tui` all share
-/// `comm == "clauth"`, so a name-only guard would let `--replace` SIGKILL one of
-/// them if the stale pid recycled onto it. Requiring argv `clauth daemon …`
+/// `comm == "clauth"`, so a name-only guard would let `--replace` force-kill
+/// one of them if the stale pid recycled onto it. Requiring argv `clauth daemon …`
 /// excludes every other subcommand and every non-clauth process. A pid that has
 /// exited (the in-handover window: recorded pid gone, successor holds the lock)
 /// or that can't be verified reads as false, so `--replace` bails and the

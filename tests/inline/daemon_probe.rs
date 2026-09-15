@@ -522,7 +522,7 @@ fn wait_for_active_claims_once_the_holder_releases() {
 
 /// The wait is bounded: a holder that never releases makes `wait_for_active`
 /// time out and return None rather than block forever, so `--replace` can
-/// escalate SIGTERM → SIGKILL and, past that, give up with an error.
+/// escalate (SIGTERM → SIGKILL on unix) and, past that, give up with an error.
 #[test]
 fn wait_for_active_times_out_while_the_lock_stays_held() {
     let _home = HomeSandbox::new();
