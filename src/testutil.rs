@@ -1606,7 +1606,7 @@ mod route_harness {
         let status_path = crate::profile::clauth_dir()
             .expect("clauth dir")
             .join("status.json");
-        ApiContext::new(
+        ApiContext::for_tests(
             config,
             status_path,
             None,

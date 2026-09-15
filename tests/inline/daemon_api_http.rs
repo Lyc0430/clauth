@@ -363,9 +363,15 @@ fn keep_alive_is_negotiated_per_the_request_version_and_header() {
     }
 }
 
-fn render(resp: &Response, disposition: &Disposition) -> String {
+fn render(resp: Response, disposition: &Disposition) -> String {
     let mut out = Vec::new();
-    write_response(&mut out, resp, disposition).unwrap_or_else(|_| panic!("write"));
+    write_response(
+        &mut out,
+        resp,
+        disposition,
+        Instant::now() + Duration::from_secs(3600),
+    )
+    .unwrap_or_else(|_| panic!("write"));
     String::from_utf8(out).unwrap_or_else(|_| panic!("utf8"))
 }
 
@@ -379,7 +385,7 @@ fn keep_alive(timeout_secs: u64, max_requests: u32) -> Disposition {
 #[test]
 fn a_response_states_its_connection_disposition_and_is_never_cached() {
     let wire = render(
-        &Response::json(200, &serde_json::json!({"ok": true})),
+        Response::json(200, &serde_json::json!({"ok": true})),
         &Disposition::Close,
     );
     assert!(wire.starts_with("HTTP/1.1 200 OK\r\n"), "{wire}");
@@ -401,7 +407,7 @@ fn a_response_states_its_connection_disposition_and_is_never_cached() {
 #[test]
 fn a_kept_alive_response_advertises_the_budget_it_was_given() {
     let wire = render(
-        &Response::json(200, &serde_json::json!({"ok": true})),
+        Response::json(200, &serde_json::json!({"ok": true})),
         &keep_alive(93, 97),
     );
     assert!(wire.contains("Connection: keep-alive\r\n"), "{wire}");
@@ -428,7 +434,7 @@ fn a_head_rendering_frames_no_body_on_any_answer() {
     ] {
         let head = resp.into_head();
         assert!(head.body.is_empty());
-        let wire = render(&head, &keep_alive(60, 99));
+        let wire = render(head, &keep_alive(60, 99));
         assert!(
             wire.ends_with("\r\n\r\n"),
             "the wire is headers plus the blank line, nothing after: {wire}"
@@ -453,7 +459,7 @@ fn content_length_matches_the_body() {
             keep_alive(1, 1),
         ),
     ] {
-        let wire = render(&resp, &disposition);
+        let wire = render(resp, &disposition);
         let body = wire
             .split("\r\n\r\n")
             .nth(1)
@@ -467,7 +473,7 @@ fn content_length_matches_the_body() {
 
 #[test]
 fn only_the_401_carries_a_bearer_challenge() {
-    let unauthorized = render(&Response::unauthorized(), &Disposition::Close);
+    let unauthorized = render(Response::unauthorized(), &Disposition::Close);
     assert!(unauthorized.starts_with("HTTP/1.1 401 Unauthorized\r\n"));
     assert!(unauthorized.contains("WWW-Authenticate: Bearer\r\n"));
     assert!(
@@ -476,7 +482,7 @@ fn only_the_401_carries_a_bearer_challenge() {
     );
 
     let ok = render(
-        &Response::json(200, &serde_json::json!({"ok": true})),
+        Response::json(200, &serde_json::json!({"ok": true})),
         &Disposition::Close,
     );
     assert!(!ok.contains("WWW-Authenticate"));
@@ -704,11 +710,12 @@ fn a_not_modified_response_is_bodyless_and_tagged() {
     let mut out = Vec::new();
     write_response(
         &mut out,
-        &Response::not_modified("\"abc\"".to_string()),
+        Response::not_modified("\"abc\"".to_string()),
         &Disposition::KeepAlive {
             timeout_secs: 30,
             max_requests: 9,
         },
+        Instant::now() + Duration::from_secs(3600),
     )
     .unwrap_or_else(|_| panic!("should write"));
 
@@ -732,8 +739,9 @@ fn an_untagged_response_carries_no_etag() {
     let mut out = Vec::new();
     write_response(
         &mut out,
-        &Response::error(404, "not_found"),
+        Response::error(404, "not_found"),
         &Disposition::Close,
+        Instant::now() + Duration::from_secs(3600),
     )
     .unwrap_or_else(|_| panic!("should write"));
 
@@ -750,4 +758,53 @@ fn a_status_no_route_emits_has_no_reason_phrase() {
     assert_eq!(reason_phrase(418), "Unknown");
     assert_eq!(reason_phrase(201), "Created");
     assert_eq!(reason_phrase(403), "Forbidden");
+}
+
+/// A writer that fails with `BrokenPipe` on its `fail_on`-th write.
+struct FailingWriter {
+    writes: usize,
+    fail_on: usize,
+}
+
+impl std::io::Write for FailingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.writes += 1;
+        if self.writes == self.fail_on {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "peer gone",
+            ));
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A stream answer propagates the closure's write error kind, so the connection
+/// loop's classifier sees the real `BrokenPipe` rather than a wrapped error.
+#[test]
+fn a_stream_write_preserves_the_client_close_error_kind() {
+    let resp = Response::stream(
+        200,
+        "text/event-stream",
+        Box::new(|sink, _deadline| {
+            sink.write_all(b"one")?;
+            sink.write_all(b"two")
+        }),
+    );
+    let mut w = FailingWriter {
+        writes: 0,
+        fail_on: 3,
+    };
+    let err = write_response(
+        &mut w,
+        resp,
+        &Disposition::Close,
+        Instant::now() + Duration::from_secs(3600),
+    )
+    .expect_err("the closure's error surfaces");
+    assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
 }

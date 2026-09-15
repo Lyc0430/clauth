@@ -43,7 +43,7 @@ fn ctx(probe: PaneProbe) -> std::sync::Arc<ApiContext> {
     let status_path = crate::profile::clauth_dir()
         .expect("clauth dir")
         .join("status.json");
-    ApiContext::new(config(), status_path, None, probe)
+    ApiContext::for_tests(config(), status_path, None, probe)
 }
 
 fn peer() -> SocketAddr {

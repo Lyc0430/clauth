@@ -381,10 +381,24 @@ fn strip_bearer(value: &str) -> Option<&str> {
     Some(rest.trim())
 }
 
-/// One response: a status, a JSON body, and whether to challenge for a token.
+/// A server-sent-events body: the head is written, then the closure runs on the
+/// connection thread, writing frames until the deadline. `FnOnce` because a
+/// stream is the rest of the connection, written exactly once.
+pub(crate) type StreamWriter =
+    Box<dyn FnOnce(&mut dyn Write, Instant) -> std::io::Result<()> + Send>;
+
+/// One response: a status, a body, and whether to challenge for a token.
 pub(crate) struct Response {
     pub(crate) status: u16,
+    /// The body for every answer but a stream; a stream leaves it empty.
     pub(crate) body: Vec<u8>,
+    /// `Some` exactly for a server-sent-events answer. The head is written with
+    /// `content_type` and no `Content-Length`, then the closure runs.
+    pub(crate) stream: Option<StreamWriter>,
+    /// The `Content-Type` head this answer carries: `application/json` for every
+    /// plain body, `text/event-stream` for a stream. `into_head` keeps it, so a
+    /// `HEAD /events` still names the stream's type.
+    pub(crate) content_type: &'static str,
     /// Emit `WWW-Authenticate: Bearer`. Set on 401 so a client knows the scheme
     /// rather than guessing.
     pub(crate) challenge: bool,
@@ -420,6 +434,8 @@ impl Response {
         Self {
             status,
             body,
+            stream: None,
+            content_type: "application/json",
             challenge: false,
             etag: None,
         }
@@ -439,8 +455,23 @@ impl Response {
         Self {
             status: 304,
             body: Vec::new(),
+            stream: None,
+            content_type: "application/json",
             challenge: false,
             etag: Some(etag),
+        }
+    }
+
+    /// A server-sent-events stream. The head names `content_type` and carries no
+    /// `Content-Length`: the body is the rest of the connection, close-delimited.
+    pub(crate) fn stream(status: u16, content_type: &'static str, write: StreamWriter) -> Self {
+        Self {
+            status,
+            body: Vec::new(),
+            stream: Some(write),
+            content_type,
+            challenge: false,
+            etag: None,
         }
     }
 
@@ -487,9 +518,12 @@ impl Response {
     /// response on a kept-alive connection. The connection loop applies this
     /// to whatever the router produced, one rule for every route and status.
     /// `Content-Length: 0` is deliberate: this server never frames a length
-    /// the client must not read.
+    /// the client must not read. A stream's closure is dropped — a HEAD runs no
+    /// stream — and its content type is kept, so `HEAD /events` still names
+    /// `text/event-stream`.
     pub(crate) fn into_head(mut self) -> Self {
         self.body.clear();
+        self.stream = None;
         self
     }
 }
@@ -519,21 +553,45 @@ pub(crate) enum Disposition {
 ///
 /// Every response states its disposition explicitly rather than relying on the
 /// HTTP/1.1 default, so a client is never left inferring whether the connection
-/// is still usable. `Content-Length` is always present, which is what lets it
-/// find the end of this response and the start of the next one.
+/// is still usable. `Content-Length` is always present for a plain body, which
+/// is what lets it find the end of this response and the start of the next one.
+/// A stream answer carries no length: its body is close-delimited, so the
+/// connection is always `close` and the closure runs with the deadline until it
+/// returns.
 pub(crate) fn write_response<W: Write>(
     w: &mut W,
-    resp: &Response,
+    resp: Response,
     disposition: &Disposition,
+    deadline: Instant,
 ) -> std::io::Result<()> {
+    if let Some(write) = resp.stream {
+        let mut head = format!(
+            "HTTP/1.1 {} {}\r\n\
+             Content-Type: {}\r\n\
+             Cache-Control: no-store\r\n\
+             Connection: close\r\n",
+            resp.status,
+            reason_phrase(resp.status),
+            resp.content_type,
+        );
+        if resp.challenge {
+            head.push_str("WWW-Authenticate: Bearer\r\n");
+        }
+        head.push_str("\r\n");
+        w.write_all(head.as_bytes())?;
+        w.flush()?;
+        return write(w, deadline);
+    }
+
     let mut head = format!(
         "HTTP/1.1 {} {}\r\n\
-         Content-Type: application/json\r\n\
+         Content-Type: {}\r\n\
          Content-Length: {}\r\n\
          Cache-Control: no-store\r\n\
          Connection: {}\r\n",
         resp.status,
         reason_phrase(resp.status),
+        resp.content_type,
         resp.body.len(),
         match disposition {
             Disposition::Close => "close",

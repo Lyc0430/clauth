@@ -27,6 +27,7 @@
 
 pub(crate) mod chain;
 pub(crate) mod devices;
+mod events;
 pub(crate) mod http;
 pub(crate) mod pairing;
 pub(crate) mod panes;
@@ -228,7 +229,13 @@ pub(crate) fn serve_prepared(
         .with_context(|| format!("failed to bind the REST API to {listen}"))?;
     devices::import_legacy()?;
     devices::note_at_start();
-    let ctx = ApiContext::new(config, status_path, Some(live), panes::real_probe());
+    let ctx = ApiContext::new(
+        config,
+        status_path,
+        Some(live),
+        panes::real_probe(),
+        events::production_herdr_resolver(),
+    );
 
     let spawned = std::thread::Builder::new()
         .name("clauth-api-accept".into())
@@ -277,6 +284,20 @@ fn accept_loop(
             logline!("clauth api: failed to spawn a connection thread: {e}");
         }
     }
+}
+
+/// Whether a write failure on a stream answer is just the client leaving early.
+/// A stream is the rest of the connection by definition, so a client that
+/// closes before the lifetime is the normal end, not a write failure; the same
+/// error kinds on a plain response keep the failure wording.
+fn is_client_stream_close(is_stream: bool, e: &std::io::Error) -> bool {
+    is_stream
+        && matches!(
+            e.kind(),
+            std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+        )
 }
 
 /// One connection: handshake, then requests until the client stops asking, the
@@ -337,8 +358,12 @@ fn serve_connection(
                 // resynchronize on a stream an attacker may be framing.
                 let response = e.response();
                 logline!("clauth api: {peer} - <unparsed> -> {}", response.status);
-                let _ =
-                    http::write_response(reader.stream_mut(), &response, &http::Disposition::Close);
+                let _ = http::write_response(
+                    reader.stream_mut(),
+                    response,
+                    &http::Disposition::Close,
+                    expires,
+                );
                 break;
             }
         };
@@ -377,6 +402,14 @@ fn serve_connection(
             } else {
                 http::Disposition::Close
             };
+        // A stream is the rest of the connection by definition, so it always
+        // closes once the writer returns, whatever the request asked for.
+        let is_stream = response.stream.is_some();
+        let disposition = if is_stream {
+            http::Disposition::Close
+        } else {
+            disposition
+        };
 
         let device = handled
             .device
@@ -386,8 +419,12 @@ fn serve_connection(
             "clauth api: {peer} {device} {summary} -> {}",
             response.status
         );
-        if let Err(e) = http::write_response(reader.stream_mut(), &response, &disposition) {
-            logline!("clauth api: {peer}: failed to write the response: {e}");
+        if let Err(e) = http::write_response(reader.stream_mut(), response, &disposition, expires) {
+            if is_client_stream_close(is_stream, &e) {
+                logline!("clauth api: {peer}: stream closed by the client");
+            } else {
+                logline!("clauth api: {peer}: failed to write the response: {e}");
+            }
             break;
         }
         if matches!(disposition, http::Disposition::Close) {

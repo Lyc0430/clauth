@@ -27,7 +27,7 @@ fn ctx() -> std::sync::Arc<ApiContext> {
             profiles: Vec::new(),
         },
     ));
-    ApiContext::new(
+    ApiContext::for_tests(
         config,
         clauth_dir().expect("dir").join("status.json"),
         None,

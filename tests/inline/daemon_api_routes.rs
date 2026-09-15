@@ -50,7 +50,7 @@ fn ctx_with_live(
     let status_path = crate::profile::clauth_dir()
         .expect("clauth dir")
         .join("status.json");
-    ApiContext::new(config, status_path, Some(live), panes::absent_probe())
+    ApiContext::for_tests(config, status_path, Some(live), panes::absent_probe())
 }
 
 fn route_path(route: &Route) -> String {
@@ -63,6 +63,21 @@ fn req_tagged(path: &str, bearer: Option<&str>, etag: &str) -> Request {
         if_none_match: Some(etag.to_string()),
         ..req("GET", path, bearer, "")
     }
+}
+
+/// Render a stream answer the way `serve_connection` writes it, with a short
+/// deadline and the published feed already on disk. The head and every frame
+/// land in the returned bytes.
+fn render_stream(resp: Response, deadline: std::time::Instant) -> Vec<u8> {
+    let mut out = Vec::new();
+    super::super::http::write_response(
+        &mut out,
+        resp,
+        &super::super::http::Disposition::Close,
+        deadline,
+    )
+    .expect("write the stream");
+    out
 }
 
 // ------------------------------------------------- status: waiting
@@ -330,6 +345,8 @@ fn the_route_table_is_exactly_this() {
             ("HEAD", "/health", Access::View),
             ("GET", "/status", Access::View),
             ("HEAD", "/status", Access::View),
+            ("GET", "/events", Access::View),
+            ("HEAD", "/events", Access::View),
             ("GET", "/openapi.json", Access::View),
             ("HEAD", "/openapi.json", Access::View),
             ("POST", "/switch", Access::Control),
@@ -891,6 +908,27 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         &mut produced,
     );
 
+    // The events stream's 200 has no JSON body, so it is rendered against a
+    // sink — with a feed on disk and a short deadline — and checked for its
+    // head and frames rather than walked against a schema.
+    write_feed(&ctx, &feed("alpha", "2026-09-02T06:00:00+00:00"));
+    let events = call(&ctx, &req("GET", "/api/v1/events", Some(TOKEN), ""));
+    assert_eq!(events.status, 200);
+    let rendered = render_stream(
+        events,
+        std::time::Instant::now() + std::time::Duration::from_millis(300),
+    );
+    let rendered_text = String::from_utf8_lossy(&rendered);
+    assert!(
+        rendered_text.contains("Content-Type: text/event-stream\r\n"),
+        "the stream head names its type: {rendered_text:?}"
+    );
+    assert!(
+        rendered_text.contains("event: status\n"),
+        "the stream carries the current feed: {rendered_text:?}"
+    );
+    driven.insert(("GET".to_string(), "/events".to_string(), 200));
+
     let switched = call(
         &ctx,
         &req(
@@ -1030,6 +1068,7 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
     for (method, path) in [
         ("GET", "/health"),
         ("GET", "/status"),
+        ("GET", "/events"),
         ("GET", "/openapi.json"),
         ("GET", "/panes"),
         ("POST", "/switch"),
@@ -1080,6 +1119,7 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
     for (method, path) in [
         ("GET", "/health"),
         ("GET", "/status"),
+        ("GET", "/events"),
         ("GET", "/openapi.json"),
         ("GET", "/panes"),
         ("POST", "/switch"),
@@ -1272,7 +1312,7 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
 
     // HEAD routes like GET at the router and arrive bodyless on the wire, the
     // serve loop's strip the router never sees.
-    for path in ["/health", "/status", "/openapi.json"] {
+    for path in ["/health", "/status", "/events", "/openapi.json"] {
         let resp = call(
             &ctx,
             &req("HEAD", &format!("{API_PREFIX}{path}"), Some(TOKEN), ""),
@@ -1500,6 +1540,7 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
     for (method, path) in [
         ("GET", "/health"),
         ("GET", "/status"),
+        ("GET", "/events"),
         ("GET", "/openapi.json"),
         ("GET", "/panes"),
         ("POST", "/switch"),

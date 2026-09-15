@@ -11,7 +11,7 @@
 //! the MCP tool, and the TUI stays the only place to resolve it.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -28,6 +28,9 @@ use crate::profile::ConfigHandle;
 
 use super::chain;
 use super::devices::{self, Device, Tier};
+use super::events::__path_events;
+use super::events::HerdrSeam;
+use super::events::events as events_handler;
 pub(crate) use super::http::ErrorBody;
 use super::http::{Request, Response, flatten_control_chars, sanitize_for_log};
 use super::pairing::{self, Code, Redeemed};
@@ -93,6 +96,18 @@ pub(crate) static ROUTES: &[Route] = &[
         path: "/status",
         access: Access::View,
         handler: status,
+    },
+    Route {
+        method: "GET",
+        path: "/events",
+        access: Access::View,
+        handler: events_handler,
+    },
+    Route {
+        method: "HEAD",
+        path: "/events",
+        access: Access::View,
+        handler: events_handler,
     },
     Route {
         method: "GET",
@@ -192,14 +207,20 @@ pub(crate) struct ApiContext {
     pub(crate) live: Option<crate::daemon::LiveStores>,
     /// The seam the pane route drives herdr through; see [`super::panes`].
     pub(crate) herdr_probe: PaneProbe,
+    /// Resolves herdr's API socket for `GET /events`. The daemon passes the
+    /// production resolver; a test passes an explicit path or `None`.
+    pub(crate) herdr: HerdrSeam,
 }
 
 impl ApiContext {
+    /// The daemon's constructor: both herdr seams are passed explicitly, the
+    /// pane probe for `GET /panes` and the socket resolver for `GET /events`.
     pub(crate) fn new(
         config: ConfigHandle,
         status_path: PathBuf,
         live: Option<crate::daemon::LiveStores>,
         herdr_probe: PaneProbe,
+        herdr: HerdrSeam,
     ) -> Arc<Self> {
         Arc::new(Self {
             config,
@@ -207,7 +228,20 @@ impl ApiContext {
             switch_gate: RankedMutex::new(()),
             live,
             herdr_probe,
+            herdr,
         })
+    }
+
+    /// The test constructor: no herdr socket resolver, so a stream never probes
+    /// a real socket; the pane probe is whatever the test hands over.
+    #[cfg(test)]
+    pub(crate) fn for_tests(
+        config: ConfigHandle,
+        status_path: PathBuf,
+        live: Option<crate::daemon::LiveStores>,
+        herdr_probe: PaneProbe,
+    ) -> Arc<Self> {
+        Self::new(config, status_path, live, herdr_probe, Arc::new(|| None))
     }
 }
 
@@ -430,10 +464,7 @@ fn status(ctx: &ApiContext, req: &Request, _: &Caller<'_>) -> Response {
         // the same answer a missing file gets — instead of handing out the
         // truncated bytes with a tag fabricated from them, the one shape the
         // wait loop already refuses.
-        if let Ok(body) = std::fs::read(&ctx.status_path)
-            && serde_json::from_slice::<serde_json::Value>(&body).is_ok()
-        {
-            let etag = etag_for(&body);
+        if let Some((body, etag)) = read_feed_tagged(&ctx.status_path) {
             if req.if_none_match.as_deref() == Some(etag.as_str()) {
                 return Response::not_modified(etag);
             }
@@ -500,13 +531,10 @@ fn wait_for_status_change(ctx: &ApiContext, tag: &str, wait: Duration) -> Respon
         // waiting rather than handing the client an error to interpret — and a
         // body that does not parse is exactly that, never a change to answer
         // with a tag fabricated from the raw bytes.
-        if let Ok(body) = std::fs::read(&ctx.status_path)
-            && serde_json::from_slice::<serde_json::Value>(&body).is_ok()
+        if let Some((body, etag)) = read_feed_tagged(&ctx.status_path)
+            && etag != tag
         {
-            let etag = etag_for(&body);
-            if etag != tag {
-                return Response::raw_json_tagged(200, body, etag);
-            }
+            return Response::raw_json_tagged(200, body, etag);
         }
         let now = std::time::Instant::now();
         if now >= deadline {
@@ -514,6 +542,18 @@ fn wait_for_status_change(ctx: &ApiContext, tag: &str, wait: Duration) -> Respon
         }
         std::thread::sleep(WAIT_POLL.min(deadline - now));
     }
+}
+
+/// The published feed, parsed-then-tagged, in one step: `None` when the file is
+/// missing or does not parse. The long poll and the events stream both call
+/// this, so the two cannot disagree about what counts as a change or about the
+/// torn-file rule (a body that does not parse is never served, tagged, or
+/// streamed).
+pub(crate) fn read_feed_tagged(status_path: &Path) -> Option<(Vec<u8>, String)> {
+    let body = std::fs::read(status_path).ok()?;
+    serde_json::from_slice::<serde_json::Value>(&body).ok()?;
+    let etag = etag_for(&body);
+    Some((body, etag))
 }
 
 /// The feed's entity tag: a digest of everything in the body a reader could act
@@ -529,7 +569,7 @@ fn wait_for_status_change(ctx: &ApiContext, tag: &str, wait: Duration) -> Respon
 /// A body that will not parse is digested whole. That is the safe direction: a
 /// tag that changes too often costs a wakeup, while one that changes too rarely
 /// leaves a reader showing an account the operator has already left.
-fn etag_for(body: &[u8]) -> String {
+pub(crate) fn etag_for(body: &[u8]) -> String {
     let meaningful = serde_json::from_slice::<serde_json::Value>(body)
         .ok()
         .and_then(|mut value| {
@@ -549,7 +589,8 @@ fn etag_for(body: &[u8]) -> String {
 const MAX_WAIT_SECS: u64 = 60;
 
 /// How often a wait re-checks. Short enough that a switch reads as instant.
-const WAIT_POLL: Duration = Duration::from_millis(250);
+/// The events stream polls the feed at the same cadence.
+pub(crate) const WAIT_POLL: Duration = Duration::from_millis(250);
 
 /// The one field `POST /api/v1/switch` accepts.
 #[derive(serde::Deserialize, utoipa::ToSchema)]
@@ -774,7 +815,7 @@ fn pair(_: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
 /// endpoint cannot ship undocumented.
 #[derive(utoipa::OpenApi)]
 #[openapi(
-    paths(health, status, switch, chain::order, chain::threshold, chain::wrap_off, pair, openapi_document, panes::panes),
+    paths(health, status, events, switch, chain::order, chain::threshold, chain::wrap_off, pair, openapi_document, panes::panes),
     modifiers(&BearerScheme)
 )]
 struct ApiDoc;

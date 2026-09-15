@@ -64,7 +64,7 @@ fn ctx() -> std::sync::Arc<ApiContext> {
     crate::daemon::api::devices::seed_for_tests(DEVICE, Tier::Control, TOKEN)
         .expect("pair the fixture device");
     let status_path = crate::profile::clauth_dir().unwrap().join("status.json");
-    ApiContext::new(
+    ApiContext::for_tests(
         empty_config(),
         status_path,
         None,
@@ -940,6 +940,61 @@ fn the_advertised_budget_is_the_one_enforced() {
             session.recv().is_err(),
             "a connection past its advertised budget must be closed"
         );
+    });
+}
+
+/// The events stream is close-delimited: the head carries no `Content-Length`,
+/// frames stream until the connection's short lifetime, and the TLS close
+/// arrives cleanly so an `EventSource` sees an orderly end and reconnects.
+#[test]
+fn the_events_stream_runs_until_the_lifetime_and_closes_cleanly() {
+    let Some(f) = fixture() else {
+        eprintln!(
+            "SKIPPED the_events_stream_runs_until_the_lifetime_and_closes_cleanly: openssl is not usable here"
+        );
+        return;
+    };
+    let limits = Limits {
+        io_timeout: std::time::Duration::from_millis(200),
+        lifetime: std::time::Duration::from_secs(1),
+        max_requests: 100,
+    };
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let (stream, peer) = f.listener.accept().expect("accept");
+            serve_connection(stream, peer, &f.server_tls, &f.ctx, limits);
+        });
+
+        let mut session = Session::connect(f.port, &f.client_tls).expect("connect");
+        session
+            .send(&format!(
+                "GET /api/v1/events HTTP/1.1\r\nHost: {SERVER_NAME}\r\n\
+                 Authorization: Bearer {TOKEN}\r\nConnection: close\r\n\r\n"
+            ))
+            .expect("send");
+
+        // A stream frames by close, not Content-Length, so read to end of
+        // stream and let the server's close deliver the boundary.
+        let mut all = Vec::new();
+        let mut chunk = [0u8; 512];
+        loop {
+            match session.stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => all.extend_from_slice(&chunk[..n]),
+                Err(e) => panic!("stream read failed: {e}"),
+            }
+        }
+        let text = String::from_utf8_lossy(&all);
+        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "{text:?}");
+        assert!(
+            text.contains("Content-Type: text/event-stream\r\n"),
+            "{text:?}"
+        );
+        assert!(!text.contains("Content-Length:"), "{text:?}");
+        assert!(text.contains("Connection: close\r\n"), "{text:?}");
+        assert!(text.contains("retry: 1000\n"), "{text:?}");
+        assert!(text.contains("event: status\n"), "{text:?}");
     });
 }
 
@@ -2428,5 +2483,36 @@ fn a_pairing_over_tls_hands_back_a_working_token_and_logs_no_secret() {
     assert!(
         logged[2].ends_with(" phone GET /api/v1/health -> 200"),
         "{logged:#?}"
+    );
+}
+
+/// A write failure on a stream is the client leaving early only for the close
+/// error kinds, and only when the answer really was a stream: a plain response
+/// keeps the failure wording.
+#[test]
+fn a_client_close_on_a_stream_is_not_a_write_failure() {
+    for kind in [
+        std::io::ErrorKind::BrokenPipe,
+        std::io::ErrorKind::ConnectionReset,
+        std::io::ErrorKind::ConnectionAborted,
+    ] {
+        assert!(
+            is_client_stream_close(true, &std::io::Error::new(kind, "peer gone")),
+            "{kind:?} on a stream is the client leaving early"
+        );
+    }
+    assert!(
+        !is_client_stream_close(
+            false,
+            &std::io::Error::new(std::io::ErrorKind::BrokenPipe, "peer gone")
+        ),
+        "the same error on a plain response keeps the failure wording"
+    );
+    assert!(
+        !is_client_stream_close(
+            true,
+            &std::io::Error::new(std::io::ErrorKind::TimedOut, "slow")
+        ),
+        "a non-close error on a stream keeps the failure wording"
     );
 }

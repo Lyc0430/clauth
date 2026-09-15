@@ -1,0 +1,552 @@
+//! `GET /api/v1/events` — the server-sent-events stream.
+//!
+//! One connection, one stream: the client learns every published-feed change
+//! (the bytes of `~/.clauth/status.json`, keyed on its entity tag), every
+//! herdr agent-status change, and — on every (re)connect — every pane's current
+//! agent status from the handshake's `pane.list`, without polling. The stream
+//! runs until the connection's deadline and then closes cleanly, so an
+//! `EventSource` client reconnects on its own and gets the current feed first
+//! again.
+//!
+//! The herdr half speaks herdr's socket protocol: one JSON object per line. It
+//! is unix-only (a `std::os::unix::net::UnixStream`); on every other target the
+//! seam reads as absent and the stream still serves status events.
+
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::io::Read;
+
+use super::http::Response;
+use super::routes::{ApiContext, Caller, ErrorBody, WAIT_POLL, read_feed_tagged};
+
+/// How the stream learns where herdr's API socket is. The daemon passes the
+/// production resolver; a test passes an explicit path or `None` — never an
+/// environment variable.
+pub(crate) type HerdrSeam = std::sync::Arc<dyn Fn() -> Option<PathBuf> + Send + Sync>;
+
+/// The production resolver: `HERDR_SOCKET_PATH` when set and non-empty, else one
+/// `herdr status server --json` probe, else absent.
+#[cfg(unix)]
+pub(crate) fn production_herdr_resolver() -> HerdrSeam {
+    std::sync::Arc::new(resolve_herdr_socket)
+}
+
+/// No unix-domain-socket client exists on other targets, so herdr reads as
+/// absent there.
+#[cfg(not(unix))]
+pub(crate) fn production_herdr_resolver() -> HerdrSeam {
+    std::sync::Arc::new(|| None)
+}
+
+/// The socket path the daemon should connect to, resolved in the order the
+/// ruling pins: the injected path first, then one bounded `herdr status server
+/// --json` probe, then nothing.
+#[cfg(unix)]
+fn resolve_herdr_socket() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("HERDR_SOCKET_PATH")
+        && !path.is_empty()
+    {
+        return Some(PathBuf::from(path));
+    }
+    let bin = crate::herdr::resolved_bin()?;
+    let out = crate::herdr::bounded_output(bin.to_str()?, &["status", "server", "--json"], &[])?;
+    if !out.status.success() {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    // The socket path is printed even with no server running, so a retry can
+    // connect against it directly (and succeeds the moment herdr starts).
+    value.get("socket")?.as_str().map(PathBuf::from)
+}
+
+/// The stream's tunables. Kept as a struct rather than globals so a test can
+/// drive the keepalive and the retry clock in milliseconds.
+#[derive(Clone, Copy)]
+struct StreamConfig {
+    /// How long with no other frame before a `: keepalive` comment line.
+    keepalive: Duration,
+    /// How often a lost herdr socket is retried while the stream lives.
+    herdr_retry: Duration,
+}
+
+impl StreamConfig {
+    const DEFAULT: Self = Self {
+        keepalive: Duration::from_secs(15),
+        herdr_retry: Duration::from_secs(5),
+    };
+}
+
+/// Whether a keepalive is due: `interval` has fully elapsed since `last_frame`.
+fn keepalive_due(last_frame: Instant, now: Instant, interval: Duration) -> bool {
+    now.saturating_duration_since(last_frame) >= interval
+}
+
+/// `GET /api/v1/events` — the server-sent-events stream.
+#[utoipa::path(
+    get,
+    path = "/api/v1/events",
+    responses(
+        (status = 200, description = "a server-sent-events stream, opened with `retry: 1000`, then an `event: herdr` frame naming herdr's presence and, when present, carrying every pane's current agent status (`{\"present\":true,\"panes\":[…]}`), re-sent on every (re)connect; then `event: status` frames carrying the whole published feed (each `id` is the feed's entity tag) whenever the tag moves, `event: pane_agent_status` frames relaying herdr agent-status changes, and a `: keepalive` comment after 15 s of silence; the stream ends cleanly at the connection's 120-second lifetime and the client's EventSource reconnects", content_type = "text/event-stream", body = String),
+        (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
+        (status = 403, description = "a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
+        (status = 500, description = "the device list does not read (`internal`)", body = ErrorBody)
+    ),
+    security(("bearer" = ["view"]))
+)]
+pub(crate) fn events(
+    ctx: &ApiContext,
+    _req: &super::http::Request,
+    _caller: &Caller<'_>,
+) -> Response {
+    let status_path = ctx.status_path.clone();
+    let herdr = std::sync::Arc::clone(&ctx.herdr);
+    Response::stream(
+        200,
+        "text/event-stream",
+        Box::new(move |sink, deadline| run_stream(sink, deadline, &status_path, herdr.as_ref())),
+    )
+}
+
+/// Write the stream until the deadline, starting with the reconnect delay and
+/// the herdr presence frame, then the current feed.
+fn run_stream(
+    sink: &mut dyn Write,
+    deadline: Instant,
+    feed: &Path,
+    resolve_herdr: &(dyn Fn() -> Option<PathBuf> + Send + Sync),
+) -> std::io::Result<()> {
+    run_stream_with_config(sink, deadline, feed, resolve_herdr, &StreamConfig::DEFAULT)
+}
+
+/// The loop itself, with the config injected. Everything is flushed frame by
+/// frame so a client sees an event the moment it is written.
+fn run_stream_with_config(
+    sink: &mut dyn Write,
+    deadline: Instant,
+    feed: &Path,
+    resolve_herdr: &(dyn Fn() -> Option<PathBuf> + Send + Sync),
+    config: &StreamConfig,
+) -> std::io::Result<()> {
+    // The one field line every stream opens with, so a reconnect is bounded.
+    sink.write_all(b"retry: 1000\n")?;
+    sink.flush()?;
+
+    // The socket path is resolved once, up front: the production resolver may
+    // run a bounded subprocess, which must not re-run per retry. From here on a
+    // retry is a bare connect on this path, so a missing socket file fails in
+    // microseconds.
+    let herdr_socket = resolve_herdr();
+
+    let mut last_tag: Option<String> = None;
+    let mut herdr: Option<Box<dyn HerdrSource + Send>> = None;
+    let mut next_herdr_try = Instant::now();
+    // A re-open that failed keeps the live connection; this is when to retry it.
+    let mut reopen_at: Option<Instant> = None;
+
+    // The herdr event is written before the first status read: the client needs
+    // to know herdr's presence — and, when present, the current pane statuses —
+    // whether or not the feed has landed yet.
+    match open_herdr(herdr_socket.as_deref()) {
+        Ok((conn, panes)) => {
+            write_herdr(sink, true, &panes)?;
+            herdr = Some(conn);
+        }
+        Err(_) => {
+            write_herdr(sink, false, &[])?;
+            next_herdr_try = Instant::now() + config.herdr_retry;
+        }
+    }
+    let mut last_frame = Instant::now();
+
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(());
+        }
+
+        // The published feed, whole, keyed on its entity tag: a rewrite that
+        // moved only `generated_at` is not a change, so no frame goes out.
+        if let Some((body, tag)) = read_feed_tagged(feed)
+            && last_tag.as_deref() != Some(tag.as_str())
+        {
+            write_status(sink, &tag, &body)?;
+            last_tag = Some(tag);
+            last_frame = Instant::now();
+        }
+
+        match herdr.take() {
+            Some(mut conn) => {
+                if reopen_at.is_some_and(|at| Instant::now() >= at) {
+                    reopen_at = None;
+                    match open_herdr(herdr_socket.as_deref()) {
+                        Ok((new_conn, panes)) => {
+                            // The old connection goes unread: the snapshot
+                            // carries every status it could still hold.
+                            drop(conn);
+                            write_herdr(sink, true, &panes)?;
+                            last_frame = Instant::now();
+                            herdr = Some(new_conn);
+                        }
+                        Err(_) => {
+                            herdr = Some(conn);
+                            reopen_at = Some(Instant::now() + config.herdr_retry);
+                        }
+                    }
+                } else {
+                    match conn.next_event_line() {
+                        Ok(Some(line)) => match classify_line(&line) {
+                            Delivered::AgentStatus => {
+                                write_pane_agent_status(sink, &line)?;
+                                last_frame = Instant::now();
+                                herdr = Some(conn);
+                            }
+                            Delivered::PaneSetChanged => {
+                                // A pane appeared or left: the pane snapshot is
+                                // stale, so re-subscribe on a fresh connection.
+                                // A re-open DOES write a herdr frame now — the
+                                // fresh snapshot is the point.
+                                match open_herdr(herdr_socket.as_deref()) {
+                                    Ok((new_conn, panes)) => {
+                                        drop(conn);
+                                        reopen_at = None;
+                                        write_herdr(sink, true, &panes)?;
+                                        last_frame = Instant::now();
+                                        herdr = Some(new_conn);
+                                    }
+                                    Err(_) => {
+                                        // The re-open failed: herdr refused the
+                                        // subscribe (a pane closed between
+                                        // pane.list and the subscribe). The old
+                                        // connection is still live, so keep
+                                        // serving it and retry the re-open on
+                                        // the clock. No present:false — presence
+                                        // did not change.
+                                        herdr = Some(conn);
+                                        reopen_at = Some(Instant::now() + config.herdr_retry);
+                                    }
+                                }
+                            }
+                            Delivered::Other => herdr = Some(conn),
+                        },
+                        Ok(None) => herdr = Some(conn),
+                        Err(_) => {
+                            // Dropped mid-stream: one present:false, then the
+                            // retry clock.
+                            reopen_at = None;
+                            write_herdr(sink, false, &[])?;
+                            last_frame = Instant::now();
+                            next_herdr_try = Instant::now() + config.herdr_retry;
+                        }
+                    }
+                }
+            }
+            None => {
+                let now = Instant::now();
+                if now >= next_herdr_try {
+                    next_herdr_try = now + config.herdr_retry;
+                    // Still absent: no event, `present:false` fired once on
+                    // the transition.
+                    if let Ok((conn, panes)) = open_herdr(herdr_socket.as_deref()) {
+                        write_herdr(sink, true, &panes)?;
+                        last_frame = Instant::now();
+                        herdr = Some(conn);
+                    }
+                }
+            }
+        }
+
+        let now = Instant::now();
+        if keepalive_due(last_frame, now, config.keepalive) {
+            sink.write_all(b": keepalive\n\n")?;
+            sink.flush()?;
+            last_frame = Instant::now();
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(());
+        }
+        std::thread::sleep(WAIT_POLL.min(deadline - now));
+    }
+}
+
+/// `event: status`, carrying the whole published feed and its entity tag as the
+/// event id, so a client's `Last-Event-ID` round-trips an `ETag`.
+///
+/// The feed is pretty-printed, so its bytes hold raw newlines. Each line becomes
+/// its own `data:` field line (the SSE multi-line `data` form); the client
+/// re-joins them with `\n`, which restores the body byte for byte. A body ending
+/// in `\n` therefore yields one trailing empty `data:` line.
+fn write_status(sink: &mut dyn Write, tag: &str, body: &[u8]) -> std::io::Result<()> {
+    sink.write_all(b"event: status\nid: ")?;
+    sink.write_all(tag.as_bytes())?;
+    sink.write_all(b"\n")?;
+    for line in body.split(|&b| b == b'\n') {
+        sink.write_all(b"data: ")?;
+        sink.write_all(line)?;
+        sink.write_all(b"\n")?;
+    }
+    sink.write_all(b"\n")?;
+    sink.flush()
+}
+
+/// `event: herdr`, carrying herdr's presence and, when present, the pane
+/// snapshot the handshake's `pane.list` returned — so every (re)connect hands
+/// the client every pane's current agent status without a second round trip.
+/// The snapshot is a projection to the status fields; the rest of a pane.list
+/// object (its cwd, its title) is not carried here. A relayed
+/// `pane.agent_status_changed` event still carries what herdr puts in it.
+fn write_herdr(
+    sink: &mut dyn Write,
+    present: bool,
+    panes: &[serde_json::Value],
+) -> std::io::Result<()> {
+    let mut body = Vec::new();
+    if present {
+        body.extend_from_slice(b"{\"present\":true,\"panes\":[");
+        for (i, pane) in panes.iter().enumerate() {
+            if i > 0 {
+                body.push(b',');
+            }
+            body.extend_from_slice(&serde_json::to_vec(pane).map_err(std::io::Error::other)?);
+        }
+        body.extend_from_slice(b"]}");
+    } else {
+        body.extend_from_slice(b"{\"present\":false}");
+    }
+    sink.write_all(b"event: herdr\ndata: ")?;
+    sink.write_all(&body)?;
+    sink.write_all(b"\n\n")?;
+    sink.flush()
+}
+
+/// What a delivered herdr line is to the stream.
+enum Delivered {
+    /// A `pane.agent_status_changed` event to relay verbatim.
+    AgentStatus,
+    /// A `pane.created`/`pane.closed` event: the pane snapshot is stale.
+    PaneSetChanged,
+    /// A response line, an unparseable line, or another subscription's event.
+    Other,
+}
+
+/// Classify a delivered line by its `event` field. herdr names these
+/// differently per delivery kind: agent-status envelopes carry the dot name
+/// `pane.agent_status_changed`, while pane create/close arrive as app events
+/// whose `EventKind` serializes snake_case (`pane_created`, `pane_closed`).
+fn classify_line(line: &[u8]) -> Delivered {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
+        return Delivered::Other;
+    };
+    match value.get("event").and_then(|e| e.as_str()) {
+        Some("pane.agent_status_changed") => Delivered::AgentStatus,
+        Some("pane_created") | Some("pane_closed") => Delivered::PaneSetChanged,
+        _ => Delivered::Other,
+    }
+}
+
+/// `event: pane_agent_status`, relaying a delivered herdr line byte for byte.
+/// The caller already classified the line as `pane.agent_status_changed`.
+fn write_pane_agent_status(sink: &mut dyn Write, line: &[u8]) -> std::io::Result<()> {
+    sink.write_all(b"event: pane_agent_status\ndata: ")?;
+    sink.write_all(line)?;
+    sink.write_all(b"\n\n")?;
+    sink.flush()
+}
+
+/// A live herdr subscription, polled for delivered event lines.
+trait HerdrSource {
+    /// The next delivered event line (JSON, no newline), `Ok(None)` when none
+    /// has arrived, `Err` when the socket dropped.
+    fn next_event_line(&mut self) -> std::io::Result<Option<Vec<u8>>>;
+}
+
+/// The pane set `pane.list` reported: the ids to subscribe to and the pane
+/// objects themselves, which a `present:true` frame carries as the snapshot.
+#[cfg(unix)]
+struct PaneSnapshot {
+    ids: Vec<String>,
+    panes: Vec<serde_json::Value>,
+}
+
+/// List the panes on `path`, subscribe to `pane.agent_status_changed` on each
+/// plus the pane-set lifecycle events, and hand back the live stream with its
+/// success line consumed and the pane snapshot a `present:true` frame carries.
+#[cfg(unix)]
+fn open_herdr(
+    path: Option<&Path>,
+) -> std::io::Result<(Box<dyn HerdrSource + Send>, Vec<serde_json::Value>)> {
+    let path =
+        path.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no herdr socket"))?;
+    let snapshot = list_panes(path)?;
+    let conn = subscribe(path, &snapshot.ids)?;
+    Ok((Box::new(conn), snapshot.panes))
+}
+
+#[cfg(not(unix))]
+fn open_herdr(
+    _path: Option<&Path>,
+) -> std::io::Result<(Box<dyn HerdrSource + Send>, Vec<serde_json::Value>)> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "the herdr socket client is unix-only",
+    ))
+}
+
+/// Take one `\n`-terminated line out of `buf`, without its newline, when a
+/// complete line is buffered.
+#[cfg(unix)]
+fn take_line(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
+    let pos = buf.iter().position(|&b| b == b'\n')?;
+    let line = buf.drain(..=pos).collect::<Vec<u8>>();
+    Some(line[..line.len() - 1].to_vec())
+}
+
+#[cfg(unix)]
+struct HerdrConn {
+    stream: std::os::unix::net::UnixStream,
+    /// Bytes already read past the last complete line (or not yet split).
+    buf: Vec<u8>,
+}
+
+#[cfg(unix)]
+impl HerdrSource for HerdrConn {
+    fn next_event_line(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+        let mut chunk = [0u8; 512];
+        loop {
+            if let Some(line) = take_line(&mut self.buf) {
+                if line.is_empty() {
+                    continue;
+                }
+                return Ok(Some(line));
+            }
+            match self.stream.read(&mut chunk) {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "herdr closed the socket",
+                    ));
+                }
+                Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
+/// The pane snapshot from one `pane.list` round trip on its own short-lived
+/// connection (herdr serves one request per connection).
+#[cfg(unix)]
+fn list_panes(path: &Path) -> std::io::Result<PaneSnapshot> {
+    let mut stream = std::os::unix::net::UnixStream::connect(path)?;
+    stream.set_read_timeout(Some(WAIT_POLL))?;
+    stream.set_write_timeout(Some(WAIT_POLL))?;
+    stream
+        .write_all(b"{\"id\":\"clauth-events:list\",\"method\":\"pane.list\",\"params\":{}}\n")?;
+    let line = read_one_line(&mut stream, &mut Vec::new())?;
+    let value: serde_json::Value = serde_json::from_slice(&line)
+        .map_err(|_| std::io::Error::other("bad pane.list response"))?;
+    if value.get("error").is_some() {
+        return Err(std::io::Error::other("pane.list refused"));
+    }
+    let mut snapshot = PaneSnapshot {
+        ids: Vec::new(),
+        panes: Vec::new(),
+    };
+    if let Some(panes) = value
+        .get("result")
+        .and_then(|r| r.get("panes"))
+        .and_then(|p| p.as_array())
+    {
+        for pane in panes {
+            if let Some(id) = pane.get("pane_id").and_then(|v| v.as_str()) {
+                snapshot.ids.push(id.to_string());
+            }
+            snapshot.panes.push(project_pane(pane));
+        }
+    }
+    Ok(snapshot)
+}
+
+/// The status fields of one `pane.list` object, nothing else.
+#[cfg(unix)]
+fn project_pane(pane: &serde_json::Value) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    for key in ["pane_id", "workspace_id", "agent", "agent_status"] {
+        if let Some(v) = pane.get(key) {
+            out.insert(key.to_string(), v.clone());
+        }
+    }
+    serde_json::Value::Object(out)
+}
+
+/// Open the subscribe connection, send one `events.subscribe` covering every
+/// pane, read the success line, and hand the stream back with any bytes already
+/// past that line kept in its buffer.
+#[cfg(unix)]
+fn subscribe(path: &Path, pane_ids: &[String]) -> std::io::Result<HerdrConn> {
+    let mut stream = std::os::unix::net::UnixStream::connect(path)?;
+    stream.set_read_timeout(Some(WAIT_POLL))?;
+    stream.set_write_timeout(Some(WAIT_POLL))?;
+
+    let mut subscriptions: Vec<serde_json::Value> = pane_ids
+        .iter()
+        .map(|id| serde_json::json!({"type": "pane.agent_status_changed", "pane_id": id}))
+        .collect();
+    // The pane-set lifecycle events carry no pane id: a pane opened or closed
+    // mid-stream invalidates the snapshot, so the stream re-subscribes.
+    subscriptions.push(serde_json::json!({"type": "pane.created"}));
+    subscriptions.push(serde_json::json!({"type": "pane.closed"}));
+    let request = serde_json::json!({
+        "id": "clauth-events",
+        "method": "events.subscribe",
+        "params": {"subscriptions": subscriptions},
+    });
+    let mut line = serde_json::to_vec(&request).map_err(std::io::Error::other)?;
+    line.push(b'\n');
+    stream.write_all(&line)?;
+
+    let mut buf = Vec::new();
+    let response = read_one_line(&mut stream, &mut buf)?;
+    let value: serde_json::Value = serde_json::from_slice(&response)
+        .map_err(|_| std::io::Error::other("bad events.subscribe response"))?;
+    if value.get("error").is_some() {
+        return Err(std::io::Error::other("events.subscribe refused"));
+    }
+
+    // Non-blocking from here: the stream loop polls at its own cadence and the
+    // feed poll must not slip past `WAIT_POLL`.
+    stream.set_nonblocking(true)?;
+    Ok(HerdrConn { stream, buf })
+}
+
+/// Read one newline-terminated line through the stream's read timeout, leaving
+/// any bytes already read past it in `buf`.
+#[cfg(unix)]
+fn read_one_line(
+    stream: &mut std::os::unix::net::UnixStream,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<Vec<u8>> {
+    let mut chunk = [0u8; 512];
+    loop {
+        if let Some(line) = take_line(buf) {
+            return Ok(line);
+        }
+        let n = stream.read(&mut chunk)?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "herdr closed the socket",
+            ));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+}
+
+#[cfg(test)]
+#[path = "../../../tests/inline/daemon_api_events.rs"]
+mod tests;
