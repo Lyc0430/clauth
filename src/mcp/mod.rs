@@ -27,7 +27,7 @@ use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
         CacheScope, CallToolResult, ContentBlock, DiscoverResult, Implementation, ListToolsResult,
-        PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo,
+        PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerConfig,
     },
     schemars,
     service::RequestContext,
@@ -1641,7 +1641,7 @@ across accounts."
             // so the run went on as a background job instead of throwing its
             // result away.
             //
-            // This reply is never sent: rmcp (3.2.0, `service.rs`) removes the
+            // This reply is never sent: rmcp (3.4.0, `service.rs`) removes the
             // request from `local_ct_pool` when the `notifications/cancelled`
             // arrives, and the response path drops any message whose id is no
             // longer in that pool — "dropping response for cancelled request" —
@@ -4938,7 +4938,7 @@ const CACHE_TTL_MS: u64 = 5 * 60 * 1000;
 // macro's default rebuilds `Self::tool_router()` on every call.
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for ClauthServer {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         // Both of these are wrong by default. Empty capabilities make a
         // spec-compliant client (Claude Code) expose no tools at all, even
         // though the server still answers a forced `tools/list`; and rmcp's
@@ -4949,7 +4949,7 @@ impl ServerHandler for ClauthServer {
         // for an `initialize` caller asking for a revision this SDK does not
         // know — a legacy client, which a 2026-07-28 answer would break —
         // while `server/discover` advertises the full supported set instead.
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
                 env!("CARGO_PKG_NAME"),
                 env!("CARGO_PKG_VERSION"),
