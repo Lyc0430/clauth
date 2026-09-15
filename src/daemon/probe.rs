@@ -23,6 +23,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
+use std::process::Stdio;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -423,10 +424,15 @@ fn wait_for_active(dir: &Path, wait: Duration, poll: Duration) -> Option<DaemonL
 #[cfg(unix)]
 fn terminate_pid(pid: u32, hard: bool) -> bool {
     let signal = if hard { "KILL" } else { "TERM" };
-    std::process::Command::new("kill")
-        .args(["-s", signal, &pid.to_string()])
-        .status()
-        .is_ok()
+    let mut cmd = std::process::Command::new("kill");
+    cmd.args(["-s", signal, &pid.to_string()]);
+    // A soft-pass refusal (a dead pid's ESRCH) is expected noise: silence it.
+    // The hard pass stays loud — its failure is the diagnosis the generic
+    // wedged-process bail lacks.
+    if !hard {
+        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+    }
+    cmd.status().is_ok()
 }
 
 #[cfg(windows)]
@@ -435,8 +441,12 @@ fn terminate_pid(pid: u32, hard: bool) -> bool {
     cmd.args(["/PID", &pid.to_string()]);
     // A console daemon has no window to accept the graceful WM_CLOSE, so the
     // first (soft) pass usually no-ops and the caller escalates here with /F.
+    // Its refusal lines are expected noise: silence the soft pass's output;
+    // the hard pass stays loud as the wedged-process diagnosis.
     if hard {
         cmd.arg("/F");
+    } else {
+        cmd.stdout(Stdio::null()).stderr(Stdio::null());
     }
     cmd.status().is_ok()
 }
