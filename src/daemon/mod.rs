@@ -12,6 +12,7 @@
 //! the daemon and the TUI share one cache. A single-instance advisory lock keeps
 //! two schedulers from double-firing.
 
+pub(crate) mod api;
 pub(crate) mod log_rotate;
 mod probe;
 mod status_json;
@@ -29,10 +30,11 @@ pub(crate) use probe::{daemon_lock_path, hold_daemon_lock};
 pub(crate) use types::{SwitchBackoff, switch_backoff_ms};
 
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
@@ -41,20 +43,23 @@ use crate::lockorder::RankedMutex;
 use crate::logline::logline;
 use crate::out::outln;
 use crate::profile::{
-    AppConfig, ConfigHandle, ReloadFingerprint, atomic_write_600, clauth_dir, load_config,
-    mkdir_700, reload_fingerprint,
+    AppConfig, ConfigHandle, ProfileName, ReloadFingerprint, atomic_write_600, clauth_dir,
+    load_config, mkdir_700, reload_fingerprint,
 };
 use crate::usage::{
-    ActivityStore, FetchStatus, KickBlocks, LastFetchedAt, NextRefreshPerProfile, PendingSwitch,
-    PendingSwitchOff, PollStreaks, RefetchQueue, StatusStore, SuppressedGenericStore,
-    ThirdPartyList, ThirdPartyStatusStore, ThirdPartyUsageStore, TokenList, UsageStore,
-    bootstrap_fetch, bootstrap_third_party, collect_oauth_seed_names, collect_third_party_entries,
-    collect_tokens, spawn_refresher,
+    ActivityStore, FetchStatus, KickBlocks, LastFetchedAt, LegKey, NextRefreshPerProfile,
+    PendingSwitch, PendingSwitchOff, PollStreaks, RefetchQueue, StatusStore,
+    SuppressedAuthExpiredStore, ThirdPartyList, ThirdPartyStatusStore, ThirdPartyUsageStore,
+    TokenList, UsageStore, bootstrap_fetch, bootstrap_third_party, collect_oauth_seed_names,
+    collect_third_party_entries, collect_tokens, spawn_refresher,
 };
 use status_json::LiveSignals;
 // `clauth list` (src/list.rs) renders a human table over the same body, so the
 // two surfaces read one code path and cannot drift.
 pub(crate) use status_json::{ProfileEntry, build_profile_entries, build_status};
+// The feed's schema number, published by `GET /api/v1/health` so a remote reader
+// can refuse a daemon newer than it knows (wiki/Daemon.md's evolution rule).
+pub(crate) use status_json::SCHEMA_VERSION;
 
 /// Main-loop cadence. The scheduler ticks on its own 1s timer; this loop only
 /// executes queued switches/config edits and rewrites `status.json`, so 1s is plenty.
@@ -80,11 +85,12 @@ const STANDBY_LOCK_FILE: &str = "clauthd-standby.lock";
 const FETCH_LOCK_FILE: &str = "usage-fetch.lock";
 
 /// Anti-wedge watchdog: abort if no tick completes within this window.
-/// `TICK` is 1s, so ~30 missed ticks. The blocking `StateLock` has no deadline
-/// and a switch runs a `/usr/bin/security` subprocess inside it, so a stuck
-/// keychain or a wedged flock holder can freeze the single-threaded run loop;
-/// `std::process::abort()` then lets launchd's `KeepAlive{SuccessfulExit=false}`
-/// restart the daemon (boot()'s relink + atomic writes make restart safe).
+/// `TICK` is 1s, so ~30 missed ticks. A `StateLock` flock wait bounds out at
+/// 25 s and a switch runs a `/usr/bin/security` subprocess inside the hold,
+/// so a stuck keychain or a wedged flock holder can freeze the single-threaded
+/// run loop past this window; `std::process::abort()` then lets launchd's
+/// `KeepAlive{SuccessfulExit=false}` restart the daemon (boot()'s relink +
+/// atomic writes make restart safe).
 ///
 /// Tightened 60s→30s for the single-fetcher lease (#27): a wedged-alive daemon
 /// keeps holding `usage-fetch.lock`, so no other instance can fetch until it
@@ -96,10 +102,12 @@ const FETCH_LOCK_FILE: &str = "usage-fetch.lock";
 /// longer per-call: `lock::SUBPROCESS_BUDGET` caps everything ONE state-lock
 /// hold spends in `security` at 20s in aggregate. If it ever false-aborts,
 /// shrink THAT (the real fix), do NOT loosen this deadline — the lease's
-/// wedged-daemon recovery depends on it. Known residual:
-/// the budget is per HOLD, and `tick.rs` drains `pending_switch` then
-/// `pending_switch_off` under two separate holds, so one tick doing both can
-/// still spend 2 × 20s here.
+/// wedged-daemon recovery depends on it. One `lock::SharedSubprocessBudget`
+/// spans the WHOLE tick (`tick.rs` arms it before both drains): its window
+/// also caps each drain's flock wait, and the tick skips its next drain once
+/// the window or this deadline is spent, so a tick's shell-outs and flock
+/// waits together stay under this deadline (pre-fix, two wedged drains
+/// waited 2 × `STATE_LOCK_TIMEOUT` = 50 s here).
 ///
 /// SCOPE: `heartbeat` is stamped by the MAIN loop only, so this covers a wedged
 /// main loop. A wedged SCHEDULER thread (which is what actually holds the lease)
@@ -107,9 +115,25 @@ const FETCH_LOCK_FILE: &str = "usage-fetch.lock";
 /// lease is never freed — pre-existing (the retired probe keyed on the same
 /// main-loop freshness). Do not read this deadline as
 /// covering the fetch path itself.
+///
+/// A SUSPENDED process (Modern Standby/S0ix, S3, a VM pause, SIGSTOP) freezes
+/// the loop but not the wall clock, so a freeze reads as a wedge on wall time
+/// alone; the watchdog therefore charges a poll that overshot its window by
+/// more than [`WATCHDOG_POLL_SLACK`] no running time
+/// ([`watchdog_unaccounted`]) and judges the gap on time the loop actually
+/// had. A legal slow tick (up to this deadline minus `TICK` of budget)
+/// survives a freeze mid-tick, and a loop that wedges before or after the
+/// resume still aborts within the deadline of running time. Ceiling: a box
+/// that cannot run the watchdog thread for one poll plus the slack at a
+/// stretch degrades stall detection with the thread itself.
 const WATCHDOG_DEADLINE: Duration = Duration::from_secs(30);
 /// How often the watchdog re-checks the tick heartbeat.
 const WATCHDOG_POLL: Duration = Duration::from_secs(10);
+/// How far past [`WATCHDOG_POLL`] a poll may run before it reads as
+/// interrupted (a suspend, a wall-clock jump) rather than as scheduling
+/// jitter. Below the slack only the overshoot is unaccounted; at or past it
+/// the whole poll charges no running time.
+const WATCHDOG_POLL_SLACK: Duration = Duration::from_secs(1);
 
 /// One watchdog evaluation: if the main loop last completed a tick more than
 /// `deadline_ms` ago, invoke `on_stall`. Production passes `std::process::abort`;
@@ -119,6 +143,54 @@ fn watchdog_check(last_tick_ms: u64, now_ms: u64, deadline_ms: u64, on_stall: im
     if last_tick_ms != 0 && now_ms.saturating_sub(last_tick_ms) > deadline_ms {
         on_stall();
     }
+}
+
+/// The wall time one poll leaves unaccounted: past [`WATCHDOG_POLL_SLACK`] the
+/// poll was interrupted by a suspend or a wall-clock jump and charges no
+/// running time at all (the loop froze with the clock); a poll near its
+/// window charges the window, its scheduling jitter excluded. Pure so the
+/// accounting is unit-testable.
+fn watchdog_unaccounted(elapsed_ms: u64, poll_ms: u64) -> u64 {
+    if elapsed_ms > poll_ms.saturating_add(WATCHDOG_POLL_SLACK.as_millis() as u64) {
+        elapsed_ms
+    } else {
+        elapsed_ms.saturating_sub(poll_ms)
+    }
+}
+
+/// One watchdog round: fold this poll's unaccounted time into the total and
+/// run the stall check against the running-time clock (`now - unaccounted`).
+/// Returns the updated total. Pure so the absorb-and-check composition is
+/// unit-testable; production passes `std::process::abort` as `on_stall`.
+fn watchdog_step(
+    last_tick_ms: u64,
+    slept_from_ms: u64,
+    now_ms: u64,
+    unaccounted_ms: u64,
+    poll_ms: u64,
+    deadline_ms: u64,
+    on_stall: impl FnOnce(),
+) -> u64 {
+    let unaccounted = unaccounted_ms.saturating_add(watchdog_unaccounted(
+        now_ms.saturating_sub(slept_from_ms),
+        poll_ms,
+    ));
+    watchdog_check(
+        last_tick_ms,
+        now_ms.saturating_sub(unaccounted),
+        deadline_ms,
+        on_stall,
+    );
+    unaccounted
+}
+
+/// Whether the next drain must be skipped this tick: the tick's shared window
+/// is spent (a `Some(0)` remainder — the window flock waits and keychain
+/// shell-outs share), or the watchdog deadline is reached. A drain handed a
+/// wait past either point can only time out or abort the daemon mid-switch.
+/// Pure, so both triggers pin without posing real waits.
+fn drains_exhausted(remaining: Option<Duration>, now: Instant, deadline: Instant) -> bool {
+    remaining.is_some_and(|r| r.is_zero()) || now >= deadline
 }
 
 /// Tighten an existing `~/.clauth` tree on boot, before `load_config` runs its
@@ -154,9 +226,41 @@ pub(crate) enum StartMode {
     Replace,
 }
 
+/// Opt-out for the REST API, matching `CLAUTH_NO_UPDATE` / `CLAUTH_NO_COMPLETIONS`
+/// (only `"1"` opts out). A listening socket is the one daemon behavior an
+/// operator might need to kill without editing the unit that passes `--listen`.
+const NO_API_ENV: &str = "CLAUTH_NO_API";
+
+fn api_enabled() -> bool {
+    std::env::var(NO_API_ENV).as_deref() != Ok("1")
+}
+
+/// `serve`'s listener decision, extracted because it is the REST kill switch's
+/// call site: `Some(addr)` under `CLAUTH_NO_API=1` must yield `no_api`, never a
+/// prepared listener. The prepare arm reads the certificate; the legacy import and
+/// the bind itself run later, below the claim, in `api::serve_prepared`.
+fn listener_setup(
+    listen: Option<SocketAddr>,
+    certs: &api::tls::CertSource,
+) -> Result<(Option<api::Prepared>, Option<SocketAddr>)> {
+    Ok(match listen {
+        Some(addr) if api_enabled() => (Some(api::prepare(addr, certs)?), None),
+        Some(addr) => (None, Some(addr)),
+        None => (None, None),
+    })
+}
+
 /// `clauth daemon` — build the shared stores, run the scheduler headless, and
 /// loop executing auto-switches + rewriting `status.json` until killed.
-pub(crate) fn serve(mode: StartMode) -> Result<()> {
+///
+/// `listen` is the REST API's bind address (`--listen`), or `None` for the
+/// default file-only daemon. `certs` is where that listener's TLS identity
+/// comes from, and is ignored without a `listen`.
+pub(crate) fn serve(
+    mode: StartMode,
+    listen: Option<SocketAddr>,
+    certs: &api::tls::CertSource,
+) -> Result<()> {
     // First thing, before any output (including the standing-by line below):
     // daemon stderr IS daemon.log, and undated lines cost real forensics time
     // (2026-07-09 — see `logline`).
@@ -168,6 +272,17 @@ pub(crate) fn serve(mode: StartMode) -> Result<()> {
     // singleton claim because the lock files live in the dir; it no-ops for
     // every instance after the first.
     mkdir_700(&dir).context("failed to create ~/.clauth")?;
+
+    // The listener's unreadable certificate is settled BEFORE the claim below,
+    // because the claim is what terminates the incumbent under `--replace`.
+    // Failing after it would leave the host with no daemon at all: no refresh,
+    // no auto-switch, not merely no listener. Nothing else settles here: the
+    // legacy import and the bind deliberately do NOT run above the claim — both
+    // live in `api::serve_prepared`, below it (and below a standby's
+    // promotion), where the incumbent's port is free, a redundant instance
+    // never reaches them, and a start that dies cannot have written
+    // `devices.json` or deleted `auth_token.json`.
+    let (mut prepared, no_api) = listener_setup(listen, certs)?;
 
     // Single-instance guard, claimed BEFORE any shared-tree work below: a
     // redundant instance must not GC the live daemon's runtime forest or walk
@@ -181,14 +296,26 @@ pub(crate) fn serve(mode: StartMode) -> Result<()> {
         StartMode::Replace => probe::claim_by_replacing(&dir)?,
         _ => claim_singleton(&dir, mode == StartMode::Standby)?,
     };
-    let _lock = match claim {
-        Claim::Active(lock) => lock,
-        Claim::Standby(slot) => stand_by(&dir, slot)?,
+    let (_lock, promoted) = match claim {
+        Claim::Active(lock) => (lock, false),
+        Claim::Standby(slot) => (stand_by(&dir, slot)?, true),
         Claim::Redundant => {
             logline!("clauth daemon: {}; exiting", redundant_reason(mode));
             return Ok(());
         }
     };
+
+    // A standby carried its pre-claim certificate through a park that is
+    // unbounded by design, so the promoted daemon re-reads it here: a renewal
+    // that landed during the park is what the listener serves, and a
+    // replacement that no longer reads fails the start fatally — the operator
+    // asked for a listener — rather than leaving a healthy-looking daemon on
+    // the stale identity. Every other start read the certificate moments ago
+    // and skips this.
+    if promoted && let Some(prepared) = prepared.as_mut() {
+        prepared.reload_certificate(certs)?;
+        logline!("clauth daemon: standby promoted; TLS certificate reloaded");
+    }
 
     log_rotate::warn_if_log_cap_defeated();
     // Tighten an existing looser tree (older builds / CLI umask left it 0o755)
@@ -201,6 +328,29 @@ pub(crate) fn serve(mode: StartMode) -> Result<()> {
     warn_if_spend_is_uncapped(&config);
     let mut daemon = Daemon::new(config, dir.join(STATUS_FILE));
     daemon.boot();
+
+    // After `boot` (the stores are seeded and the scheduler is up, so a request
+    // arriving immediately gets real numbers) and before `run` (which never
+    // returns). The certificate was settled by `api::prepare` above the claim
+    // (a promoted standby re-read it right after its promotion); the legacy import
+    // and the bind happen here for the first time, on a port that is winnable
+    // exactly now: the incumbent under `--replace` is dead, and a promoted
+    // standby holds the claim it parked for.
+    if let Some(addr) = no_api {
+        // Said here rather than above the claim so a redundant instance cannot
+        // print it and then "already running": two lines from a process that
+        // did nothing.
+        logline!("clauth daemon: {NO_API_ENV}=1 is set; not serving the REST API on {addr}");
+    }
+    if let Some(prepared) = prepared {
+        api::serve_prepared(
+            prepared,
+            Arc::clone(&daemon.config),
+            daemon.status_path.clone(),
+            daemon.live_stores(),
+        )?;
+    }
+
     logline!(
         "clauth daemon: running (status → {})",
         daemon.status_path.display()
@@ -326,6 +476,214 @@ pub(crate) fn status_oneshot(include_disabled: bool) -> Result<()> {
     Ok(())
 }
 
+/// Republish `~/.clauth/status.json` from a process that is not the daemon, so a
+/// switch landing in the TUI, in `clauth <name>`, or through the MCP tool reaches
+/// the feed's readers at once.
+///
+/// Without this the feed is only ever written by a running daemon, which learns
+/// of such a switch from the `profiles.toml` mtime on its next tick — and never
+/// learns of it at all when no daemon is running, leaving the published file
+/// naming an account the operator switched away from however long ago. That is
+/// the one field an external reader (`clauth-tray`, a status bar) most needs to
+/// be right, so a switch publishes it itself.
+///
+/// A live daemon OWNS the file: it republishes every tick with the scheduler's
+/// in-memory signals (`fetch_status`, `next_refresh_at`, `pending_switch`) that
+/// a single-shot build cannot see, and its own auto-switches already end in a
+/// `write_status`. So this defers whenever the singleton lock is positively
+/// held — that daemon's next tick, at most a second out, publishes the richer
+/// body over the same active account. Only an uncertain probe (a filesystem
+/// without working locks) publishes anyway: writing a slightly thinner body is
+/// cheaper than leaving a stale one.
+///
+/// Best-effort by design. The switch has already landed and been persisted by
+/// the time this runs; the caller must not fail because a status file could not
+/// be written.
+///
+/// The stamp is the daemon's, never this publish's: `generated_at` is how every
+/// reader (`clauth-tray`, the TUI's daemon dot) decides a daemon is alive, so
+/// the republish carries the daemon's last stamp forward, or the epoch when no
+/// daemon has ever published — see [`prior_generated_at`].
+///
+/// The daemon-presence probe stays unserialized. A daemon's first tick can land
+/// between the probe and this publish, costing one stale stamp at worst: the next
+/// tick replaces it. The switch-side body construction below remains outside the
+/// state flock; only its publication guards and atomic commit use the brief
+/// final hold.
+///
+/// Call it OUTSIDE the switch's `with_state_lock`, the way every caller in
+/// `actions` does: [`build_status`] stats and reads each profile's caches and
+/// sweeps the session flocks, and that disk work has no business extending the
+/// critical section every other clauth process is queued behind.
+///
+/// Takes the shared [`ConfigHandle`] and snapshots the config the same way the
+/// daemon's own writer and the API's switch do — the guard acquired for the
+/// clone and released before any disk work, so the snapshot itself never holds
+/// the config mutex across the build either.
+pub(crate) fn publish_status(config: &crate::profile::ConfigHandle) {
+    publish_status_with(config, || {});
+}
+
+/// [`publish_status`] with a hook between the status body's construction and
+/// its commit — the window a competing publisher can land in. Production passes
+/// a no-op; the regression tests use it to order two real publishers.
+pub(crate) fn publish_status_with(
+    config: &crate::profile::ConfigHandle,
+    before_commit: impl FnOnce(),
+) {
+    if singleton_held().unwrap_or(false) {
+        return;
+    }
+    let snapshot = {
+        #[allow(
+            clippy::expect_used,
+            reason = "config mutex poisoning is unrecoverable"
+        )]
+        let cfg = config.lock().expect("config mutex poisoned");
+        cfg.clone()
+    };
+    let stamp = prior_generated_at().unwrap_or_else(|| crate::usage::epoch_secs_to_iso(0));
+    let built_after = std::time::SystemTime::now();
+    let Some(json) = status_feed_json(&snapshot, None, Some(&stamp)) else {
+        return;
+    };
+    before_commit();
+    publish_status_json_if_current(&snapshot, &json, built_after);
+}
+
+/// The daemon's last `generated_at`, read off the feed this publish replaces.
+///
+/// `None` when no feed is on disk, it does not parse, or its `generated_at` is
+/// missing: no daemon has published a readable stamp here, and the caller
+/// answers that with the epoch, which every staleness rule reads as "no
+/// daemon".
+fn prior_generated_at() -> Option<String> {
+    let Ok(dir) = clauth_dir() else { return None };
+    let body = std::fs::read(dir.join(STATUS_FILE)).ok()?;
+    serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()?
+        .get("generated_at")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Rewrite `status.json` from `config`, unconditionally.
+///
+/// [`publish_status`]'s core, split out for the one caller that must NOT defer
+/// to a running daemon: the daemon's own `POST /api/v1/switch`. There the daemon IS
+/// the process that just switched, so there is no other owner to wait for, and
+/// a client blocked on `GET /api/v1/status?wait=` is holding a connection open
+/// precisely to be told the moment this file names the new account. Leaving it
+/// to the next scheduler tick adds up to a second of nothing happening to every
+/// switch made through the API.
+///
+/// `live` carries the scheduler's in-memory signals when the caller has them —
+/// the daemon's own API switch does, and passing `None` there republished a feed
+/// whose `fetch_status`, `next_refresh_at`, `stale` and `pending_switch` fell
+/// back to the mtime derivation until the next tick overwrote them.
+///
+/// Best-effort and construction lock-placement rules are [`publish_status`]'s.
+///
+/// Stamps `generated_at` now: the daemon's own spelling, and itself the
+/// freshness signal. Only the daemon's writers come through here; the
+/// daemonless republish preserves the daemon's stamp instead
+/// ([`publish_status_with`]).
+pub(crate) fn write_status_feed(config: &AppConfig, live: Option<&LiveSignals>) {
+    let Some(json) = status_feed_json(config, live, None) else {
+        return;
+    };
+    write_status_json(&json);
+}
+
+/// A separate process can publish again while this body is built. Two guards,
+/// taken with the write inside one brief State hold so daemonless publishers
+/// serialize against each other: the persisted active marker must still match
+/// the body's, and the on-disk feed must not be newer than `built_after`. The
+/// publish branch is what the second guard licenses: a feed stamped strictly
+/// before `built_after` finished its build before our build started, so its
+/// inputs predate ours and ours is at least as fresh. Anything stamped at or
+/// later skips — conservative even though a later stamp does not prove fresher
+/// inputs (a slow writer can publish old inputs late), because a skip only
+/// loses one best-effort refresh while a wrong overwrite is the
+/// stale-whole-feed defect this guard exists to prevent (B→C→B and same-active
+/// edits alike). The daemon's own writers take no state flock and bypass both
+/// guards by design: they are the feed's owner while the singleton is held,
+/// and this path defers to them at entry. Both guards only skip: publication
+/// is best-effort after a switch that already succeeded. The recency
+/// comparison leans on the filesystem stamp and `SystemTime` sharing one
+/// realtime clock; a backward clock step, or a coarse fs stamp collapsing a
+/// just-later write onto `built_after`'s tick, can cost one mis-ordered
+/// publish until the next one lands.
+fn publish_status_json_if_current(
+    snapshot: &AppConfig,
+    json: &[u8],
+    built_after: std::time::SystemTime,
+) {
+    debug_assert!(!crate::lockorder::holds::<crate::lockorder::rank::Config>());
+    let active = snapshot.state.active_profile.as_ref();
+    let feed = clauth_dir().ok().map(|dir| dir.join(STATUS_FILE));
+    if let Err(e) = crate::lock::with_state_lock(|_held| {
+        if crate::profile::load_app_state()?.active_profile.as_ref() != active {
+            logline!(
+                "clauth: skipped the daemonless status.json republish: the active profile moved while this body was built"
+            );
+            return Ok(());
+        }
+        if let Some(path) = feed.as_ref()
+            && let Ok(mtime) = std::fs::metadata(path).and_then(|m| m.modified())
+            && mtime >= built_after
+        {
+            logline!(
+                "clauth: skipped the daemonless status.json republish: a newer publication landed while this body was built"
+            );
+            return Ok(());
+        }
+        write_status_json(json);
+        Ok(())
+    }) {
+        logline!("clauth: failed to publish status.json after a switch: {e:#}");
+    }
+}
+
+fn status_feed_json(
+    config: &AppConfig,
+    live: Option<&LiveSignals>,
+    generated_at: Option<&str>,
+) -> Option<Vec<u8>> {
+    debug_assert!(!crate::lockorder::holds::<crate::lockorder::rank::State>());
+    debug_assert!(!crate::lockorder::holds::<crate::lockorder::rank::Config>());
+    let mut body = build_status(config, config.state.refresh_interval_ms, live, false);
+    // The backdate this applies is the one deliberate exception to
+    // `build_status`'s "the stamp never precedes a per-entry verdict instant"
+    // ordering: a non-daemon publish carries a daemon's OLD stamp over entries
+    // built now, which is the point — stamp freshness must keep meaning
+    // "a daemon wrote this", never "some process did".
+    if let Some(stamp) = generated_at {
+        body.generated_at = stamp.to_string();
+    }
+    match serde_json::to_vec_pretty(&body) {
+        Ok(json) => Some(json),
+        Err(e) => {
+            logline!("clauth: failed to serialize status.json after a switch: {e}");
+            None
+        }
+    }
+}
+
+fn write_status_json(json: &[u8]) {
+    let Ok(dir) = clauth_dir() else { return };
+    if let Err(e) = mkdir_700(&dir) {
+        logline!(
+            "clauth: failed to prepare {} for status.json: {e}",
+            dir.display()
+        );
+        return;
+    }
+    if let Err(e) = atomic_write_600(&dir.join(STATUS_FILE), json) {
+        logline!("clauth: failed to publish status.json after a switch: {e}");
+    }
+}
+
 /// True when the live credentials diverge from the active profile's stored chain
 /// and it isn't a first-login adoption — the daemon cannot prompt, so it skips
 /// the switch and leaves the resolution to the operator (TUI Divergence modal).
@@ -340,6 +698,133 @@ pub(crate) fn status_oneshot(include_disabled: bool) -> Result<()> {
 /// maps to `false` (proceed) here.
 fn active_diverged_unsaved(active: &crate::profile::ProfileName) -> bool {
     crate::claude::live_diverged_and_unsaved(active).unwrap_or(false)
+}
+
+/// The live scheduler stores a published feed's [`LiveSignals`] are built from.
+///
+/// Bundled so that anything publishing the feed takes the SAME snapshot the
+/// daemon's own tick does. Without it the REST API had to pass `None` and fall
+/// back to the mtime derivation, so `GET /api/v1/status?all=1` — which rebuilds
+/// rather than serving the file — disagreed with the plain route on
+/// `fetch_status`, `next_refresh_at`, `stale` and `pending_switch`, on the same
+/// daemon, in the same second.
+///
+/// Seven `Arc` clones, so handing one to the listener costs nothing and shares
+/// the scheduler's state rather than copying it.
+#[derive(Clone)]
+pub(crate) struct LiveStores {
+    pub(crate) usage_status: StatusStore,
+    pub(crate) third_party_status: ThirdPartyStatusStore,
+    pub(crate) next_refresh_per_profile: NextRefreshPerProfile,
+    pub(crate) poll_streaks: PollStreaks,
+    pub(crate) pending_switch: PendingSwitch,
+    pub(crate) auto_start_queue: crate::usage::AutoStartQueueState,
+    pub(crate) kick_blocks: KickBlocks,
+}
+
+#[cfg(test)]
+impl Default for LiveStores {
+    /// Empty stores, for a test that wants to seed one of them and prove a
+    /// route reads it rather than deriving the same field from a file mtime.
+    fn default() -> Self {
+        Self {
+            usage_status: Arc::new(RankedMutex::new(HashMap::new())),
+            third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
+            next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
+            poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+            pending_switch: Arc::new(RankedMutex::new(Default::default())),
+            auto_start_queue: Arc::new(RankedMutex::new(Default::default())),
+            kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+        }
+    }
+}
+
+/// One consistent read of [`LiveStores`], owning its data so no lock is held
+/// while the feed is built.
+pub(crate) struct LiveSnapshot {
+    status: HashMap<String, FetchStatus>,
+    third_party_status: HashMap<String, FetchStatus>,
+    next_refresh: HashMap<LegKey, u64>,
+    streaks: HashMap<String, u32>,
+    pending_switch: Option<String>,
+    queue_anchor: Option<i64>,
+    queue_blocked: Vec<ProfileName>,
+}
+
+impl LiveStores {
+    /// Snapshot every store, each lock released at the end of its own statement
+    /// so none is ever held when CONFIG (which outranks all of them) is taken
+    /// next, and none is held while [`build_status`] does its disk work.
+    pub(crate) fn snapshot(&self) -> LiveSnapshot {
+        let status = self
+            .usage_status
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_default();
+        // The third-party leg writes its outcomes to a store of its own, so
+        // without this snapshot every api-key/provider profile fell through to
+        // the mtime derivation — and an `AuthExpired` session, which writes no
+        // cache, published `fetch_status: null`, indistinguishable from a cold
+        // start.
+        let third_party_status = self
+            .third_party_status
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_default();
+        let next_refresh = self
+            .next_refresh_per_profile
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_default();
+        // Projected to the 429 axis on purpose: `stale` is contracted as a stuck
+        // THROTTLE (`wiki/Daemon.md`), so a refresh-fail streak must not leak in.
+        let streaks = self
+            .poll_streaks
+            .lock()
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.rate_limit)).collect())
+            .unwrap_or_default();
+        // The in-flight switch target (accepted, not yet applied), so a reader
+        // shows in-flight truth instead of a timing heuristic. The set holds at
+        // most one scheduler target in practice (`scan_auto_switch` skips while
+        // one is pending); `min` keeps the snapshot deterministic anyway.
+        let pending_switch = self
+            .pending_switch
+            .lock()
+            .ok()
+            .and_then(|q| q.iter().min().cloned());
+        // `switch_grade_kick_lifts` keys ARE the blocked set: it and the
+        // scheduler's own `kick_rejected_names` share one predicate, which is how
+        // the TUI's queue chips read it too.
+        let queue_anchor = crate::usage::queue_anchor_cached(&self.auto_start_queue);
+        let queue_blocked: Vec<ProfileName> =
+            crate::usage::switch_grade_kick_lifts(&self.kick_blocks)
+                .keys()
+                .map(|k| k.as_str().into())
+                .collect();
+        LiveSnapshot {
+            status,
+            third_party_status,
+            next_refresh,
+            streaks,
+            pending_switch,
+            queue_anchor,
+            queue_blocked,
+        }
+    }
+}
+
+impl LiveSnapshot {
+    pub(crate) fn signals(&self) -> LiveSignals<'_> {
+        LiveSignals {
+            status: &self.status,
+            third_party_status: &self.third_party_status,
+            next_refresh: &self.next_refresh,
+            streaks: &self.streaks,
+            pending_switch: self.pending_switch.as_deref(),
+            queue_anchor: self.queue_anchor,
+            queue_blocked: &self.queue_blocked,
+        }
+    }
 }
 
 /// Owns the shared `Arc` stores (cloned into the scheduler) plus main-loop-only
@@ -471,6 +956,7 @@ impl Daemon {
         );
         bootstrap_third_party(
             &self.third_party_usage_store,
+            &self.usage_store,
             &self.third_party_status,
             &self.last_fetched,
             &third_party,
@@ -480,9 +966,10 @@ impl Daemon {
     }
 
     /// Bundle scheduler `Arc`s and launch the background refresher (same call the
-    /// TUI's `start_scheduler` makes). The suppressed-generic set is daemon-local.
+    /// TUI's `start_scheduler` makes). The suppressed-auth-expired set is daemon-local.
     fn spawn_scheduler(&self) {
-        let suppressed: SuppressedGenericStore = Arc::new(RankedMutex::new(HashMap::new()));
+        let suppressed_auth_expired: SuppressedAuthExpiredStore =
+            Arc::new(RankedMutex::new(HashMap::new()));
         spawn_refresher(
             Arc::clone(&self.config),
             Arc::clone(&self.usage_tokens),
@@ -501,7 +988,7 @@ impl Daemon {
             Arc::clone(&self.third_party_tokens),
             Arc::clone(&self.third_party_usage_store),
             Arc::clone(&self.third_party_status),
-            suppressed,
+            suppressed_auth_expired,
             Arc::clone(&self.shutting_down),
             // Single-fetcher lease (#27): the daemon competes for `usage-fetch.lock`
             // like any instance. It normally boots first (launchd) and wins the
@@ -559,11 +1046,24 @@ impl Daemon {
         let spawned = std::thread::Builder::new()
             .name("clauth-daemon-watchdog".into())
             .spawn(move || {
+                let mut unaccounted_ms: u64 = 0;
                 loop {
+                    let slept_from = crate::usage::now_ms();
                     std::thread::sleep(WATCHDOG_POLL);
-                    watchdog_check(
+                    // A suspend/resume freezes this thread with the main loop
+                    // while the wall clock keeps running; watchdog_step
+                    // charges the overshot poll no running time, so the first
+                    // post-resume check judges the pre-freeze heartbeat on
+                    // time the loop actually had. The heartbeat is untouched:
+                    // the main loop re-stamps on its next tick, and a loop
+                    // that wedges before or after the resume still aborts
+                    // within the deadline of running time.
+                    unaccounted_ms = watchdog_step(
                         heartbeat.load(Ordering::Relaxed),
+                        slept_from,
                         crate::usage::now_ms(),
+                        unaccounted_ms,
+                        WATCHDOG_POLL.as_millis() as u64,
                         WATCHDOG_DEADLINE.as_millis() as u64,
                         || {
                             logline!(
@@ -586,6 +1086,20 @@ impl Daemon {
         }
     }
 
+    /// The live stores, bundled for anything that publishes the feed — the tick
+    /// below and the REST API's rebuild alike, so the two cannot disagree.
+    fn live_stores(&self) -> LiveStores {
+        LiveStores {
+            usage_status: Arc::clone(&self.usage_status),
+            third_party_status: Arc::clone(&self.third_party_status),
+            next_refresh_per_profile: Arc::clone(&self.next_refresh_per_profile),
+            poll_streaks: Arc::clone(&self.poll_streaks),
+            pending_switch: Arc::clone(&self.pending_switch),
+            auto_start_queue: Arc::clone(&self.auto_start_queue),
+            kick_blocks: Arc::clone(&self.kick_blocks),
+        }
+    }
+
     /// Snapshot the live freshness/countdown stores — each snapshot's lock is
     /// fully released at the end of its own statement, so none is ever held
     /// when the `config` lock below is taken — then build and atomically
@@ -597,66 +1111,8 @@ impl Daemon {
     /// a TUI edit) behind it. The clone is a handful of small strings.
     fn write_status(&self) {
         let interval = self.refresh_interval.load(Ordering::Relaxed);
-        let status_snap: HashMap<String, FetchStatus> = self
-            .usage_status
-            .lock()
-            .map(|m| m.clone())
-            .unwrap_or_default();
-        // The third-party leg writes its outcomes to a store of its own, so
-        // without this snapshot every api-key/provider profile fell through to
-        // the mtime derivation — and an `AuthExpired` session, which writes no
-        // cache, published `fetch_status: null`, indistinguishable from a cold
-        // start.
-        let tp_status_snap: HashMap<String, FetchStatus> = self
-            .third_party_status
-            .lock()
-            .map(|m| m.clone())
-            .unwrap_or_default();
-        let next_snap: HashMap<String, u64> = self
-            .next_refresh_per_profile
-            .lock()
-            .map(|m| m.clone())
-            .unwrap_or_default();
-        // Snapshot the 429 streaks so build_status can publish `stale` (a
-        // deep-slot stuck RateLimited). Lower rank than config, like the stores
-        // above — snapshot + release before the config lock. Projected to the 429
-        // axis on purpose: `stale` is contracted as a stuck THROTTLE
-        // (`wiki/Daemon.md`), so a refresh-fail streak must not leak into it.
-        let streaks_snap: HashMap<String, u32> = self
-            .poll_streaks
-            .lock()
-            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.rate_limit)).collect())
-            .unwrap_or_default();
-        // The in-flight switch target (accepted, not yet applied), so the UI
-        // shows in-flight truth instead of a timing heuristic. Snapshot + release
-        // before the config lock, like the freshness stores above. The set holds
-        // at most one scheduler target in practice (`scan_auto_switch` skips
-        // while one is pending); `min` keeps the snapshot deterministic anyway.
-        let pending_snap: Option<String> = self
-            .pending_switch
-            .lock()
-            .ok()
-            .and_then(|q| q.iter().min().cloned());
-        // The auto-start queue's in-memory anchor and the blocks its membership
-        // rule excludes on — both leaf rank, snapshot + release before the config
-        // lock like every store above. `switch_grade_kick_lifts` keys ARE the
-        // blocked set: it and the scheduler's own `kick_rejected_names` share one
-        // predicate, which is how the TUI's queue chips read it too.
-        let queue_anchor = crate::usage::queue_anchor_cached(&self.auto_start_queue);
-        let queue_blocked: Vec<crate::profile::ProfileName> =
-            crate::usage::switch_grade_kick_lifts(&self.kick_blocks)
-                .keys()
-                .map(|k| k.as_str().into())
-                .collect();
-        let live = LiveSignals {
-            status: &status_snap,
-            third_party_status: &tp_status_snap,
-            next_refresh: &next_snap,
-            streaks: &streaks_snap,
-            pending_switch: pending_snap.as_deref(),
-            queue_anchor,
-            queue_blocked: &queue_blocked,
-        };
+        let snapshot = self.live_stores().snapshot();
+        let live = snapshot.signals();
         let cfg_snap = {
             #[allow(
                 clippy::expect_used,

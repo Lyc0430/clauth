@@ -355,6 +355,19 @@ fn format_pct_shows_fractional_percent() {
     assert_eq!(format_pct(42.3), "42.3%");
 }
 
+/// The one threshold spelling, pinned per branch so a drift on one branch
+/// cannot ride the others green: exact millions as `{n}M`, whole thousands
+/// below a million as `{n}k`, anything else plain.
+#[test]
+fn threshold_tokens_formats_m_k_and_plain() {
+    assert_eq!(format_threshold_tokens(1_000_000), "1M");
+    assert_eq!(format_threshold_tokens(2_000_000), "2M");
+    assert_eq!(format_threshold_tokens(600_000), "600k");
+    assert_eq!(format_threshold_tokens(50_000), "50k");
+    assert_eq!(format_threshold_tokens(450_500), "450500");
+    assert_eq!(format_threshold_tokens(1_500_000), "1500000");
+}
+
 /// `local_stamp` is the one prose-stamp formatter: epoch seconds → `YYYY-MM-DD
 /// HH:MM:SS` in local wall clock. Pinned on a fixed epoch so the SHAPE asserts
 /// independently of the operator's zone — the wall-clock digits shift with the
@@ -418,6 +431,7 @@ fn account_tier_reports_no_tier_for_an_unfetched_plan() {
             expires_at: None,
             scopes: None,
             subscription_type: Some("something_new".into()),
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     assert_eq!(account_tier(&unclassified), None);
@@ -449,6 +463,7 @@ fn account_tier_falls_through_an_unclassified_fetched_plan_to_the_token() {
                 expires_at: None,
                 scopes: None,
                 subscription_type: Some(sub.into()),
+                ..crate::profile::OAuthToken::default_extra()
             }),
         })
     };
@@ -497,6 +512,7 @@ fn account_tier_reads_back_a_free_logins_stored_token() {
             expires_at: None,
             scopes: None,
             subscription_type: Some("free".into()),
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     assert_eq!(account_tier(&free), Some(PlanTier::Free));
@@ -534,6 +550,7 @@ fn account_tier_still_renders_every_known_tier() {
             expires_at: None,
             scopes: None,
             subscription_type: Some("pro".into()),
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     assert_eq!(account_tier(&token_only), Some(PlanTier::Pro));

@@ -5,6 +5,59 @@
 use super::*;
 use crate::profile::AppState;
 use crate::testutil::HomeSandbox;
+use crate::testutil::through_handle;
+
+const SWITCH_PUBLISH_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn seed_keyless_switch_profiles() {
+    let profiles = ["a", "b", "c"]
+        .into_iter()
+        .map(|name| {
+            Profile::new(
+                name.to_string(),
+                Some("https://api.deepseek.com".to_string()),
+                None,
+            )
+        })
+        .collect::<Vec<_>>();
+    for profile in &profiles {
+        crate::profile::save_profile(profile).expect("persist keyless profile");
+    }
+    let state = AppState {
+        profiles: profiles
+            .iter()
+            .map(|profile| profile.name.clone())
+            .collect(),
+        active_profile: Some("a".into()),
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist initial active profile");
+}
+
+fn switch_handle_from_disk() -> crate::profile::ConfigHandle {
+    std::sync::Arc::new(crate::lockorder::RankedMutex::new(
+        crate::profile::load_config().expect("load independent config handle"),
+    ))
+}
+
+fn persisted_active() -> String {
+    crate::profile::load_app_state()
+        .expect("load persisted state")
+        .active_profile
+        .expect("fixture keeps an active profile")
+        .to_string()
+}
+
+fn feed_active(home: &HomeSandbox) -> String {
+    let body: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(home.home().join(".clauth/status.json")).expect("read status feed"),
+    )
+    .expect("status feed json");
+    body["active_profile"]
+        .as_str()
+        .expect("feed active profile")
+        .to_string()
+}
 
 /// The rotation guard every account mutation takes. Uncontended inside a
 /// sandbox, so this is the fixture spelling of "no rotation is in flight" — the
@@ -32,6 +85,63 @@ fn acct_config() -> AppConfig {
         state: AppState::default(),
         profiles: vec![Profile::new("acct".to_string(), None, None)],
     }
+}
+
+#[test]
+fn a_delayed_daemonless_publish_keeps_the_current_active_profile() {
+    let home = HomeSandbox::new();
+    seed_keyless_switch_profiles();
+    assert!(!crate::daemon::singleton_held().expect("probe daemon singleton"));
+
+    let p1 = switch_handle_from_disk();
+    let p2 = switch_handle_from_disk();
+    let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            switch_profile_synced(&p1, &"b".into(), || {
+                reached_tx.send(()).expect("test awaits rendezvous");
+                release_rx
+                    .recv_timeout(SWITCH_PUBLISH_WAIT)
+                    .expect("test releases publication before the hang deadline");
+            })
+        });
+
+        reached_rx
+            .recv_timeout(SWITCH_PUBLISH_WAIT)
+            .expect("P1 built its body and released its locks before the commit");
+        assert_eq!(persisted_active(), "b");
+        crate::lock::with_state_lock(|_held| Ok(()))
+            .expect("P1 holds no state flock while publication is delayed");
+
+        switch_profile(&p2, &"c".into()).expect("P2 switches B to C");
+        assert_eq!(persisted_active(), "c");
+        assert_eq!(feed_active(&home), "c");
+
+        release_tx.send(()).expect("release P1 publication");
+        worker
+            .join()
+            .expect("P1 worker did not panic")
+            .expect("P1 switch completed");
+    });
+
+    assert_eq!(persisted_active(), "c");
+    assert_eq!(feed_active(&home), "c");
+}
+
+#[test]
+fn ordered_daemonless_switch_publishes_the_latest_state() {
+    let home = HomeSandbox::new();
+    seed_keyless_switch_profiles();
+
+    let p1 = switch_handle_from_disk();
+    switch_profile(&p1, &"b".into()).expect("P1 switches A to B");
+    let p2 = switch_handle_from_disk();
+    switch_profile(&p2, &"c".into()).expect("P2 switches B to C");
+
+    assert_eq!(persisted_active(), "c");
+    assert_eq!(feed_active(&home), "c");
 }
 
 #[test]
@@ -109,6 +219,7 @@ fn switch_replaces_active_account_mirror_without_refusing() {
                 expires_at: None,
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         });
         crate::profile::save_profile(&p).expect("save profile");
@@ -138,8 +249,10 @@ fn switch_replaces_active_account_mirror_without_refusing() {
     crate::profile::save_app_state(&config.state).expect("persist state");
 
     // Must NOT bail — the live file is the active account's captured mirror.
-    switch_profile(&mut config, &crate::profile::ProfileName::from("xfx"))
-        .expect("switch replaces the active-account mirror");
+    let (config, ()) = through_handle(config, |h| {
+        switch_profile(h, &crate::profile::ProfileName::from("xfx"))
+            .expect("switch replaces the active-account mirror");
+    });
 
     assert!(config.is_active(&crate::profile::ProfileName::from("xfx")));
     assert_eq!(
@@ -147,6 +260,141 @@ fn switch_replaces_active_account_mirror_without_refusing() {
             .expect("classify"),
         crate::claude::LinkState::LinkedTo,
         "after the switch the live path resolves to xfx's stored creds",
+    );
+}
+
+/// Two logged-in profiles with `one` active and the live file mirroring it —
+/// the shape both feed-publishing tests below switch out of.
+fn two_profiles_active_on_one() -> AppConfig {
+    let mk = |name: &str| {
+        let mut p = Profile::new(name.to_string(), None, None);
+        p.credentials = Some(crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: format!("{name}-access"),
+                refresh_token: Some(format!("{name}-refresh")),
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
+            }),
+        });
+        crate::profile::save_profile(&p).expect("save profile");
+        p
+    };
+    let outgoing = mk("one");
+    let target = mk("two");
+
+    let live_path = crate::profile::claude_dir()
+        .unwrap()
+        .join(".credentials.json");
+    std::fs::create_dir_all(live_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &live_path,
+        serde_json::to_vec(outgoing.credentials.as_ref().unwrap()).unwrap(),
+    )
+    .unwrap();
+
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![outgoing, target],
+    };
+    config.state.active_profile = Some("one".into());
+    // Persisted, not just in memory: `ensure_installable` gates on
+    // `profile::is_configured`, which reads the roster back off disk so a target
+    // deleted by a concurrent CLI bounces before the relink tears the live slot
+    // down. A fixture holding the roster only in memory reads as "not found".
+    config.state.profiles = vec!["one".into(), "two".into()];
+    crate::profile::save_app_state(&config.state).expect("save app state");
+    config
+}
+
+/// The published feed must name the account the switch just landed on.
+///
+/// `~/.clauth/status.json` is the contract external readers follow
+/// (`wiki/Daemon.md`), and only `clauth daemon` ever wrote it — so a switch made
+/// in the TUI, by `clauth <name>`, or through the MCP tool left the published
+/// `active_profile` naming the account the operator had just switched away
+/// from: until the next tick when a daemon happened to be running to notice the
+/// `profiles.toml` mtime, and forever when one was not.
+#[test]
+fn switch_publishes_the_status_feed_when_no_daemon_owns_it() {
+    let home = HomeSandbox::new();
+    let config = two_profiles_active_on_one();
+
+    let feed = home.home().join(".clauth").join("status.json");
+    assert!(!feed.exists(), "nothing has published a feed yet");
+
+    through_handle(config, |h| {
+        switch_profile(h, &"two".into()).expect("switch");
+    });
+
+    let published = std::fs::read(&feed).expect("the switch itself published the feed");
+    let body: serde_json::Value = serde_json::from_slice(&published).unwrap();
+    assert_eq!(body["active_profile"], "two");
+    let flags: Vec<(String, bool)> = body["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| {
+            (
+                p["name"].as_str().unwrap().to_string(),
+                p["active"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        flags,
+        vec![("one".to_string(), false), ("two".to_string(), true)],
+        "the per-profile active flags move with the top-level name",
+    );
+}
+
+/// The no-op arm: a switch to the account ALREADY active changes nothing, so
+/// republishing would rewrite a feed whose bytes are already correct — and
+/// `publish_status`'s probe-to-stamp flow (stat every profile cache, read the
+/// old feed) would run that rewrite under no switch at all. `changed` gating
+/// the republish is what keeps a no-op switch off the disk entirely.
+#[test]
+fn a_no_op_switch_does_not_republish_the_feed() {
+    let home = HomeSandbox::new();
+    let config = two_profiles_active_on_one();
+
+    through_handle(config, |h| {
+        switch_profile(h, &"one".into()).expect("already-active is a no-op success");
+    });
+
+    assert!(
+        !home.home().join(".clauth").join("status.json").exists(),
+        "a switch that changed nothing must not write the feed"
+    );
+}
+
+/// A live daemon OWNS the feed: it republishes every tick with the scheduler's
+/// in-memory `fetch_status` / `next_refresh_at` / `pending_switch`, which a
+/// single-shot build cannot see. A switch must leave the file to that daemon —
+/// whose next tick is at most a second out — rather than overwrite the richer
+/// body with a thinner one.
+#[test]
+fn switch_leaves_the_feed_to_a_running_daemon() {
+    let home = HomeSandbox::new();
+    let config = two_profiles_active_on_one();
+    let _daemon = crate::daemon::hold_daemon_lock();
+
+    through_handle(config, |h| {
+        switch_profile(h, &"two".into()).expect("switch");
+    });
+    // Off disk, not the handle clone: the closure's return is `()`, so the
+    // switch's landed marker is observable here only through the store it
+    // persisted, which is also what any later clauth process would read.
+    assert!(
+        crate::profile::load_config()
+            .expect("load")
+            .is_active(&"two".into()),
+        "the switch itself still lands"
+    );
+    assert!(
+        !home.home().join(".clauth").join("status.json").exists(),
+        "a daemon owns status.json; its own next tick republishes it",
     );
 }
 
@@ -169,6 +417,7 @@ fn switch_to_a_missing_profile_bails_before_touching_the_live_link() {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     crate::profile::save_profile(&p).expect("save profile");
@@ -189,8 +438,9 @@ fn switch_to_a_missing_profile_bails_before_touching_the_live_link() {
     };
     config.state.active_profile = Some("keeper".into());
 
-    let err = switch_profile(&mut config, &crate::profile::ProfileName::from("ghost"))
-        .expect_err("ghost must bail");
+    let (config, err) = through_handle(config, |h| {
+        switch_profile(h, &crate::profile::ProfileName::from("ghost")).expect_err("ghost must bail")
+    });
     assert!(
         err.to_string().contains("not found"),
         "bail names the cause, got: {err}"
@@ -224,6 +474,7 @@ fn switch_profile_refuses_a_target_deleted_on_disk() {
                 expires_at: None,
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         });
         save_profile(&p).expect("save profile");
@@ -253,7 +504,7 @@ fn switch_profile_refuses_a_target_deleted_on_disk() {
     save_app_state(&config.state).expect("persist state");
 
     // The leg's snapshot predates the delete.
-    let mut stale = config.clone();
+    let stale = config.clone();
 
     // CLI account mutation: delete victim out from under the stale snapshot.
     // `victim` is not active on the delete config, so the live file survives and
@@ -270,8 +521,10 @@ fn switch_profile_refuses_a_target_deleted_on_disk() {
     .expect("delete");
     drop(guard);
 
-    let err = switch_profile(&mut stale, &crate::profile::ProfileName::from("victim"))
-        .expect_err("a deleted target must be refused");
+    let (stale, err) = through_handle(stale, |h| {
+        switch_profile(h, &crate::profile::ProfileName::from("victim"))
+            .expect_err("a deleted target must be refused")
+    });
     assert_eq!(err.to_string(), "profile 'victim' not found");
     assert!(
         stale.is_active(&crate::profile::ProfileName::from("keeper")),
@@ -302,7 +555,7 @@ fn switch_profile_refuses_a_disabled_target_and_leaves_active_unchanged() {
     let mut target = Profile::new("target".to_string(), None, None);
     target.disabled = true;
 
-    let mut config = AppConfig {
+    let config = AppConfig {
         state: AppState {
             active_profile: Some("active".into()),
             profiles: vec!["active".into(), "target".into()],
@@ -312,8 +565,10 @@ fn switch_profile_refuses_a_disabled_target_and_leaves_active_unchanged() {
     };
     crate::profile::save_app_state(&config.state).expect("persist state");
 
-    let err = switch_profile(&mut config, &crate::profile::ProfileName::from("target"))
-        .expect_err("a disabled target must be refused");
+    let (config, err) = through_handle(config, |h| {
+        switch_profile(h, &crate::profile::ProfileName::from("target"))
+            .expect_err("a disabled target must be refused")
+    });
     assert_eq!(
         err.to_string(),
         "'target': account is disabled, run `clauth enable target`"
@@ -344,6 +599,7 @@ fn auto_switch_if_needed_walks_off_a_broken_active() {
                 expires_at: None,
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         });
         p.usage = Some(UsageInfo {
@@ -373,7 +629,7 @@ fn auto_switch_if_needed_walks_off_a_broken_active() {
     )
     .unwrap();
 
-    let mut config = AppConfig {
+    let config = AppConfig {
         state: AppState {
             active_profile: Some("a".into()),
             profiles: vec!["a".into(), "b".into()],
@@ -385,7 +641,9 @@ fn auto_switch_if_needed_walks_off_a_broken_active() {
     };
     crate::profile::save_app_state(&config.state).expect("persist state");
 
-    let action = auto_switch_if_needed(&mut config, None).expect("auto switch");
+    let (config, action) = through_handle(config, |h| {
+        auto_switch_if_needed(h, None).expect("auto switch")
+    });
     assert_eq!(
         action,
         Some(SwitchAction::To("b".to_string())),
@@ -410,6 +668,7 @@ fn auto_switch_if_needed_hops_off_a_scoped_blocked_active() {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
     let mk = |name: &str, scoped: Vec<ScopedWindow>| {
@@ -451,7 +710,7 @@ fn auto_switch_if_needed_hops_off_a_scoped_blocked_active() {
     )
     .unwrap();
 
-    let mut config = AppConfig {
+    let config = AppConfig {
         state: AppState {
             active_profile: Some("a".into()),
             profiles: vec!["a".into(), "b".into()],
@@ -462,7 +721,9 @@ fn auto_switch_if_needed_hops_off_a_scoped_blocked_active() {
     };
     crate::profile::save_app_state(&config.state).expect("persist state");
 
-    let action = auto_switch_if_needed(&mut config, None).expect("auto switch");
+    let (config, action) = through_handle(config, |h| {
+        auto_switch_if_needed(h, None).expect("auto switch")
+    });
     assert_eq!(
         action,
         Some(SwitchAction::To("b".to_string())),
@@ -492,6 +753,7 @@ fn auto_switch_if_needed_does_not_hop_a_scoped_blocked_active_onto_a_canceled_me
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
     let mut a = Profile::new("a".to_string(), None, None);
@@ -541,7 +803,7 @@ fn auto_switch_if_needed_does_not_hop_a_scoped_blocked_active_onto_a_canceled_me
     )
     .unwrap();
 
-    let mut config = AppConfig {
+    let config = AppConfig {
         state: AppState {
             active_profile: Some("a".into()),
             profiles: vec!["a".into(), "b".into()],
@@ -551,7 +813,9 @@ fn auto_switch_if_needed_does_not_hop_a_scoped_blocked_active_onto_a_canceled_me
         profiles: vec![a, b],
     };
 
-    let action = auto_switch_if_needed(&mut config, None).expect("auto switch");
+    let (config, action) = through_handle(config, |h| {
+        auto_switch_if_needed(h, None).expect("auto switch")
+    });
     assert_eq!(
         action, None,
         "a scoped-blocked active must not hop onto a canceled member reading idle headroom"
@@ -579,6 +843,7 @@ fn auto_switch_if_needed_keeps_a_scoped_blocked_sink_parked() {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
     let mut a = Profile::new("a".to_string(), None, None);
@@ -612,7 +877,7 @@ fn auto_switch_if_needed_keeps_a_scoped_blocked_sink_parked() {
     )
     .unwrap();
 
-    let mut config = AppConfig {
+    let config = AppConfig {
         state: AppState {
             active_profile: Some("a".into()),
             profiles: vec!["a".into(), "b".into()],
@@ -622,9 +887,184 @@ fn auto_switch_if_needed_keeps_a_scoped_blocked_sink_parked() {
         profiles: vec![a, b],
     };
 
-    let action = auto_switch_if_needed(&mut config, None).expect("auto switch");
+    let (config, action) = through_handle(config, |h| {
+        auto_switch_if_needed(h, None).expect("auto switch")
+    });
     assert_eq!(action, None, "a pinned sink stays parked");
     assert!(config.is_active(&crate::profile::ProfileName::from("a")));
+}
+
+/// The h3-probe fixture shape: third-party base_url-only profiles (no
+/// credentials, no network path), persisted through the real writers. `a` is
+/// the active chain head, `b` the chain's second member, `c` the explicit
+/// writer's target. `active_util`/`sibling_util` pick the decision — a clear
+/// sibling yields `To("b")`, an exhausted one under `switch_off_when_spent`
+/// yields `Off`.
+fn seed_auto_dispatch_fixture(active_util: f64, sibling_util: f64, wrap_off: bool) -> AppConfig {
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+    let mk = |name: &str, util: f64| {
+        let mut p = Profile::new(
+            name.to_string(),
+            Some("https://api.deepseek.com".to_string()),
+            None,
+        );
+        p.fallback_threshold = Some(95.0);
+        p.usage = Some(UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: util,
+                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+            }),
+            ..Default::default()
+        });
+        crate::profile::save_profile(&p).expect("persist profile fixture");
+        p
+    };
+    let a = mk("a", active_util);
+    let b = mk("b", sibling_util);
+    let c = mk("c", 10.0);
+    let state = AppState {
+        profiles: ["a", "b", "c"].into_iter().map(Into::into).collect(),
+        fallback_chain: ["a", "b"].into_iter().map(Into::into).collect(),
+        active_profile: Some("a".into()),
+        switch_off_when_spent: wrap_off,
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist fixture state");
+    AppConfig {
+        state,
+        profiles: vec![a, b, c],
+    }
+}
+
+/// Drive one decision/dispatch ordering cell: arm the rendezvous for
+/// `expected`, run the REAL `auto_switch_if_needed` on its own thread, release
+/// a REAL `switch_profile(&disk_handle, "c")` into the interval after the
+/// decision, and assert the writer waits out the automatic transaction and
+/// lands last. The bounded wait is a negative observation discharged by the
+/// join: the seam sits at the decision/dispatch boundary inside the hold, so
+/// a shape that releases State between the two lets the writer finish inside
+/// the window and reds the blocked-witness assert here; a shape that instead
+/// moves the boundary away from the seam falls through to the final
+/// persisted-state assert.
+fn assert_explicit_switch_waits_out_the_auto_transaction(
+    expected: crate::fallback::SwitchAction,
+    final_active: &str,
+) {
+    let wrap_off = expected == crate::fallback::SwitchAction::Off;
+    let sibling_util = if wrap_off { 96.0 } else { 10.0 };
+    let config = seed_auto_dispatch_fixture(96.0, sibling_util, wrap_off);
+
+    let handle: crate::profile::ConfigHandle =
+        std::sync::Arc::new(crate::lockorder::RankedMutex::new(config));
+    let auto_handle = std::sync::Arc::clone(&handle);
+    let (decision_rx, permit_tx) =
+        crate::fallback::install_auto_decision_rendezvous(expected.clone());
+    let auto_worker =
+        std::thread::spawn(move || crate::fallback::auto_switch_if_needed(&auto_handle, None));
+
+    let reached = decision_rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the automatic actor reached the decision/dispatch boundary");
+    assert_eq!(
+        reached.action, expected,
+        "the fixture forces exactly this decision"
+    );
+
+    let (explicit_done_tx, explicit_done_rx) = std::sync::mpsc::channel::<()>();
+    // Registered so a red that unwinds the driver while the writer is still
+    // queued on the state lock still joins it BEFORE `HomeSandbox::drop`
+    // clears the home override — the writer's switch must never resolve
+    // against the operator's real `~/.clauth`.
+    let worker_done = crate::testutil::register_background_task();
+    let explicit_worker = std::thread::spawn(move || {
+        let writer_handle = switch_handle_from_disk();
+        let result = switch_profile(&writer_handle, &"c".into());
+        let _ = explicit_done_tx.send(());
+        let _ = worker_done.send(());
+        result
+    });
+
+    match explicit_done_rx.recv_timeout(std::time::Duration::from_secs(3)) {
+        Ok(()) => panic!(
+            "the explicit switch completed while the automatic decision-and-dispatch \
+             transaction held State: the dispatch left the decision's state hold"
+        ),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        Err(e) => panic!("unexpected channel error {e:?}"),
+    }
+    assert_eq!(
+        persisted_active(),
+        "a",
+        "the explicit switch has not landed while the transaction holds State"
+    );
+
+    permit_tx.send(()).expect("release the automatic dispatch");
+    let auto_result = auto_worker
+        .join()
+        .expect("the automatic actor did not panic")
+        .expect("the automatic switch succeeded");
+    explicit_worker
+        .join()
+        .expect("the explicit writer did not panic")
+        .expect("the explicit switch succeeded");
+    assert_eq!(
+        auto_result,
+        Some(expected),
+        "the automatic dispatch applied its decision"
+    );
+    assert_eq!(
+        persisted_active(),
+        final_active,
+        "the explicit switch that waited out the transaction lands last and wins"
+    );
+}
+
+/// The post-decision gap: an explicit switch (CLI/TUI/MCP) released into the
+/// interval between the automatic decision and its dispatch must wait for the
+/// transaction and win — not complete inside the gap and then be overwritten
+/// by the already-made decision. The shape that returned the decision out of
+/// the state hold, dropped the config guard, and let the dispatch wrappers
+/// re-take both locks left a real interval exactly there (the h3 probe
+/// measured the automatic's stale `To("b")` persisting over the operator's
+/// `c`).
+#[test]
+fn an_explicit_switch_cannot_slip_between_the_auto_decision_and_its_dispatch() {
+    let _home = HomeSandbox::new();
+    assert_explicit_switch_waits_out_the_auto_transaction(
+        crate::fallback::SwitchAction::To("b".to_string()),
+        "c",
+    );
+}
+
+/// The Off dispatch arm shares the gap the `To` arm has: wrap-off mode, the
+/// whole chain spent, no sink — the decision is `Off`, and an explicit switch
+/// released after that decision must still wait out the transaction and land.
+#[test]
+fn an_explicit_switch_cannot_slip_between_the_auto_off_decision_and_its_dispatch() {
+    let _home = HomeSandbox::new();
+    assert_explicit_switch_waits_out_the_auto_transaction(crate::fallback::SwitchAction::Off, "c");
+}
+
+/// CONTROL, green before and after the fix: a healthy active below its
+/// threshold yields no decision, the call dispatches nothing and republishes
+/// nothing, and a following explicit switch lands and stays.
+#[test]
+fn auto_switch_with_headroom_yields_no_dispatch_and_leaves_an_explicit_switch_in_place() {
+    let home = HomeSandbox::new();
+    let config = seed_auto_dispatch_fixture(10.0, 10.0, false);
+
+    let (_config, action) = through_handle(config, |h| {
+        crate::fallback::auto_switch_if_needed(h, None).expect("auto decision")
+    });
+    assert_eq!(action, None, "a healthy active yields no decision");
+    assert!(
+        !home.home().join(".clauth").join("status.json").exists(),
+        "no decision means no dispatch and no republish"
+    );
+
+    let writer_handle = switch_handle_from_disk();
+    switch_profile(&writer_handle, &"c".into()).expect("explicit switch lands");
+    assert_eq!(persisted_active(), "c");
 }
 
 #[test]
@@ -895,6 +1335,7 @@ fn overwrite_captured_profile_keeps_config_and_history_swaps_credentials() {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     save_profile(&target).expect("save target");
@@ -935,6 +1376,7 @@ fn overwrite_captured_profile_keeps_config_and_history_swaps_credentials() {
                 expires_at: None,
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         }),
         base_url: Some("https://api.example.com".to_string()),
@@ -1046,6 +1488,7 @@ fn browser_reauth_on_a_third_party_profile_keeps_its_endpoint_and_key() {
                 expires_at: None,
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         }
     }
@@ -1169,6 +1612,7 @@ fn a_switch_after_a_switch_off_does_not_inherit_the_departed_accounts_env() {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     let mut incoming = Profile::new(
@@ -1180,7 +1624,7 @@ fn a_switch_after_a_switch_off_does_not_inherit_the_departed_accounts_env() {
     save_profile(&departing).expect("save departing");
     save_profile(&incoming).expect("save incoming");
 
-    let mut config = AppConfig {
+    let config = AppConfig {
         state: AppState {
             profiles: vec!["departing".into(), "incoming".into()],
             active_profile: Some("departing".into()),
@@ -1196,14 +1640,16 @@ fn a_switch_after_a_switch_off_does_not_inherit_the_departed_accounts_env() {
     crate::claude::apply_profile_to_claude_settings(departing_ref, &[])
         .expect("seed the departing account's env into the live settings");
 
-    switch_off(&mut config).expect("switch off");
+    let (config, ()) = through_handle(config, |h| switch_off(h).expect("switch off"));
     assert_eq!(
         config.state.active_profile, None,
         "fixture: the marker must be cleared, which is what the switch then reads"
     );
 
-    switch_profile(&mut config, &crate::profile::ProfileName::from("incoming"))
-        .expect("switch to the incoming account");
+    through_handle(config, |h| {
+        switch_profile(h, &crate::profile::ProfileName::from("incoming"))
+            .expect("switch to the incoming account");
+    });
 
     let settings = crate::profile::claude_dir()
         .ok()
@@ -1235,6 +1681,7 @@ fn browser_reauth_keeps_a_generic_endpoint_and_key() {
                 expires_at: None,
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         }
     }
@@ -1363,6 +1810,7 @@ fn an_env_token_profiles_endpoint_survives_reauth_and_the_next_load() {
                         expires_at: None,
                         scopes: None,
                         subscription_type: None,
+                        ..crate::profile::OAuthToken::default_extra()
                     }),
                 }),
                 base_url: None,
@@ -1432,6 +1880,7 @@ fn the_auto_activate_arm_writes_a_preserved_endpoint_into_the_live_settings() {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     save_profile(&ds).expect("save ds");
@@ -1474,6 +1923,7 @@ fn the_auto_activate_arm_writes_a_preserved_endpoint_into_the_live_settings() {
                     expires_at: None,
                     scopes: None,
                     subscription_type: None,
+                    ..crate::profile::OAuthToken::default_extra()
                 }),
             }),
             base_url: None,
@@ -1531,10 +1981,11 @@ fn a_fresh_capture_after_a_switch_off_strips_the_departed_accounts_env() {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     save_profile(&departing).expect("save departing");
-    let mut config = AppConfig {
+    let config = AppConfig {
         state: AppState {
             profiles: vec!["departing".into()],
             active_profile: Some("departing".into()),
@@ -1549,7 +2000,7 @@ fn a_fresh_capture_after_a_switch_off_strips_the_departed_accounts_env() {
     crate::claude::apply_profile_to_claude_settings(departing_ref, &[])
         .expect("seed the departing account's env into the live settings");
 
-    switch_off(&mut config).expect("switch off");
+    let (mut config, ()) = through_handle(config, |h| switch_off(h).expect("switch off"));
     assert_eq!(
         config.state.active_profile, None,
         "fixture: the marker must be cleared, which is what the capture then reads"
@@ -1558,6 +2009,7 @@ fn a_fresh_capture_after_a_switch_off_strips_the_departed_accounts_env() {
     capture_into_profile(
         &mut config,
         "incoming".to_string(),
+        None,
         login_snapshot("rt-incoming", None),
     )
     .expect("capture the incoming account");
@@ -1598,10 +2050,11 @@ fn a_tui_create_account_after_a_switch_off_strips_the_departed_accounts_env() {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     save_profile(&departing).expect("save departing");
-    let mut config = AppConfig {
+    let config = AppConfig {
         state: AppState {
             profiles: vec!["departing".into()],
             active_profile: Some("departing".into()),
@@ -1616,7 +2069,7 @@ fn a_tui_create_account_after_a_switch_off_strips_the_departed_accounts_env() {
     crate::claude::apply_profile_to_claude_settings(departing_ref, &[])
         .expect("seed the departing account's env into the live settings");
 
-    switch_off(&mut config).expect("switch off");
+    let (mut config, ()) = through_handle(config, |h| switch_off(h).expect("switch off"));
     assert_eq!(
         config.state.active_profile, None,
         "fixture: the marker must be cleared, which is what the commit then reads"
@@ -1633,6 +2086,7 @@ fn a_tui_create_account_after_a_switch_off_strips_the_departed_accounts_env() {
                 expires_at: None,
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         },
         None,
@@ -1774,6 +2228,7 @@ fn browser_reauth_does_not_keep_an_endpoint_with_no_key_behind_it() {
                     expires_at: None,
                     scopes: None,
                     subscription_type: None,
+                    ..crate::profile::OAuthToken::default_extra()
                 }),
             }),
             base_url: None,
@@ -1818,6 +2273,7 @@ fn browser_reauth_on_an_active_third_party_profile_keeps_the_live_endpoint() {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     save_profile(&ds).expect("save ds");
@@ -1843,6 +2299,7 @@ fn browser_reauth_on_an_active_third_party_profile_keeps_the_live_endpoint() {
                     expires_at: None,
                     scopes: None,
                     subscription_type: None,
+                    ..crate::profile::OAuthToken::default_extra()
                 }),
             }),
             base_url: None,
@@ -1885,6 +2342,7 @@ fn overwrite_still_replaces_the_endpoint_set_outside_the_preserve_arm() {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     let ds = Profile::new(
@@ -1914,6 +2372,7 @@ fn overwrite_still_replaces_the_endpoint_set_outside_the_preserve_arm() {
                     expires_at: None,
                     scopes: None,
                     subscription_type: None,
+                    ..crate::profile::OAuthToken::default_extra()
                 }),
             }),
             base_url: None,
@@ -1986,6 +2445,7 @@ fn a_credentials_less_recapture_still_drops_the_stored_chain() {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     save_profile(&acme).expect("save acme");
@@ -2141,6 +2601,7 @@ fn login_snapshot(refresh: &str, account_uuid: Option<&str>) -> CaptureSnapshot 
                 expires_at: None,
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         }),
         base_url: None,
@@ -2187,6 +2648,7 @@ fn capture_into_profile_anchors_the_account_it_committed() {
     capture_into_profile(
         &mut config,
         "fresh".to_string(),
+        None,
         login_snapshot("minted", Some("uuid-fresh")),
     )
     .expect("capture");
@@ -2195,6 +2657,330 @@ fn capture_into_profile_anchors_the_account_it_committed() {
         anchor_of("fresh").as_deref(),
         Some("uuid-fresh"),
         "a new account is anchored by the login that created it"
+    );
+}
+
+// ── first-account create over a foreign live login (issue #72) ────────────────
+
+/// The #72 fixture: `claude` itself logged in on this box, so the live
+/// `.credentials.json` is a plain file holding a login clauth never saved, and
+/// clauth holds zero accounts.
+fn foreign_plain_live_login() -> std::path::PathBuf {
+    let live = crate::profile::claude_dir()
+        .expect("claude dir")
+        .join(".credentials.json");
+    std::fs::create_dir_all(live.parent().expect("parent")).expect("mkdir .claude");
+    std::fs::write(
+        &live,
+        serde_json::to_vec(&ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: "cc-own-access".to_string(),
+                refresh_token: Some("cc-own-refresh".to_string()),
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
+            }),
+        })
+        .expect("serialize live login"),
+    )
+    .expect("write live login");
+    live
+}
+
+fn empty_config() -> AppConfig {
+    AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    }
+}
+
+/// The refusal the issue reports, on `capture_into_profile`'s arm: the message
+/// must name the two actions that actually save the login (never the divergence
+/// modal, unreachable at zero accounts), and nothing may survive the attempt.
+#[test]
+fn first_capture_over_a_foreign_live_login_refuses_and_rolls_back() {
+    let _home = HomeSandbox::new();
+    let live = foreign_plain_live_login();
+    save_app_state(&AppState::default()).expect("persist the empty state");
+    let mut config = empty_config();
+
+    let err = capture_into_profile(
+        &mut config,
+        "work".to_string(),
+        None,
+        login_snapshot("minted-refresh", None),
+    )
+    .expect_err("the guarded link must refuse over a foreign live file");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("clauth capture"),
+        "names the cli way out: {msg}"
+    );
+    assert!(
+        msg.contains("+ capture current login"),
+        "names the tui row: {msg}"
+    );
+    assert!(
+        msg.contains("rolled back"),
+        "says the create was rolled back: {msg}"
+    );
+    assert!(
+        !msg.contains("divergence"),
+        "the zero-account site must not point at the divergence modal: {msg}"
+    );
+    // The CLI error printer shows the whole chain in Debug (`Error: {e:?}`),
+    // so the chain must carry the refusal WITHOUT the guard's divergence
+    // pointer — the exact output surface the issue quoted.
+    let debug = format!("{err:?}");
+    assert!(
+        debug.contains("refusing to replace"),
+        "the guard's own refusal rides along as the cause, unmasked: {debug}"
+    );
+    assert!(
+        !debug.contains("resolve the divergence"),
+        "the CLI chain must not carry the divergence pointer: {debug}"
+    );
+
+    assert!(
+        !profile_dir(&ProfileName::from("work"))
+            .expect("dir")
+            .exists(),
+        "no orphan profile dir"
+    );
+    assert!(
+        config.profiles.is_empty() && config.state.profiles.is_empty(),
+        "in-memory config matches disk again"
+    );
+    let state_toml = std::fs::read_to_string(
+        crate::profile::clauth_dir()
+            .expect("clauth dir")
+            .join("profiles.toml"),
+    )
+    .expect("profiles.toml readable");
+    assert!(
+        !state_toml.contains("work"),
+        "profiles.toml does not list it"
+    );
+    assert!(
+        live.symlink_metadata()
+            .is_ok_and(|m| !m.file_type().is_symlink()),
+        "the foreign live file is untouched"
+    );
+}
+
+/// The same refusal on `create_profile_from_login`'s arm — the Setup tab's
+/// `+ new` → login → create path the issue reproduces.
+#[test]
+fn first_create_from_login_over_a_foreign_live_login_refuses_and_rolls_back() {
+    let _home = HomeSandbox::new();
+    let live = foreign_plain_live_login();
+    save_app_state(&AppState::default()).expect("persist the empty state");
+    let mut config = empty_config();
+    let minted = ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "minted-access".to_string(),
+            refresh_token: Some("minted-refresh".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    };
+
+    let err = create_profile_from_login(&mut config, "work".to_string(), None, minted, None)
+        .expect_err("the guarded link must refuse over a foreign live file");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("clauth capture"),
+        "names the cli way out: {msg}"
+    );
+    assert!(
+        !msg.contains("divergence"),
+        "the zero-account site must not point at the divergence modal: {msg}"
+    );
+    let debug = format!("{err:?}");
+    assert!(
+        debug.contains("refusing to replace"),
+        "the guard's own refusal rides along as the cause, unmasked: {debug}"
+    );
+    assert!(
+        !debug.contains("resolve the divergence"),
+        "the CLI chain must not carry the divergence pointer: {debug}"
+    );
+    assert!(
+        !profile_dir(&ProfileName::from("work"))
+            .expect("dir")
+            .exists(),
+        "no orphan profile dir"
+    );
+    assert!(
+        config.profiles.is_empty() && config.state.profiles.is_empty(),
+        "in-memory config matches disk again"
+    );
+    assert!(
+        live.symlink_metadata()
+            .is_ok_and(|m| !m.file_type().is_symlink()),
+        "the foreign live file is untouched"
+    );
+}
+
+/// The reporter's fixed flow: `clauth capture work` over the foreign plain file
+/// saves the login, becomes the active account, and the live path ends up
+/// clauth's own link.
+#[test]
+fn capture_current_login_saves_a_foreign_live_login_as_the_first_account() {
+    let _home = HomeSandbox::new();
+    let live = foreign_plain_live_login();
+    let mut config = empty_config();
+
+    let became_active = capture_current_login(&mut config, "work").expect("capture");
+
+    assert!(became_active, "the first profile auto-activates");
+    assert_eq!(config.state.active_profile.as_deref(), Some("work"));
+    assert!(
+        live.symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_symlink()),
+        "the live path is now clauth's link"
+    );
+    assert_eq!(
+        crate::claude::classify_credentials_link(&ProfileName::from("work")).expect("classify"),
+        crate::claude::LinkState::LinkedTo,
+        "the account the login was saved under owns the live slot"
+    );
+}
+
+/// A logged-out box (no live file at all) must refuse rather than persist an
+/// empty profile behind a success line.
+#[test]
+fn capture_current_login_refuses_when_nothing_is_live() {
+    let _home = HomeSandbox::new();
+    let mut config = empty_config();
+
+    let err = capture_current_login(&mut config, "work").expect_err("nothing to capture");
+
+    assert_eq!(err.to_string(), "no live login found to capture");
+    assert!(
+        !profile_dir(&ProfileName::from("work"))
+            .expect("dir")
+            .exists(),
+        "nothing written"
+    );
+    assert!(config.profiles.is_empty(), "no in-memory record either");
+}
+
+#[test]
+fn capture_current_login_refuses_an_existing_name_pointing_at_login() {
+    let _home = HomeSandbox::new();
+    foreign_plain_live_login();
+    let existing = Profile::new("work".to_string(), None, None);
+    save_profile(&existing).expect("save existing");
+    let mut config = empty_config();
+    config.add(existing);
+
+    // Case-different spelling: the refusal must name the canonical existing
+    // profile, not mint a second one.
+    let err = capture_current_login(&mut config, "WORK").expect_err("duplicate refused");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("clauth login work"),
+        "points at the re-auth verb with the canonical name: {msg}"
+    );
+    assert_eq!(config.profiles.len(), 1, "no second profile added");
+}
+
+/// A capture beside an existing active account neither activates (that is the
+/// first-account arm) nor relinks — the live slot is left exactly as it was.
+/// The live login must be foreign to EVERY profile: one another profile owns
+/// is refused by the ownership gate, not captured.
+#[test]
+fn capture_beside_an_active_account_leaves_the_active_alone() {
+    let _home = HomeSandbox::new();
+    // A live re-login no profile owns yet: the CC-side `/login` the active
+    // account must not consume just because another capture happened.
+    let live = crate::profile::claude_dir()
+        .expect("claude dir")
+        .join(".credentials.json");
+    std::fs::create_dir_all(live.parent().expect("parent")).expect("mkdir .claude");
+    std::fs::write(
+        &live,
+        serde_json::to_vec(&ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: "uncaptured-access".to_string(),
+                refresh_token: Some("uncaptured-refresh".to_string()),
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
+            }),
+        })
+        .expect("serialize live login"),
+    )
+    .expect("write live login");
+    let mut first = Profile::new("first".to_string(), None, None);
+    first.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "first-access".to_string(),
+            refresh_token: Some("first-refresh".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    save_profile(&first).expect("save first");
+    let mut config = empty_config();
+    config.add(first);
+    config.state.active_profile = Some(ProfileName::from("first"));
+
+    let became_active = capture_current_login(&mut config, "work").expect("capture");
+
+    assert!(!became_active, "a later profile needs an explicit switch");
+    assert_eq!(config.state.active_profile.as_deref(), Some("first"));
+    assert!(
+        live.symlink_metadata()
+            .is_ok_and(|m| !m.file_type().is_symlink()),
+        "the live file is left exactly as it was"
+    );
+}
+
+/// The CLI's twin of the TUI's capture-ownership confirm: a live login another
+/// profile already owns must be refused by name, not duplicated silently.
+#[test]
+fn capture_current_login_refuses_a_login_an_existing_profile_owns() {
+    let _home = HomeSandbox::new();
+    let live = foreign_plain_live_login();
+    let mut owner = Profile::new("first".to_string(), None, None);
+    owner.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "cc-own-access".to_string(),
+            refresh_token: Some("cc-own-refresh".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    save_profile(&owner).expect("save owner");
+    let mut config = empty_config();
+    config.add(owner);
+    config.state.active_profile = Some(ProfileName::from("first"));
+
+    let err = capture_current_login(&mut config, "work").expect_err("owned login refused");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("'first'") && msg.contains("clauth first"),
+        "names the owning profile and the switch to it: {msg}"
+    );
+    assert_eq!(config.profiles.len(), 1, "no duplicate profile minted");
+    assert!(
+        live.symlink_metadata()
+            .is_ok_and(|m| !m.file_type().is_symlink()),
+        "the live file is untouched"
     );
 }
 
@@ -2374,6 +3160,7 @@ fn overwrite_captured_profile_clears_auth_broken_quarantine() {
                 expires_at: None,
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         }),
         base_url: None,
@@ -2416,6 +3203,7 @@ fn overwrite_captured_profile_reapplies_live_state_when_active() {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     save_profile(&acme).expect("save acme");
@@ -2491,6 +3279,7 @@ fn overwriting_the_active_profile_replaces_a_regular_live_file() {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     save_profile(&acme).expect("save acme");
@@ -2528,6 +3317,7 @@ fn overwriting_the_active_profile_replaces_a_regular_live_file() {
                 expires_at: None,
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         }),
         base_url: None,
@@ -2572,6 +3362,7 @@ fn overwriting_the_active_profile_with_no_credentials_clears_a_regular_live_file
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     save_profile(&acme).expect("save acme");
@@ -3391,6 +4182,7 @@ fn enable_clears_the_flag_leaving_everything_else_byte_identical() {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     save_profile(&profile).expect("save profile");
@@ -3619,6 +4411,7 @@ fn clear_profile_credentials_blanks_active_profile_keeping_shell() {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     save_profile(&acct).expect("save acct");
@@ -3712,6 +4505,7 @@ fn clear_profile_credentials_non_active_and_no_sidecar_resurrection() {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
 
@@ -3841,7 +4635,7 @@ fn switch_off_also_deletes_stale_oauth_account_block() {
     crate::claude::link_profile_credentials(&crate::profile::ProfileName::from("acct"))
         .expect("link acct live");
 
-    let mut config = AppConfig {
+    let config = AppConfig {
         state: AppState {
             profiles: vec!["acct".into()],
             active_profile: Some("acct".into()),
@@ -3850,7 +4644,7 @@ fn switch_off_also_deletes_stale_oauth_account_block() {
         profiles: vec![profile],
     };
 
-    switch_off(&mut config).expect("switch_off");
+    let (config, ()) = through_handle(config, |h| switch_off(h).expect("switch_off"));
 
     assert!(config.state.active_profile.is_none());
     let after: serde_json::Value =
@@ -3883,7 +4677,7 @@ fn switch_off_on_diverged_file_keeps_profile_snapshot_and_drops_login() {
     )
     .expect("write diverged live file");
 
-    let mut config = AppConfig {
+    let config = AppConfig {
         state: AppState {
             profiles: vec!["acct".into()],
             active_profile: Some("acct".into()),
@@ -3892,7 +4686,7 @@ fn switch_off_on_diverged_file_keeps_profile_snapshot_and_drops_login() {
         profiles: vec![profile],
     };
 
-    switch_off(&mut config).expect("switch_off");
+    let (config, ()) = through_handle(config, |h| switch_off(h).expect("switch_off"));
 
     assert!(config.state.active_profile.is_none());
     assert!(
@@ -3917,6 +4711,7 @@ fn oauth_creds(access: &str) -> crate::profile::ClaudeCredentials {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     }
 }
@@ -3991,6 +4786,7 @@ fn switch_cli_refuses_dead_target_with_login_hint() {
             expires_at: Some(1), // epoch-ms 1 → long expired
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
 
@@ -4029,6 +4825,7 @@ mod identify_live_login_owner {
                 expires_at: None,
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         }
     }
@@ -4223,6 +5020,7 @@ mod identify_live_login_owner {
                 expires_at: None,
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         }
     }
@@ -4330,6 +5128,111 @@ fn a_console_login_stores_the_session_and_leaves_the_api_key_alone() {
     assert!(loaded.console.is_some(), "the session still landed");
 }
 
+/// The endpoint edit drops the third-party DISK cache with the in-memory
+/// stats: `bootstrap_third_party` reseeds a leftover cache `Fresh` on the
+/// restart/boot paths, and the usage-store mirror drives the auto-switch
+/// walk off the reseed. A live process's in-memory mirror entry survives
+/// until the profile's next fetch — the boundary the src comment names.
+#[test]
+fn an_endpoint_edit_drops_the_third_party_disk_cache() {
+    let _home = HomeSandbox::new();
+    let stats = || crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 80.0)]);
+    let cache = |name: &str| {
+        crate::profile_cache::load_profile_cache::<crate::providers::ThirdPartyStats>(
+            &crate::profile::ProfileName::from(name),
+            crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        )
+    };
+
+    // A provider change drops it.
+    let p = Profile::new(
+        "cache-moved".to_string(),
+        Some("https://api.minimax.io/anthropic".to_string()),
+        Some("sk-cp-k".to_string()),
+    );
+    crate::profile::save_profile(&p).expect("save the profile");
+    crate::testutil::register_names(&["cache-moved", "cache-rotated"]);
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("cache-moved"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &stats(),
+    );
+    assert!(
+        cache("cache-moved").is_some(),
+        "the fixture wrote the old provider's cache"
+    );
+    let mut config = inactive_config(p);
+    edit_profile_endpoint(
+        &mut config,
+        &crate::profile::ProfileName::from("cache-moved"),
+        Some("https://api.z.ai/api/anthropic".to_string()),
+        Some("zai-key".to_string()),
+    )
+    .expect("edit_profile_endpoint");
+    assert!(
+        cache("cache-moved").is_none(),
+        "the old provider's cache does not survive the move"
+    );
+
+    // …and so does a rotated key on the SAME provider — the stats were
+    // fetched under a credential just replaced.
+    let p = Profile::new(
+        "cache-rotated".to_string(),
+        Some("https://api.minimax.io/anthropic".to_string()),
+        Some("sk-cp-k".to_string()),
+    );
+    crate::profile::save_profile(&p).expect("save the profile");
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("cache-rotated"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &stats(),
+    );
+    let mut config = inactive_config(p);
+    edit_profile_endpoint(
+        &mut config,
+        &crate::profile::ProfileName::from("cache-rotated"),
+        Some("https://api.minimax.io/anthropic".to_string()),
+        Some("sk-cp-rotated".to_string()),
+    )
+    .expect("edit_profile_endpoint");
+    assert!(
+        cache("cache-rotated").is_none(),
+        "a rotated key drops the stats fetched under the old one"
+    );
+
+    // The preset-apply path moves the endpoint without touching the key, and
+    // its own comment claims it re-derives the provider "exactly like
+    // `edit_profile_endpoint`" — the cache drop has to hold there too.
+    let p = Profile::new(
+        "cache-preset".to_string(),
+        Some("https://api.minimax.io/anthropic".to_string()),
+        Some("sk-cp-k".to_string()),
+    );
+    crate::profile::save_profile(&p).expect("save the profile");
+    crate::testutil::register_names(&["cache-preset"]);
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("cache-preset"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &stats(),
+    );
+    assert!(
+        cache("cache-preset").is_some(),
+        "the fixture wrote the old provider's cache"
+    );
+    let mut config = inactive_config(p);
+    edit_profile_preset(
+        &mut config,
+        &crate::profile::ProfileName::from("cache-preset"),
+        Some("https://api.z.ai/api/anthropic".to_string()),
+        crate::profile::ModelSettings::default(),
+    )
+    .expect("edit_profile_preset");
+    assert!(
+        cache("cache-preset").is_none(),
+        "a preset that moves the endpoint drops the old provider's cache"
+    );
+}
+
 /// `main.rs`'s reauth contract is that the snapshot clears the old type's
 /// leftovers. The console session is a FOURTH credential, and it is meaningless
 /// off Alibaba: left behind, an endpoint move parks a live Model Studio session
@@ -4421,4 +5324,169 @@ fn moving_the_endpoint_off_alibaba_clears_the_console_session() {
             .is_none(),
         "a reauth that moves the endpoint off Alibaba clears the session with it",
     );
+}
+
+#[test]
+fn a_late_commit_does_not_replace_a_newer_same_active_publication() {
+    let home = HomeSandbox::new();
+    seed_keyless_switch_profiles();
+
+    let p1 = switch_handle_from_disk();
+    let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            switch_profile_synced(&p1, &"b".into(), || {
+                reached_tx.send(()).expect("test awaits rendezvous");
+                release_rx
+                    .recv_timeout(SWITCH_PUBLISH_WAIT)
+                    .expect("test releases publication before the hang deadline");
+            })
+        });
+
+        reached_rx
+            .recv_timeout(SWITCH_PUBLISH_WAIT)
+            .expect("P1 built its body before the competing publications");
+        assert_eq!(persisted_active(), "b");
+
+        switch_profile(&switch_handle_from_disk(), &"c".into()).expect("P2 switches B to C");
+        assert_eq!(feed_active(&home), "c");
+
+        // A same-active change P1's frozen body cannot know: b's endpoint moves
+        // after P1 built, before P3 publishes.
+        crate::profile::save_profile(&Profile::new(
+            "b".to_string(),
+            Some("https://api.other.example".to_string()),
+            None,
+        ))
+        .expect("edit b after P1 built");
+
+        switch_profile(&switch_handle_from_disk(), &"b".into()).expect("P3 switches C back to B");
+        assert_eq!(feed_active(&home), "b");
+
+        release_tx.send(()).expect("release P1 commit");
+        worker
+            .join()
+            .expect("P1 worker did not panic")
+            .expect("P1 switch completed");
+    });
+
+    assert_eq!(persisted_active(), "b");
+    let body: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(home.home().join(".clauth/status.json")).expect("read status feed"),
+    )
+    .expect("status feed json");
+    let b_entry = body["profiles"]
+        .as_array()
+        .expect("feed profiles")
+        .iter()
+        .find(|entry| entry["name"] == "b")
+        .expect("feed b entry");
+    assert_eq!(
+        b_entry["base_url"],
+        serde_json::json!("https://api.other.example"),
+        "the frozen body must not overwrite P3's same-active publication"
+    );
+    assert_eq!(feed_active(&home), "b");
+}
+
+#[test]
+fn a_daemonless_publish_skips_when_a_later_switch_never_published() {
+    let home = HomeSandbox::new();
+    seed_keyless_switch_profiles();
+
+    // An older feed from before the switches: nothing newer lands while P1 is
+    // paused, so the publication-recency guard alone cannot explain a skip.
+    let feed = home.home().join(".clauth/status.json");
+    std::fs::write(&feed, br#"{"active_profile": "a", "sentinel": true}"#)
+        .expect("seed pre-switch feed");
+
+    let p1 = switch_handle_from_disk();
+    let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            switch_profile_synced(&p1, &"b".into(), || {
+                reached_tx.send(()).expect("test awaits rendezvous");
+                release_rx
+                    .recv_timeout(SWITCH_PUBLISH_WAIT)
+                    .expect("test releases publication before the hang deadline");
+            })
+        });
+
+        reached_rx
+            .recv_timeout(SWITCH_PUBLISH_WAIT)
+            .expect("P1 built its body before the competing switch");
+        {
+            // Hold the singleton so P2's own republish defers: P2 persists the
+            // switch, but no newer publication ever lands.
+            let _singleton = crate::daemon::hold_daemon_lock();
+            switch_profile(&switch_handle_from_disk(), &"c".into()).expect("P2 switches B to C");
+            assert_eq!(persisted_active(), "c");
+        }
+
+        release_tx.send(()).expect("release P1 commit");
+        worker
+            .join()
+            .expect("P1 worker did not panic")
+            .expect("P1 switch completed");
+    });
+
+    assert_eq!(persisted_active(), "c");
+    let body: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&feed).expect("reread feed"))
+            .expect("status feed json");
+    assert_eq!(
+        body["active_profile"],
+        serde_json::json!("a"),
+        "the stale body must not overwrite the feed while C is persisted"
+    );
+}
+
+#[test]
+fn the_daemonless_commit_serializes_on_the_state_flock() {
+    let home = HomeSandbox::new();
+    seed_keyless_switch_profiles();
+
+    let p1 = switch_handle_from_disk();
+    let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            switch_profile_synced(&p1, &"b".into(), || {
+                reached_tx.send(()).expect("test awaits rendezvous");
+                release_rx
+                    .recv_timeout(SWITCH_PUBLISH_WAIT)
+                    .expect("test releases publication before the hang deadline");
+            })
+        });
+
+        reached_rx
+            .recv_timeout(SWITCH_PUBLISH_WAIT)
+            .expect("P1 built its body before the state flock is taken");
+        // Hold the cross-process state flock: the commit must queue behind it,
+        // never write around it. Bound of this pin: it observes only a write
+        // that lands while another holder owns the flock, so a half-refactor
+        // that keeps the guards inside the hold but moves the write out stays
+        // green; no non-racy test can observe that shape from outside.
+        let state = crate::lock::StateLock::acquire().expect("test holds the state flock");
+        release_tx.send(()).expect("release P1 commit");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(
+            !home.home().join(".clauth/status.json").exists(),
+            "the commit must not write status.json while another holder owns the state flock"
+        );
+        drop(state);
+
+        worker
+            .join()
+            .expect("P1 worker did not panic")
+            .expect("P1 switch completed");
+    });
+
+    assert_eq!(persisted_active(), "b");
+    assert_eq!(feed_active(&home), "b");
 }

@@ -43,6 +43,7 @@ fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> Profile {
         fetch_status: None,
         provider: None,
         third_party_usage: None,
+        usage_stale: false,
     }
 }
 
@@ -84,6 +85,7 @@ fn auto_start_queue_view_resolves_slots_from_config_and_anchor() {
                 expires_at: None,
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         });
         p

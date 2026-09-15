@@ -2,12 +2,17 @@
 //! (`tests/inline/*.rs`). Defined once here rather than copied per module so the
 //! home-sandbox, mtime, and key-event scaffolding stays in a single place.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use utoipa::ToSchema;
+use utoipa::openapi::RefOr;
+use utoipa::openapi::schema::{
+    AdditionalProperties, Array, ArrayItems, Components, Object, Schema, SchemaType, Type,
+};
 
 /// RAII home sandbox: acquires `HOME_TEST_LOCK` and redirects `home_dir()` into
 /// a tempdir for its lifetime, clearing the override on drop (even on panic).
@@ -88,6 +93,22 @@ impl Drop for HomeSandbox {
             None => unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") },
         }
     }
+}
+
+/// Run a switch fn (`switch_profile`/`switch_off`/`auto_switch_if_needed`, all
+/// [`crate::profile::ConfigHandle`]-taking) over an owned `AppConfig` and hand
+/// the mutated value back. The fns lock internally and run their post-switch
+/// feed republish on the handle, so the test moves the value in and clones it
+/// out after — every later assert reads the post-switch state.
+pub(crate) fn through_handle<T>(
+    config: crate::profile::AppConfig,
+    run: impl FnOnce(&crate::profile::ConfigHandle) -> T,
+) -> (crate::profile::AppConfig, T) {
+    let handle: crate::profile::ConfigHandle =
+        std::sync::Arc::new(crate::lockorder::RankedMutex::new(config));
+    let out = run(&handle);
+    let config = handle.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    (config, out)
 }
 
 /// Completion signals for detached background tasks that have no joinable
@@ -444,6 +465,7 @@ pub(crate) fn rotation_fixture_config(
             expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     crate::profile::save_profile(&profile).expect("save profile");
@@ -872,6 +894,7 @@ pub(crate) fn blank_profile(name: &crate::profile::ProfileName) -> crate::profil
         credentials: None,
         usage: None,
         fetch_status: None,
+        usage_stale: false,
         provider: None,
         third_party_usage: None,
     }
@@ -898,6 +921,24 @@ pub(crate) fn write_usage_history(
         body.push('\n');
     }
     std::fs::write(&path, body).expect("write history");
+}
+
+/// Simulate a live `clauth start` session for `name`: a locked pid file in the
+/// profile's sessions dir under `home` reads as alive via
+/// `runtime::has_live_session`. The caller must keep the returned file alive for
+/// as long as the session should read as live — dropping it releases the flock.
+/// The explicit `home` pins the marker inside the caller's [`HomeSandbox`], the
+/// same tree `profile_dir` resolves under that sandbox.
+pub(crate) fn arm_live_session(home: &Path, name: &str) -> std::fs::File {
+    let sessions = home
+        .join(".clauth")
+        .join("profiles")
+        .join(name)
+        .join("sessions");
+    std::fs::create_dir_all(&sessions).expect("mkdir sessions");
+    let pid = crate::runtime::open_pid_file(&sessions.join("test-pid")).expect("open pid");
+    pid.lock().expect("lock pid");
+    pid
 }
 
 /// Put `names` in the on-disk profile list without creating profile content.
@@ -975,14 +1016,41 @@ pub(crate) const CAPTURED_TWO_WALLET_DS_CACHE: &str = r#"{"is_available":true,"r
 /// as before.
 pub(crate) const CAPTURED_ONE_WALLET_DS_CACHE: &str = r#"{"is_available":true,"rows":[{"label":"CNY balance","value":"","kind":"heading"},{"label":"api balance","value":"3640.55 CNY","kind":"body"},{"label":"granted","value":"0.00 CNY","kind":"body"},{"label":"topped up","value":"3640.55 CNY","kind":"body"}],"bars":[],"best_effort":false}"#;
 
+/// Parse a captured `third_party_cache.json`, re-anchor its bar stamps (see
+/// [`write_captured_third_party_cache`]), and hand back the re-serialized
+/// bytes — for a test whose route to disk is a raw file write rather than the
+/// production cache writer.
+pub(crate) fn reanchored_bars_cache_bytes(json: &str) -> Vec<u8> {
+    let mut parsed: crate::providers::ThirdPartyStats =
+        serde_json::from_str(json).expect("captured cache parses");
+    let now = crate::usage::now_epoch_secs();
+    for bar in &mut parsed.bars {
+        // Each bar is stamped now + its own window length, read off the label
+        // the provider itself wrote — not the captured stamp, whose offset
+        // from another bar's can be internally inconsistent (one capture held
+        // a 5h bar resetting days before its own 30d bar) and preserving it
+        // would re-create lapsed bars as real time moves. An unparseable label
+        // still gets a future stamp: a shape fixture is not a lapsed case.
+        let span = crate::usage::window_duration_secs(&bar.label).unwrap_or(3600);
+        bar.resets_at = Some(crate::usage::epoch_secs_to_iso(now + span));
+    }
+    serde_json::to_vec(&parsed).expect("re-serialized cache parses")
+}
+
 /// Parse a captured `third_party_cache.json` and write it at `name`'s
 /// sandboxed path through the production cache writer — the same route the
 /// fetch leg takes — so a consumer is driven by captured bytes, never a
 /// hand-built [`crate::providers::ThirdPartyStats`] that mirrors the reader's
-/// own guess.
+/// own guess. A captured bar's `resets_at` is an ABSOLUTE stamp, so real time
+/// drifting past it turns a fixture meant to exercise the bars SHAPE into a
+/// lapsed-window case the liveness gate legitimately drops: every parseable
+/// bar stamp is re-stamped at now plus its own window length (see
+/// [`reanchored_bars_cache_bytes`]), so a captured cache renders its shape
+/// forever and lapsed behaviour is pinned only by the tests that mean it.
 pub(crate) fn write_captured_third_party_cache(name: &str, json: &str) {
+    let bytes = reanchored_bars_cache_bytes(json);
     let parsed: crate::providers::ThirdPartyStats =
-        serde_json::from_str(json).expect("captured cache parses");
+        serde_json::from_slice(&bytes).expect("captured cache parses");
     crate::profile_cache::write_profile_cache(
         &crate::profile::ProfileName::from(name),
         crate::profile_cache::THIRD_PARTY_CACHE_FILE,
@@ -1232,3 +1300,383 @@ impl Drop for SlowClaude<'_> {
         }
     }
 }
+
+// ── Third-party stats fixtures ────────────────────────────────────────────────
+
+/// The `ThirdPartyStats` shell every typed-provider fixture builds: available,
+/// no rows, typed (never best-effort), carrying exactly the given bars — one
+/// definition so the non-bar fields cannot drift between test modules.
+pub(crate) fn stats_with_bars(
+    bars: Vec<crate::providers::UsageBar>,
+) -> crate::providers::ThirdPartyStats {
+    crate::providers::ThirdPartyStats {
+        is_available: true,
+        rows: Vec::new(),
+        bars,
+        plan: None,
+        endpoint: None,
+        best_effort: false,
+    }
+}
+
+/// One unstamped percentage bar — the shape a provider's `5h`/`7d` windows
+/// arrive as. [`bar_reset_in`] stamps one when a test needs liveness to hold.
+pub(crate) fn bar(label: &str, pct: f64) -> crate::providers::UsageBar {
+    crate::providers::UsageBar {
+        label: label.to_string(),
+        pct,
+        resets_at: None,
+        used: None,
+        total: None,
+    }
+}
+
+/// [`bar`] with a `resets_at` the given seconds into the future — a live
+/// window, for the surfaces that judge liveness off the stamp.
+pub(crate) fn bar_reset_in(
+    label: &str,
+    pct: f64,
+    secs_in_future: i64,
+) -> crate::providers::UsageBar {
+    crate::providers::UsageBar {
+        resets_at: Some(crate::usage::epoch_secs_to_iso(
+            crate::usage::now_epoch_secs() + secs_in_future,
+        )),
+        ..bar(label, pct)
+    }
+}
+
+/// Resolve a `$ref` through the component schemas, following ref chains until a
+/// concrete schema is reached.
+pub(crate) fn schema_deref<'a>(
+    schema: &'a RefOr<Schema>,
+    components: &'a BTreeMap<String, RefOr<Schema>>,
+) -> &'a Schema {
+    match schema {
+        RefOr::Ref(reference) => {
+            let name = reference
+                .ref_location
+                .strip_prefix("#/components/schemas/")
+                .unwrap_or_else(|| panic!("unexpected ref location {}", reference.ref_location));
+            let component = components
+                .get(name)
+                .unwrap_or_else(|| panic!("unresolved component {name}"));
+            schema_deref(component, components)
+        }
+        RefOr::T(schema) => schema,
+    }
+}
+
+/// The JSON type name a serialized value carries, with an integral number read
+/// as `integer` so a schema's `integer` admits only whole numbers.
+fn value_json_type(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(n) => {
+            if n.as_f64().is_some_and(|f| f.fract() == 0.0) {
+                "integer"
+            } else {
+                "number"
+            }
+        }
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+fn type_name(t: &Type) -> &'static str {
+    match t {
+        Type::Object => "object",
+        Type::String => "string",
+        Type::Integer => "integer",
+        Type::Number => "number",
+        Type::Boolean => "boolean",
+        Type::Array => "array",
+        Type::Null => "null",
+    }
+}
+
+/// The JSON type names a schema's `type` allows; empty for a typeless schema.
+fn allowed_type_names(schema_type: &SchemaType) -> Vec<&'static str> {
+    match schema_type {
+        SchemaType::Type(t) => vec![type_name(t)],
+        SchemaType::Array(ts) => ts.iter().map(type_name).collect(),
+        SchemaType::AnyValue => Vec::new(),
+    }
+}
+
+/// Whether `vtype` is admitted by one of the allowed names: `number` admits any
+/// numeric value, `integer` only integral ones.
+fn type_matches(vtype: &str, allowed: &[&str]) -> bool {
+    allowed.iter().any(|allowed| match *allowed {
+        "number" => vtype == "number" || vtype == "integer",
+        other => other == vtype,
+    })
+}
+
+/// Walk `value` against `schema`, resolving `$ref`s through the component map,
+/// and return the first mismatch named by its JSON path.
+fn walk(
+    value: &serde_json::Value,
+    schema: &RefOr<Schema>,
+    components: &BTreeMap<String, RefOr<Schema>>,
+    path: &str,
+) -> Result<(), String> {
+    match schema_deref(schema, components) {
+        Schema::Object(object) => object_agrees(value, object, components, path),
+        Schema::Array(array) => array_agrees(value, array, components, path),
+        Schema::OneOf(one_of) => {
+            if one_of
+                .items
+                .iter()
+                .any(|arm| walk(value, arm, components, path).is_ok())
+            {
+                Ok(())
+            } else {
+                Err(format!("{path}: the body {value} matches no oneOf arm"))
+            }
+        }
+        Schema::AnyOf(any_of) => {
+            if any_of
+                .items
+                .iter()
+                .any(|arm| walk(value, arm, components, path).is_ok())
+            {
+                Ok(())
+            } else {
+                Err(format!("{path}: the body {value} matches no anyOf arm"))
+            }
+        }
+        Schema::AllOf(all_of) => {
+            for arm in &all_of.items {
+                walk(value, arm, components, path)?;
+            }
+            Ok(())
+        }
+        _ => Err(format!(
+            "{path}: the schema is a shape the walk cannot check"
+        )),
+    }
+}
+
+/// Check `value` against a schema rendered as an [`Object`], which utoipa uses
+/// for every leaf type as well as for objects: the value's JSON type must be
+/// one the schema's `type` names, and an object value keeps today's key checks
+/// and recurses through `properties` and `additionalProperties`.
+fn object_agrees(
+    value: &serde_json::Value,
+    object: &Object,
+    components: &BTreeMap<String, RefOr<Schema>>,
+    path: &str,
+) -> Result<(), String> {
+    let allowed = allowed_type_names(&object.schema_type);
+    if allowed.is_empty() {
+        return Err(format!(
+            "{path}: the schema names no type, so the body cannot be checked"
+        ));
+    }
+    let vtype = value_json_type(value);
+    if !type_matches(vtype, &allowed) {
+        return Err(format!(
+            "{path}: the schema allows {} but the body is {vtype} ({value})",
+            allowed.join("|")
+        ));
+    }
+    if vtype == "object" {
+        check_object_body(
+            value.as_object().expect("json object"),
+            object,
+            components,
+            path,
+        )?;
+    }
+    Ok(())
+}
+
+fn check_object_body(
+    body: &serde_json::Map<String, serde_json::Value>,
+    object: &Object,
+    components: &BTreeMap<String, RefOr<Schema>>,
+    path: &str,
+) -> Result<(), String> {
+    for (property, property_schema) in &object.properties {
+        let property_path = format!("{path}.{property}");
+        if object.required.iter().any(|name| name == property) && !body.contains_key(property) {
+            return Err(format!(
+                "{property_path}: required schema property is absent from the body"
+            ));
+        }
+        if let Some(property_value) = body.get(property) {
+            walk(property_value, property_schema, components, &property_path)?;
+        }
+    }
+    for (key, key_value) in body {
+        if object.properties.contains_key(key) {
+            continue;
+        }
+        let key_path = format!("{path}.{key}");
+        match object.additional_properties.as_deref() {
+            Some(AdditionalProperties::RefOr(schema)) => {
+                walk(key_value, schema, components, &key_path)?;
+            }
+            Some(AdditionalProperties::FreeForm(_)) => {
+                return Err(format!(
+                    "{key_path}: additional properties are free-form, which the walk cannot check"
+                ));
+            }
+            None => {
+                return Err(format!("{key_path}: body key is absent from the schema"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn array_agrees(
+    value: &serde_json::Value,
+    array: &Array,
+    components: &BTreeMap<String, RefOr<Schema>>,
+    path: &str,
+) -> Result<(), String> {
+    let items = value
+        .as_array()
+        .ok_or_else(|| format!("{path}: the schema is an array but the body is {value}"))?;
+    if let ArrayItems::RefOrSchema(item_schema) = &array.items {
+        for (index, item) in items.iter().enumerate() {
+            walk(item, item_schema, components, &format!("{path}[{index}]"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Walk `value` against `schema`, resolving `$ref`s through the document's
+/// component schemas, and panic naming the JSON path of the first mismatch.
+pub(crate) fn schema_agrees(
+    value: &serde_json::Value,
+    schema: &RefOr<Schema>,
+    components: &Components,
+) {
+    if let Err(message) = walk(value, schema, &components.schemas, "$") {
+        panic!("{message}");
+    }
+}
+
+/// Derive the schema and component map from `T` and walk them against `value`:
+/// the one entry every body's schema-truth test calls, so the walk stays
+/// value-only and shared.
+pub(crate) fn schema_agrees_with_type<T: ToSchema>(value: &serde_json::Value) {
+    let mut schemas: Vec<(String, RefOr<Schema>)> = Vec::new();
+    T::schemas(&mut schemas);
+    schemas.push((T::name().into_owned(), T::schema()));
+    let mut components = Components::new();
+    components.schemas = schemas.into_iter().collect();
+    schema_agrees(value, &T::schema(), &components);
+}
+
+// ── daemon-route test harness ─────────────────────────────────────────────────
+//
+// The request/context helpers every daemon-route test module shares: the
+// control-device bearer constants, the profile seeders, the request builder,
+// and the router call. Defined once here rather than copied per
+// `tests/inline/*.rs` so a `Request` field or device-seeding change lands in
+// one place. Every consumer is a `#![cfg(unix)]` test module, so the whole
+// harness is unix-gated too: on the windows cross-lint it would otherwise read
+// as dead code under `-D warnings`.
+
+#[cfg(unix)]
+mod route_harness {
+    use std::net::SocketAddr;
+
+    use crate::daemon::api::devices::{self, Tier};
+    use crate::daemon::api::http::{Request, Response};
+    use crate::daemon::api::routes::{ApiContext, handle};
+    use crate::profile::{ClaudeCredentials, ConfigHandle, OAuthToken, Profile, save_profile};
+
+    /// The bearer of the control device every context below pairs.
+    pub(crate) const TOKEN: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    /// The device [`TOKEN`] authenticates as.
+    pub(crate) const DEVICE: &str = "test";
+    /// The bearer of a second device, which the tests that need one pair.
+    pub(crate) const OTHER_TOKEN: &str =
+        "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+
+    pub(crate) fn creds(access: &str) -> ClaudeCredentials {
+        ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: access.to_string(),
+                refresh_token: Some(format!("{access}-refresh")),
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
+            }),
+        }
+    }
+
+    pub(crate) fn stored_profile(name: &str) -> Profile {
+        let mut p = Profile::new(name.to_string(), None, None);
+        p.credentials = Some(creds(name));
+        save_profile(&p).expect("save profile");
+        p
+    }
+
+    /// A context over `config`, with [`TOKEN`] paired as the control device
+    /// [`DEVICE`].
+    pub(crate) fn ctx_with(config: ConfigHandle) -> std::sync::Arc<ApiContext> {
+        seed_device(DEVICE, Tier::Control, TOKEN);
+        let status_path = crate::profile::clauth_dir()
+            .expect("clauth dir")
+            .join("status.json");
+        ApiContext::for_tests(
+            config,
+            status_path,
+            None,
+            crate::daemon::api::panes::absent_probe(),
+        )
+    }
+
+    /// A request as the HTTP layer would hand it to the router.
+    pub(crate) fn req(method: &str, path: &str, bearer: Option<&str>, body: &str) -> Request {
+        let (path, query) = path.split_once('?').unwrap_or((path, ""));
+        Request {
+            method: method.to_string(),
+            path: path.to_string(),
+            query: query.to_string(),
+            bearer: bearer.map(str::to_string),
+            if_none_match: None,
+            body: body.as_bytes().to_vec(),
+            // Routing does not depend on this; the connection loop owns it.
+            keep_alive: true,
+        }
+    }
+
+    pub(crate) fn peer() -> SocketAddr {
+        SocketAddr::from(([192, 0, 2, 7], 50_000))
+    }
+
+    /// The router as most of these tests drive it: one fixed peer, the answer
+    /// alone. A test about which device the answer went to calls [`handle`].
+    pub(crate) fn call(ctx: &ApiContext, req: &Request) -> Response {
+        handle(ctx, req, peer()).response
+    }
+
+    pub(crate) fn seed_device(name: &str, tier: Tier, token: &str) {
+        devices::seed_for_tests(name, tier, token).expect("seed a device");
+    }
+
+    pub(crate) fn body_json(resp: &Response) -> serde_json::Value {
+        serde_json::from_slice(&resp.body).expect("response body is json")
+    }
+
+    /// Write a feed body to the context's `status.json`, for the tests that
+    /// stage a stale feed before driving a republish.
+    pub(crate) fn write_feed(ctx: &ApiContext, body: &str) {
+        std::fs::write(&ctx.status_path, body).expect("write status.json");
+    }
+}
+
+#[cfg(unix)]
+pub(crate) use route_harness::*;

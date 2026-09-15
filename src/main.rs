@@ -8,6 +8,7 @@ mod daemon;
 mod fallback;
 mod format;
 mod herdr;
+mod hook_context;
 mod hook_note;
 mod jobs_cli;
 mod jsonsync;
@@ -116,23 +117,42 @@ impl std::fmt::Display for HelpRendered {
 
 impl std::error::Error for HelpRendered {}
 
+/// A run a signal ended once its command had cleaned up after itself (`clauth
+/// devices pair` withdrawing its code). [`exit_code`] answers the shell's
+/// `128 + signal` with no `Error:` line, since the command already said what
+/// it did.
+#[derive(Debug)]
+pub(crate) struct Interrupted(pub(crate) i32);
+
+impl std::fmt::Display for Interrupted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "interrupted by signal {}", self.0)
+    }
+}
+
+impl std::error::Error for Interrupted {}
+
 /// Build a [`UsageError`] as an `anyhow::Error` for a dispatch arm to return.
 fn usage_error(msg: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(UsageError(msg.into()))
 }
 
 /// Map a dispatch outcome to a process exit code: 0 on success, 2 for a
-/// [`UsageError`] (bad flag/args) or an already-printed [`HelpRendered`], 1
-/// for any other failure. Prints the error exactly as anyhow's `Result`
-/// `Termination` did (`Error: {:?}`) — except the [`HelpRendered`] arm, whose
-/// message already reached stderr — so the message surface is unchanged now
-/// that `main` maps the code itself.
+/// [`UsageError`] (bad flag/args) or an already-printed [`HelpRendered`],
+/// `128 + signal` for an [`Interrupted`] run, 1 for any other failure. Prints
+/// the error exactly as anyhow's `Result` `Termination` did (`Error: {:?}`) —
+/// except the [`HelpRendered`] and [`Interrupted`] arms, whose commands already
+/// said what happened on stderr — so the message surface is unchanged now that
+/// `main` maps the code itself.
 pub(crate) fn exit_code(result: Result<()>) -> i32 {
     match result {
         Ok(()) => 0,
         Err(e) => {
             if e.downcast_ref::<HelpRendered>().is_some() {
                 return 2;
+            }
+            if let Some(Interrupted(signal)) = e.downcast_ref::<Interrupted>() {
+                return 128 + signal;
             }
             // `errln!`, so a reader that walked away from `2>&1 | head` still
             // gets this code rather than the 101 `eprintln!` panicked with.
@@ -165,6 +185,7 @@ fn dispatch(cli: Cli) -> Result<()> {
     match command {
         Command::Start(a) => cmd_start(&a.profile, &a.claude_args, a.isolation(), a.with_fallback),
         Command::Login(a) => cmd_login(a),
+        Command::Capture { profile } => cmd_capture(&profile),
         Command::Delete {
             profile,
             yes,
@@ -196,9 +217,21 @@ fn dispatch(cli: Cli) -> Result<()> {
             standby,
             replace,
             status,
+            listen,
+            cert,
+            key,
             // The default's explicit spelling: nothing to branch on.
             no_standby: _,
-        } => cmd_daemon(standby, replace, status),
+            dump_openapi,
+        } => cmd_daemon(
+            standby,
+            replace,
+            status,
+            listen,
+            daemon::api::tls::CertSource::from_flags(cert, key),
+            dump_openapi,
+        ),
+        Command::Devices { json, cmd } => cmd_devices(json, cmd),
         Command::Status {
             json: _,
             all,
@@ -221,15 +254,60 @@ fn dispatch(cli: Cli) -> Result<()> {
     }
 }
 
-fn cmd_daemon(standby: bool, replace: bool, status: bool) -> Result<()> {
+fn cmd_daemon(
+    standby: bool,
+    replace: bool,
+    status: bool,
+    listen: Option<std::net::SocketAddr>,
+    certs: daemon::api::tls::CertSource,
+    dump_openapi: bool,
+) -> Result<()> {
+    // The dump arm is first: it must return before any listener, certificate
+    // read, singleton claim or home access, so CI can pin the spec without a
+    // daemon.
+    if dump_openapi {
+        let mut stdout = std::io::stdout().lock();
+        return write_openapi_document(&mut stdout);
+    }
     if status {
         daemon::status_probe()
     } else if replace {
-        daemon::serve(daemon::StartMode::Replace)
+        daemon::serve(daemon::StartMode::Replace, listen, &certs)
     } else if standby {
-        daemon::serve(daemon::StartMode::Standby)
+        daemon::serve(daemon::StartMode::Standby, listen, &certs)
     } else {
-        daemon::serve(daemon::StartMode::ExitIfRunning)
+        daemon::serve(daemon::StartMode::ExitIfRunning, listen, &certs)
+    }
+}
+
+/// Write the OpenAPI document verbatim to `writer` — the exact bytes
+/// `GET /api/v1/openapi.json` serves, with no trailing newline or framing.
+/// Split out from [`cmd_daemon`] so the byte-for-byte contract is unit-testable
+/// without capturing stdout.
+fn write_openapi_document<W: std::io::Write>(writer: &mut W) -> Result<()> {
+    let document = daemon::api::routes::openapi_document_bytes().map_err(anyhow::Error::msg)?;
+    // The serializer always emits UTF-8; the check keeps the byte contract exact
+    // instead of a lossy conversion that could drop a byte.
+    let text = String::from_utf8(document).map_err(anyhow::Error::msg)?;
+    match crate::out::write_chunk(writer, format_args!("{text}"), false, "stdout") {
+        crate::out::Wrote::Yes => Ok(()),
+        // A reader that left ends the dump at Ok, exit 0 at the real entry: the
+        // pipeline reported what the reader returned, not this run failing.
+        crate::out::Wrote::ReaderGone => Ok(()),
+    }
+}
+
+/// `clauth devices`: bare lists; `pair`, `add` and `revoke` change the list.
+fn cmd_devices(json: bool, cmd: Option<cli::DevicesCommand>) -> Result<()> {
+    match cmd {
+        None => daemon::api::devices::run_list(json),
+        Some(cli::DevicesCommand::Pair { name, control }) => {
+            daemon::api::pairing::run_pair(&name, control)
+        }
+        Some(cli::DevicesCommand::Add { name, control }) => {
+            daemon::api::devices::run_add(&name, control)
+        }
+        Some(cli::DevicesCommand::Revoke { name }) => daemon::api::devices::run_revoke(&name),
     }
 }
 
@@ -754,12 +832,14 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
         outln!("clauth: captured into profile '{target}'. Switch to it with:  clauth {target}");
     } else {
         let snapshot = run_oauth(false, &target, method)?;
-        actions::capture_into_profile(&mut config, target.to_string(), snapshot)?;
-        // Apply the requested default model so the captured profile's sessions
-        // route there from the first launch.
-        if let Some(model) = args.model.as_deref() {
-            actions::set_profile_default_model(&mut config, &target, model)?;
-        }
+        // The requested default model rides the capture's own save, so the
+        // profile's sessions route there from the first launch.
+        actions::capture_into_profile(
+            &mut config,
+            target.to_string(),
+            args.model.clone(),
+            snapshot,
+        )?;
         outln!("clauth: captured into profile '{target}'. Switch to it with:  clauth {target}");
     }
     // CLA-SPLIT: the sidecar outranks `credentials.json` at every switch, so a
@@ -773,6 +853,24 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
              install. This login only feeds usage polling. Drop it with:  clauth static-token \
              {target} --clear"
         );
+    }
+    Ok(())
+}
+
+/// `clauth capture <name>`: save the login Claude Code is using now as a new
+/// profile. The refusal paths (existing name, nothing live to capture) and the
+/// capture itself live in `actions::capture_current_login`, so they are
+/// testable without argv; this wrapper only loads config and reports the
+/// outcome.
+fn cmd_capture(profile: &str) -> Result<()> {
+    platform::init();
+    let mut config = load_config()?;
+    let name = profile.trim();
+    let became_active = actions::capture_current_login(&mut config, name)?;
+    if became_active {
+        outln!("clauth: captured into profile '{name}'. It is the active account.");
+    } else {
+        outln!("clauth: captured into profile '{name}'. Switch to it with:  clauth {name}");
     }
     Ok(())
 }

@@ -13,7 +13,7 @@ The [README](https://github.com/uwuclxdy/clauth#readme) is the tour. This wiki i
 | [Interface and keys](Interface-And-Keys) | the eight tabs, every keybinding, the action menus |
 | [Configuration](Configuration) | `profiles.toml`, per-profile `config.toml`, model routing, storage layout |
 | [Auto-switch](Auto-Switch) | the fallback chain: thresholds, gates, burn-aware mode, spend ceilings |
-| [Daemon](Daemon) | `clauth daemon`, the `status.json` read contract for external readers |
+| [Daemon](Daemon) | `clauth daemon`, the REST API, and the `status.json` read contract |
 | [Claude Code plugin](Claude-Code-Plugin) | the MCP server, its four tools, `delegate` in full |
 | [herdr plugin](Herdr-Plugin) | the clauth popup in herdr, the key, the per-pane account tag |
 | [Tokens and cost](Tokens-And-Cost) | where the token dashboard reads from, what the cost figure means |

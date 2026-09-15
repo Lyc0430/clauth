@@ -816,22 +816,16 @@ fn delegate_row(job: &StoredJob, now: u64) -> DelegateCells {
                 "elapsed {}",
                 humanize_duration(live.elapsed_secs as i64)
             )];
-            if live.recorded {
-                facts.push(match live.last_output_secs_ago {
-                    Some(secs) => format!("last output {}", age_phrase(secs)),
-                    None => "no output yet".to_string(),
+            facts.push(match live.last_output_secs_ago {
+                Some(secs) => format!("last output {}", age_phrase(secs)),
+                None => "no output yet".to_string(),
+            });
+            if let Some((label, secs)) = next_deadline(&live) {
+                facts.push(if secs == 0 {
+                    format!("{label} now")
+                } else {
+                    format!("{label} in {}", humanize_duration(secs as i64))
                 });
-                if let Some((label, secs)) = next_deadline(&live) {
-                    facts.push(if secs == 0 {
-                        format!("{label} now")
-                    } else {
-                        format!("{label} in {}", humanize_duration(secs as i64))
-                    });
-                }
-            } else {
-                // `monitor`'s own wording for the same gap, so one record does
-                // not get two names for what is missing from it.
-                facts.push("liveness not recorded".to_string());
             }
             DelegateCells {
                 state,

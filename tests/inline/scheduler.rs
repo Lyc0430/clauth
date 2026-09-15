@@ -7,11 +7,12 @@ use crate::oauth::RefreshError;
 use crate::profile::DEFAULT_REFRESH_INTERVAL_MS as REFRESH_INTERVAL_MS;
 
 use super::{
-    ActivityStore, ClaudeRollingPacing, EpochMs, LastFetchedAt, ProfileActivity,
-    RESET_ANCHOR_GRACE_MS, SuppressedGenericStore, ThirdPartyEntry, ThirdPartyFetcher, TokenEntry,
-    anchor_post_reset_oauth, clear_activity, clear_orphaned_forced, collect_oauth_seed_names,
-    collect_third_party_entries, collect_tokens, fetch_third_party_due, filter_suppressed,
-    mark_activity, memoized_identity, partition_due, should_anchor_fetch, window_lapsed,
+    ActivityStore, ClaudeRollingPacing, EpochMs, FetchLeg, FetchStamp, LastFetchedAt, LegKey,
+    ProfileActivity, RESET_ANCHOR_GRACE_MS, SuppressedAuthExpiredStore, ThirdPartyEntry,
+    ThirdPartyFetcher, TokenEntry, anchor_post_reset_oauth, clear_activity, clear_orphaned_forced,
+    collect_oauth_seed_names, collect_third_party_entries, collect_tokens, fetch_third_party_due,
+    filter_suppressed, generic_slot_deferral, mark_activity, memoized_identity, partition_due,
+    should_anchor_fetch, window_lapsed,
 };
 
 fn token(name: &str) -> TokenEntry {
@@ -24,6 +25,16 @@ fn token(name: &str) -> TokenEntry {
         auth_broken: false,
         may_open_window: true,
     }
+}
+
+/// The OAuth leg's key for `name` — most scheduler tests drive [`TokenEntry`].
+fn oauth_key(name: &str) -> LegKey {
+    FetchLeg::OAuth.key(crate::profile::ProfileName::from(name))
+}
+
+/// The third-party leg's key for `name`.
+fn tp_key(name: &str) -> LegKey {
+    FetchLeg::ThirdParty.key(crate::profile::ProfileName::from(name))
 }
 
 /// An OAuth-credentialed profile, optionally disabled, for the
@@ -39,6 +50,7 @@ fn oauth_profile_disabled(name: &str, disabled: bool) -> crate::profile::Profile
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     p.disabled = disabled;
@@ -240,13 +252,16 @@ fn partition_due_uses_fixed_interval() {
         &HashMap::new(),
     );
     assert_eq!(due.len(), 1, "a never-fetched profile is due");
-    assert_eq!(next.get("a").copied(), Some(REFRESH_INTERVAL_MS));
+    assert_eq!(
+        next.get(&oauth_key("a")).copied(),
+        Some(REFRESH_INTERVAL_MS)
+    );
 
     // Just fetched: not due one ms later.
     last_fetched
         .lock()
         .unwrap()
-        .insert("a".to_string(), EpochMs::from_millis(base));
+        .insert(oauth_key("a"), FetchStamp::at(EpochMs::from_millis(base)));
     let (due, next) = partition_due(
         &snapshot,
         base + 1,
@@ -256,7 +271,10 @@ fn partition_due_uses_fixed_interval() {
         &HashMap::new(),
     );
     assert!(due.is_empty(), "not due one ms after a fetch");
-    assert_eq!(next.get("a").copied(), Some(base + REFRESH_INTERVAL_MS));
+    assert_eq!(
+        next.get(&oauth_key("a")).copied(),
+        Some(base + REFRESH_INTERVAL_MS)
+    );
 
     // Exactly one interval later: due again.
     let (due, _) = partition_due(
@@ -322,8 +340,8 @@ fn should_anchor_fetch_fires_once_after_reset_plus_grace() {
 fn anchor_post_reset_oauth_schedules_only_eligible_profiles() {
     let now = ANCHOR_NOW;
     let reset = now - RESET_ANCHOR_GRACE_MS - 1_000; // reset + grace comfortably passed
-    let last_before = EpochMs::from_millis(reset - 60_000); // fetched before the reset
-    let last_after = EpochMs::from_millis(reset + 1_000); // already fetched post-reset
+    let last_before = FetchStamp::at(EpochMs::from_millis(reset - 60_000)); // fetched before the reset
+    let last_after = FetchStamp::at(EpochMs::from_millis(reset + 1_000)); // already fetched post-reset
 
     let snapshot = vec![
         token("due"),
@@ -340,15 +358,15 @@ fn anchor_post_reset_oauth_schedules_only_eligible_profiles() {
         // "noreset" carries no stamp.
     ]);
     let last_fetched = HashMap::from([
-        ("due".to_string(), last_before),
-        ("excluded".to_string(), last_before),
-        ("already".to_string(), last_before),
-        ("fetched".to_string(), last_after),
-        ("noreset".to_string(), last_before),
+        (oauth_key("due"), last_before),
+        (oauth_key("excluded"), last_before),
+        (oauth_key("already"), last_before),
+        (oauth_key("fetched"), last_after),
+        (oauth_key("noreset"), last_before),
     ]);
     let excluded = HashSet::from(["excluded".to_string()]);
     let mut due = vec![token("already")]; // already scheduled by partition_due
-    let mut next: HashMap<String, u64> = HashMap::new();
+    let mut next: HashMap<LegKey, u64> = HashMap::new();
 
     anchor_post_reset_oauth(
         &snapshot,
@@ -366,7 +384,7 @@ fn anchor_post_reset_oauth_schedules_only_eligible_profiles() {
         "eligible post-reset profile is scheduled"
     );
     assert_eq!(
-        next.get("due").copied(),
+        next.get(&oauth_key("due")).copied(),
         Some(now),
         "its countdown is stamped to now"
     );
@@ -388,9 +406,9 @@ fn anchor_post_reset_oauth_schedules_only_eligible_profiles() {
         "an already-due profile is not duplicated",
     );
     assert!(
-        !next.contains_key("excluded")
-            && !next.contains_key("fetched")
-            && !next.contains_key("noreset"),
+        !next.contains_key(&oauth_key("excluded"))
+            && !next.contains_key(&oauth_key("fetched"))
+            && !next.contains_key(&oauth_key("noreset")),
         "skipped profiles get no countdown stamp",
     );
 }
@@ -473,7 +491,7 @@ fn partition_due_excludes_refreshing() {
     );
     assert!(due.is_empty(), "refreshing profiles are excluded from due");
     assert!(
-        next.contains_key("a"),
+        next.contains_key(&oauth_key("a")),
         "countdown still publishes for excluded profiles"
     );
 }
@@ -503,16 +521,146 @@ fn partition_due_excludes_switching() {
     );
     assert!(due.is_empty(), "mid-switch profiles are excluded from due");
     assert!(
-        next.contains_key("a"),
+        next.contains_key(&oauth_key("a")),
         "countdown still publishes for excluded profiles"
     );
 }
 
-/// A quarantined (`auth_broken`) profile's poll spends a guaranteed-dead
-/// 401 → refresh → 400 pair against the token endpoint, so partition widens
-/// its cadence by `AUTH_BROKEN_BACKOFF_MS` — computed from the live flag,
-/// never baked into the `last_fetched` stamp, so any flag lift (login, adopt,
-/// carry) snaps the cadence back on the very next tick.
+/// The OAuth leg's own marks belong to the leg. A rotation that starts between
+/// the partition queue and the throttle gate's `Queued` -> `Fetching` flip keeps
+/// its account-wide marker: erasing it re-admits the profile to the due set
+/// while the rotation is still spending its single-use pair.
+#[test]
+fn an_oauth_fetch_mark_never_retires_a_concurrent_rotation() {
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let name = crate::profile::ProfileName::from("a");
+
+    // partition marks the leg due, then a rotation opens on the same profile.
+    mark_activity(&activity, &name, ProfileActivity::Queued);
+    mark_activity(&activity, &name, ProfileActivity::Refreshing);
+    // the queued request clears the per-host gate (`get_json`'s flip).
+    mark_activity(&activity, &name, ProfileActivity::Fetching);
+
+    {
+        let states = activity.lock().unwrap();
+        let state = states.get("a").expect("activity state");
+        assert_eq!(
+            state.account,
+            Some(ProfileActivity::Refreshing),
+            "the fetch leg's flip must leave the rotation marker standing"
+        );
+        assert_eq!(
+            state.fetch(FetchLeg::OAuth),
+            Some(ProfileActivity::Fetching)
+        );
+    }
+
+    let (due, _next) = partition_due(
+        &[token("a")],
+        REFRESH_INTERVAL_MS + 1,
+        &last_fetched,
+        &activity,
+        REFRESH_INTERVAL_MS,
+        &HashMap::new(),
+    );
+    assert!(
+        due.is_empty(),
+        "a profile mid-rotation stays excluded after its leg flips to Fetching"
+    );
+}
+
+/// The rotation owner's handoff is one write: the account marker retires and the
+/// OAuth leg opens under a single hold, so `partition_due` never observes the
+/// profile idle between the two.
+#[test]
+fn the_rotation_owner_hands_its_marker_to_the_oauth_leg() {
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let name = crate::profile::ProfileName::from("a");
+
+    mark_activity(&activity, &name, ProfileActivity::Refreshing);
+    super::rotation_into_fetch(&activity, &name);
+
+    let states = activity.lock().unwrap();
+    let state = states.get("a").expect("activity state");
+    assert_eq!(state.account, None, "the rotation marker retires");
+    assert_eq!(
+        state.fetch(FetchLeg::OAuth),
+        Some(ProfileActivity::Fetching)
+    );
+}
+
+/// `end_rotation` retires the rotation marker alone. A rotation result drains on
+/// the UI thread a tick or more after its worker returned, by which time an
+/// unrelated refetch may already own the OAuth leg.
+#[test]
+fn end_rotation_leaves_a_later_oauth_refetch_standing() {
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let name = crate::profile::ProfileName::from("a");
+
+    mark_activity(&activity, &name, ProfileActivity::Refreshing);
+    mark_activity(&activity, &name, ProfileActivity::Fetching);
+    super::end_rotation(&activity, &name);
+
+    let states = activity.lock().unwrap();
+    let state = states.get("a").expect("activity state");
+    assert_eq!(state.account, None);
+    assert_eq!(
+        state.fetch(FetchLeg::OAuth),
+        Some(ProfileActivity::Fetching),
+        "the refetch spinner outlives the rotation result it did not belong to"
+    );
+}
+
+/// `Switching` belongs to the switch gate, not to a rotation result. Only
+/// `Refreshing` retires here, so a switch opened after the rotation survives.
+#[test]
+fn end_rotation_leaves_a_switch_gate_standing() {
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let name = crate::profile::ProfileName::from("a");
+
+    mark_activity(&activity, &name, ProfileActivity::Switching);
+    super::end_rotation(&activity, &name);
+
+    let states = activity.lock().unwrap();
+    assert_eq!(
+        states.get("a").expect("activity state").account,
+        Some(ProfileActivity::Switching)
+    );
+}
+
+/// An account-level owner clears its own slot only. Both fetch legs open and
+/// close at their own completion boundaries (`clear_fetch_activity`), so a clear
+/// that reached into them would drop a spinner it never raised.
+#[test]
+fn clear_activity_leaves_both_fetch_legs_to_their_owners() {
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let name = crate::profile::ProfileName::from("a");
+
+    mark_activity(&activity, &name, ProfileActivity::Refreshing);
+    mark_activity(&activity, &name, ProfileActivity::Fetching);
+    super::mark_fetch_activity(&activity, &tp_key("a"), ProfileActivity::Fetching);
+    clear_activity(&activity, &name);
+
+    let states = activity.lock().unwrap();
+    let state = states.get("a").expect("activity state");
+    assert_eq!(state.account, None);
+    assert_eq!(
+        state.fetch(FetchLeg::OAuth),
+        Some(ProfileActivity::Fetching)
+    );
+    assert_eq!(
+        state.fetch(FetchLeg::ThirdParty),
+        Some(ProfileActivity::Fetching)
+    );
+}
+
+/// A quarantined (`auth_broken`) profile's poll can no longer refresh (the
+/// rotation leg bails before spending the dead pair), so partition widens its
+/// cadence to the degraded floor `max(interval, DEGRADED_GAP_CEILING_MS)` —
+/// computed from the live flag, never baked into the `last_fetched` stamp,
+/// so any flag lift (login, adopt, carry) snaps the cadence back on the very
+/// next tick.
 #[test]
 fn partition_due_defers_flagged_profiles_until_the_flag_lifts() {
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
@@ -521,7 +669,7 @@ fn partition_due_defers_flagged_profiles_until_the_flag_lifts() {
     last_fetched
         .lock()
         .unwrap()
-        .insert("a".to_string(), EpochMs::from_millis(base));
+        .insert(oauth_key("a"), FetchStamp::at(EpochMs::from_millis(base)));
 
     let mut flagged = token("a");
     flagged.auth_broken = true;
@@ -539,8 +687,8 @@ fn partition_due_defers_flagged_profiles_until_the_flag_lifts() {
     );
     assert!(due.is_empty(), "flagged profile skips the plain cadence");
     assert_eq!(
-        next["a"],
-        base + REFRESH_INTERVAL_MS + super::AUTH_BROKEN_BACKOFF_MS,
+        next[&oauth_key("a")],
+        base + REFRESH_INTERVAL_MS.max(super::DEGRADED_GAP_CEILING_MS),
         "published countdown shows the widened deadline"
     );
 
@@ -548,7 +696,7 @@ fn partition_due_defers_flagged_profiles_until_the_flag_lifts() {
     // attempt stays a (slow) recovery path.
     let (due, _) = partition_due(
         &snapshot,
-        base + REFRESH_INTERVAL_MS + super::AUTH_BROKEN_BACKOFF_MS,
+        base + REFRESH_INTERVAL_MS.max(super::DEGRADED_GAP_CEILING_MS),
         &last_fetched,
         &activity,
         REFRESH_INTERVAL_MS,
@@ -575,7 +723,7 @@ fn partition_due_defers_flagged_profiles_until_the_flag_lifts() {
         1,
         "an unflagged profile snaps back to the cadence"
     );
-    assert_eq!(next["a"], base + REFRESH_INTERVAL_MS);
+    assert_eq!(next[&oauth_key("a")], base + REFRESH_INTERVAL_MS);
 }
 
 /// The sibling of the `auth_broken` widen above, for the failure it can NEVER
@@ -594,7 +742,7 @@ fn partition_due_ladders_a_profile_whose_refresh_keeps_failing() {
     last_fetched
         .lock()
         .unwrap()
-        .insert("a".to_string(), EpochMs::from_millis(base));
+        .insert(oauth_key("a"), FetchStamp::at(EpochMs::from_millis(base)));
 
     let snapshot = vec![token("a")];
     let streaks = |refresh_fail: u32| {
@@ -615,7 +763,7 @@ fn partition_due_ladders_a_profile_whose_refresh_keeps_failing() {
             REFRESH_INTERVAL_MS,
             streaks,
         )
-        .1["a"]
+        .1[&oauth_key("a")]
     };
 
     // Streak 0 is the plain cadence — `rate_limit_backoff_ms(0)` returns a full
@@ -631,16 +779,17 @@ fn partition_due_ladders_a_profile_whose_refresh_keeps_failing() {
     assert_eq!(next_at(&streaks(2)), base + REFRESH_INTERVAL_MS + 30_000);
     assert_eq!(next_at(&streaks(3)), base + REFRESH_INTERVAL_MS + 90_000);
 
-    // …and stops at the same 15-minute ceiling the 429 ladder honors, rather
+    // …and stops at the degraded floor the 429 ladder converges to, rather
     // than running away to hours (`rate_limit_backoff_ms` alone is unbounded).
     assert_eq!(
         next_at(&streaks(50)),
-        base + REFRESH_INTERVAL_MS + super::MAX_RETRY_AFTER_MS,
-        "a deep refresh-fail streak caps at MAX_RETRY_AFTER_MS",
+        base + REFRESH_INTERVAL_MS.max(super::DEGRADED_GAP_CEILING_MS),
+        "a deep refresh-fail streak caps at the degraded floor",
     );
 
-    // A quarantined profile keeps the wider `auth_broken` deferral: that flag
-    // means the token is confirmed dead, which outranks "might be a blip".
+    // A quarantined profile lands on the floor immediately: that flag means
+    // the token is confirmed dead, which outranks "might be a blip" and the
+    // shallow 10s rung the same streak would otherwise give.
     let mut flagged = token("a");
     flagged.auth_broken = true;
     let (_, next) = partition_due(
@@ -652,9 +801,583 @@ fn partition_due_ladders_a_profile_whose_refresh_keeps_failing() {
         &streaks(1),
     );
     assert_eq!(
-        next["a"],
-        base + REFRESH_INTERVAL_MS + super::AUTH_BROKEN_BACKOFF_MS,
+        next[&oauth_key("a")],
+        base + REFRESH_INTERVAL_MS.max(super::DEGRADED_GAP_CEILING_MS),
         "a confirmed-dead token outranks the refresh-fail ladder"
+    );
+}
+
+/// The composed deferral must be clamped once, at the site where both extras
+/// meet. A deep 429 streak records its ladder extra in the `last_fetched` stamp
+/// (`apply_outcome`); a deep refresh-fail streak adds its own at partition time.
+/// Unclamped, the two stack to `interval + 2*floor`. The clamp bounds the sum of
+/// the recorded 429 extra and the partition extra to the degraded floor, so a
+/// deep-both profile polls one interval past its stamp, never the stacked gap.
+#[test]
+fn partition_due_clamps_composed_deferral_where_both_axes_meet() {
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let base = 1_700_000_000_000u64;
+    let floor = REFRESH_INTERVAL_MS.max(super::DEGRADED_GAP_CEILING_MS) - REFRESH_INTERVAL_MS;
+    // The stamp already carries the deep 429 extra (`apply_outcome` recorded it).
+    last_fetched.lock().unwrap().insert(
+        oauth_key("a"),
+        FetchStamp {
+            due: EpochMs::from_millis(base + floor),
+            ladder_ms: floor,
+        },
+    );
+
+    let snapshot = vec![token("a")];
+    let streaks = HashMap::from([(
+        "a".to_string(),
+        super::StreakCounts {
+            rate_limit: 50,
+            refresh_fail: 50,
+        },
+    )]);
+
+    let (_, next) = partition_due(
+        &snapshot,
+        base,
+        &last_fetched,
+        &activity,
+        REFRESH_INTERVAL_MS,
+        &streaks,
+    );
+    // The recorded 429 extra already sits in the stamp, so a correctly clamped
+    // partition adds nothing: the next poll lands one interval past the stamp.
+    assert_eq!(
+        next[&oauth_key("a")],
+        base + floor + REFRESH_INTERVAL_MS,
+        "a deep-both profile polls one interval past its stamp, never the stacked 8.5 min"
+    );
+}
+
+/// The write side of the recorded ladder: `apply_outcome` must record the
+/// deferral it actually baked, and the clamp must compose on THAT value. A
+/// recording regression (stamping the ladder into the due but recording 0)
+/// would hand partition a bare stamp and re-introduce the stacked gap through
+/// the refresh-fail ladder — this pin drives both halves end to end.
+#[test]
+fn apply_outcome_records_the_ladder_it_baked_for_the_clamp_to_compose_on() {
+    use super::{FetchOutcome, FetchStatus, StatusStore, apply_outcome, now_ms};
+
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let statuses: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+
+    // Deep on both axes before the outcome lands; update_streaks only widens.
+    streaks.lock().unwrap().insert(
+        "storm".to_string(),
+        super::StreakCounts {
+            rate_limit: 50,
+            refresh_fail: 50,
+        },
+    );
+
+    let outcome = FetchOutcome {
+        name: crate::profile::ProfileName::from("storm"),
+        info: None,
+        status: FetchStatus::RateLimited,
+        rotated: None,
+        from_fetch: false,
+        refresh_failed: false,
+        plan_override: None,
+        retry_after: None,
+    };
+    apply_outcome(
+        outcome,
+        &store,
+        &statuses,
+        &last_fetched,
+        &streaks,
+        REFRESH_INTERVAL_MS,
+        false,
+        false,
+        &Arc::new(RankedMutex::new(HashSet::new())),
+    );
+
+    let floor = REFRESH_INTERVAL_MS.max(super::DEGRADED_GAP_CEILING_MS) - REFRESH_INTERVAL_MS;
+    let (due, ladder_ms) = {
+        let stamp = last_fetched
+            .lock()
+            .unwrap()
+            .get(&oauth_key("storm"))
+            .copied()
+            .expect("the 429 outcome stamps");
+        (stamp.due, stamp.ladder_ms)
+    };
+    assert_eq!(
+        ladder_ms, floor,
+        "a deep no-hint 429 must record the floor-clamped ladder it baked"
+    );
+
+    // Partition composes on the recorded value: deep refresh-fail ladder meets
+    // the recorded floor bake and the clamp leaves nothing to add.
+    let snapshot = vec![token("storm")];
+    let live_streaks = HashMap::from([("storm".to_string(), streaks.lock().unwrap()["storm"])]);
+    let (_, next) = partition_due(
+        &snapshot,
+        now_ms(),
+        &last_fetched,
+        &activity,
+        REFRESH_INTERVAL_MS,
+        &live_streaks,
+    );
+    assert_eq!(
+        next[&oauth_key("storm")],
+        due.as_millis() + REFRESH_INTERVAL_MS,
+        "the recorded ladder must carry the compose; a zero recording stacks the refresh ladder on top"
+    );
+}
+
+/// The round-2 phantom: a non-429 outcome (`Cached` mid-storm, or the
+/// `auth_broken` bail) stamps a bare deadline while the 429 streak stays deep.
+/// The refresh-fail ladder must stay FULLY alive on that stamp. Re-deriving the
+/// bake from the streak would read a floor that the stamp never baked and eat
+/// the whole partition ladder; the recorded value keeps it exact.
+#[test]
+fn partition_due_keeps_the_refresh_fail_ladder_when_the_stamp_baked_nothing() {
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let base = 1_700_000_000_000u64;
+    let floor = REFRESH_INTERVAL_MS.max(super::DEGRADED_GAP_CEILING_MS) - REFRESH_INTERVAL_MS;
+    // A non-429 stamp: the deadline is bare, the recorded ladder is 0.
+    last_fetched
+        .lock()
+        .unwrap()
+        .insert(oauth_key("a"), FetchStamp::at(EpochMs::from_millis(base)));
+
+    let snapshot = vec![token("a")];
+    let streaks = HashMap::from([(
+        "a".to_string(),
+        super::StreakCounts {
+            rate_limit: 50,
+            refresh_fail: 50,
+        },
+    )]);
+
+    let (_, next) = partition_due(
+        &snapshot,
+        base,
+        &last_fetched,
+        &activity,
+        REFRESH_INTERVAL_MS,
+        &streaks,
+    );
+    assert_eq!(
+        next[&oauth_key("a")],
+        base + REFRESH_INTERVAL_MS + floor,
+        "a bare stamp with a deep refresh-fail streak keeps its full partition ladder"
+    );
+}
+
+/// The active-profile cap bakes a SHORTER ladder than the raw streak would, so
+/// the recorded bake is the capped value. The clamp must use that recorded
+/// value, not the uncapped streak estimate, or it eats the refresh backoff.
+#[test]
+fn partition_due_clamps_the_active_capped_bake_exactly() {
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let base = 1_700_000_000_000u64;
+    // `next_slot_deferral`'s cap: active streak 5 ladders to 2*interval, so the
+    // recorded bake is one interval (2*interval - interval), not the raw floor.
+    last_fetched.lock().unwrap().insert(
+        oauth_key("a"),
+        FetchStamp {
+            due: EpochMs::from_millis(base + REFRESH_INTERVAL_MS),
+            ladder_ms: REFRESH_INTERVAL_MS,
+        },
+    );
+
+    let snapshot = vec![token("a")];
+    let streaks = HashMap::from([(
+        "a".to_string(),
+        super::StreakCounts {
+            rate_limit: 5,
+            refresh_fail: 50,
+        },
+    )]);
+
+    let (_, next) = partition_due(
+        &snapshot,
+        base,
+        &last_fetched,
+        &activity,
+        REFRESH_INTERVAL_MS,
+        &streaks,
+    );
+    // recorded bake (interval) + refresh ladder (floor) clamp to the floor, so
+    // the partition adds floor - interval and the total gap is the degraded floor.
+    assert_eq!(
+        next[&oauth_key("a")],
+        base + REFRESH_INTERVAL_MS.max(super::DEGRADED_GAP_CEILING_MS),
+        "an active-capped bake clamps exactly against its recorded ladder"
+    );
+}
+
+/// The composed clamp must leave a single-axis profile's deadline untouched: a
+/// 429-only profile keeps its baked deferral, a refresh-fail-only profile keeps
+/// its partition ladder.
+#[test]
+fn partition_due_clamp_leaves_single_axis_profiles_untouched() {
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let base = 1_700_000_000_000u64;
+    let baked_extra = 30_000u64; // streak-2 ladder, same on both axes
+
+    // 429-only: the extra is baked into the stamp, the partition adds nothing.
+    last_fetched.lock().unwrap().insert(
+        oauth_key("rl"),
+        FetchStamp {
+            due: EpochMs::from_millis(base + baked_extra),
+            ladder_ms: baked_extra,
+        },
+    );
+    let (_, next) = partition_due(
+        &[token("rl")],
+        base,
+        &last_fetched,
+        &activity,
+        REFRESH_INTERVAL_MS,
+        &HashMap::from([(
+            "rl".to_string(),
+            super::StreakCounts {
+                rate_limit: 2,
+                refresh_fail: 0,
+            },
+        )]),
+    );
+    assert_eq!(
+        next[&oauth_key("rl")],
+        base + baked_extra + REFRESH_INTERVAL_MS,
+        "a 429-only stamp keeps its baked deferral, never narrowed"
+    );
+
+    // refresh-fail-only: nothing baked, the partition adds the ladder.
+    last_fetched
+        .lock()
+        .unwrap()
+        .insert(oauth_key("rf"), FetchStamp::at(EpochMs::from_millis(base)));
+    let (_, next) = partition_due(
+        &[token("rf")],
+        base,
+        &last_fetched,
+        &activity,
+        REFRESH_INTERVAL_MS,
+        &HashMap::from([(
+            "rf".to_string(),
+            super::StreakCounts {
+                rate_limit: 0,
+                refresh_fail: 2,
+            },
+        )]),
+    );
+    assert_eq!(
+        next[&oauth_key("rf")],
+        base + baked_extra + REFRESH_INTERVAL_MS,
+        "a refresh-fail-only profile keeps its partition ladder, never narrowed"
+    );
+}
+
+/// A third-party entry's `poll_backoff_ms` is the default 0 and its names never
+/// enter the OAuth `poll_streaks` map, so the composed clamp must leave its
+/// deadline untouched even while a deep streak map is in hand.
+#[test]
+fn partition_due_clamp_leaves_third_party_untouched() {
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let base = 1_700_000_000_000u64;
+    last_fetched
+        .lock()
+        .unwrap()
+        .insert(tp_key("tp"), FetchStamp::at(EpochMs::from_millis(base)));
+
+    let snapshot = vec![tp_entry("tp")];
+    // A deep same-name OAuth streak must remain irrelevant to provider cadence.
+    let streaks = HashMap::from([(
+        "tp".to_string(),
+        super::StreakCounts {
+            rate_limit: 50,
+            refresh_fail: 50,
+        },
+    )]);
+
+    let (_, next) = partition_due(
+        &snapshot,
+        base,
+        &last_fetched,
+        &activity,
+        REFRESH_INTERVAL_MS,
+        &streaks,
+    );
+    assert_eq!(
+        next[&tp_key("tp")],
+        base + REFRESH_INTERVAL_MS,
+        "a third-party deadline is untouched by the composed clamp"
+    );
+}
+
+/// #74: a GENERIC provider's 429 with no usable `retry-after` lands the flat
+/// degraded floor `max(interval, DEGRADED_GAP_CEILING_MS)` — its scan has no
+/// per-account streak to ramp — while an explicit (non-zero) hint stays
+/// verbatim. A `0` hint names no wait, so it takes the floor too.
+#[test]
+fn generic_no_hint_429_lands_the_flat_floor_and_a_hint_stays_verbatim() {
+    use std::time::Duration;
+
+    let floor_gap = REFRESH_INTERVAL_MS.max(super::DEGRADED_GAP_CEILING_MS);
+    let total_gap = |hint: Option<Duration>| {
+        generic_slot_deferral(hint, REFRESH_INTERVAL_MS).as_millis() + REFRESH_INTERVAL_MS
+    };
+
+    assert_eq!(
+        total_gap(None),
+        floor_gap,
+        "a generic no-hint 429 must land on the flat floor, not a streak rung"
+    );
+    assert_eq!(
+        total_gap(Some(Duration::ZERO)),
+        floor_gap,
+        "retry-after: 0 names no wait and must take the same floor"
+    );
+    assert_eq!(
+        total_gap(Some(Duration::from_secs(240))),
+        240_000,
+        "an explicit generic hint is honored verbatim, even below the floor"
+    );
+    assert_eq!(
+        total_gap(Some(Duration::from_secs(20 * 60))),
+        super::MAX_RETRY_AFTER_MS,
+        "a long generic hint is capped at 15 minutes"
+    );
+    let wide = 10 * 60_000;
+    assert_eq!(
+        generic_slot_deferral(None, wide).as_millis() + wide,
+        wide,
+        "a no-hint 429 never extends an interval already above the floor"
+    );
+}
+
+/// One name keys both fetch legs' `last_fetched` stamp; a hybrid profile (an
+/// OAuth identity AND a third-party provider) must keep one stamp per leg. A
+/// shared name-keyed map lets the later bootstrap overwrite the earlier, so
+/// this reds while the OAuth stamp is clobbered by the third-party seed.
+#[test]
+fn bootstrap_legs_keep_separate_stamps_for_a_hybrid_profile() {
+    use crate::profile_cache::{
+        THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, profile_cache_path, write_profile_cache,
+    };
+    use crate::providers::ThirdPartyStats;
+    use crate::usage::UsageInfo;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let name = crate::profile::ProfileName::from("hybrid");
+    crate::testutil::register_names(&["hybrid"]);
+
+    let oauth_mtime = 1_700_000_000_000u64;
+    let tp_mtime = oauth_mtime + 600_000;
+
+    write_profile_cache(&name, USAGE_CACHE_FILE, &UsageInfo::default());
+    crate::testutil::set_mtime(
+        &profile_cache_path(&name, USAGE_CACHE_FILE).expect("usage cache path"),
+        std::time::UNIX_EPOCH + std::time::Duration::from_millis(oauth_mtime),
+    );
+    write_profile_cache(
+        &name,
+        THIRD_PARTY_CACHE_FILE,
+        &ThirdPartyStats {
+            is_available: true,
+            rows: vec![],
+            bars: vec![],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+    crate::testutil::set_mtime(
+        &profile_cache_path(&name, THIRD_PARTY_CACHE_FILE).expect("third-party cache path"),
+        std::time::UNIX_EPOCH + std::time::Duration::from_millis(tp_mtime),
+    );
+
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let status: super::StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let tp_store: super::ThirdPartyUsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let tp_status: super::ThirdPartyStatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+
+    // OAuth seed lands first, then the third-party seed.
+    super::bootstrap_fetch(
+        &store,
+        &status,
+        &last_fetched,
+        &["hybrid".to_string()],
+        REFRESH_INTERVAL_MS,
+    );
+    super::bootstrap_third_party(
+        &tp_store,
+        &store,
+        &tp_status,
+        &last_fetched,
+        &[tp_entry("hybrid")],
+        REFRESH_INTERVAL_MS,
+    );
+
+    let oauth_stamp = last_fetched
+        .lock()
+        .unwrap()
+        .get(&oauth_key("hybrid"))
+        .copied()
+        .expect("hybrid OAuth stamp");
+    assert_eq!(
+        oauth_stamp.as_millis(),
+        oauth_mtime,
+        "the OAuth leg's stamp must survive the third-party seed (no shared-key clobber)"
+    );
+    let tp_stamp = last_fetched
+        .lock()
+        .unwrap()
+        .get(&tp_key("hybrid"))
+        .copied()
+        .expect("hybrid third-party stamp");
+    assert_eq!(
+        tp_stamp.as_millis(),
+        tp_mtime,
+        "the third-party leg's stamp keeps its own slot alongside the OAuth one"
+    );
+}
+
+/// `selected_next_refresh` is the shared display selector: a hybrid profile's
+/// third-party-cached row must read the provider leg's countdown, its OAuth row
+/// its own. A map holding both keys resolves each side to the matching key, so
+/// a surface swapping in the wrong leg reds this.
+#[test]
+fn selected_next_refresh_picks_the_provider_leg_for_a_hybrid() {
+    use super::selected_next_refresh;
+
+    let name = crate::profile::ProfileName::from("hybrid");
+    let mut next: HashMap<LegKey, u64> = HashMap::new();
+    next.insert(oauth_key("hybrid"), 111);
+    next.insert(tp_key("hybrid"), 222);
+
+    let oauth = crate::testutil::blank_profile(&name);
+    assert_eq!(
+        selected_next_refresh(&next, &oauth),
+        Some(111),
+        "an OAuth-cached row reads the OAuth leg"
+    );
+
+    let mut provider = oauth_profile_disabled("hybrid", false);
+    provider.base_url = Some("https://api.deepseek.com".to_string());
+    provider.api_key = Some("key".to_string());
+    provider.provider = crate::providers::Provider::from_base_url(
+        provider.base_url.as_deref().expect("hybrid base url"),
+    );
+    assert!(
+        provider.credentials.is_some(),
+        "fixture keeps its OAuth pair"
+    );
+    assert_eq!(
+        selected_next_refresh(&next, &provider),
+        Some(222),
+        "a hybrid provider-cached row reads the provider leg"
+    );
+}
+
+/// A panicking OAuth worker owns BOTH slots at the moment it dies: the leg it
+/// was queued on, and the account marker its own rotation raised inside
+/// `poll_one`. The join loop is the only site left to free either, so it frees
+/// both. Freeing the leg alone strands `Refreshing`, and `partition_due`
+/// excludes the profile from every later tick.
+#[test]
+fn a_panicking_oauth_worker_strands_neither_slot() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["boom"]);
+    let state = completion_order_state();
+    let activity = Arc::clone(&state.activity);
+    let name = crate::profile::ProfileName::from("boom");
+
+    super::fetch_oauth_due_with(
+        &state,
+        vec![token("boom")],
+        REFRESH_INTERVAL_MS,
+        move |_| {
+            // What `poll_one` does before it reaches its rotation handoff.
+            mark_activity(
+                &activity,
+                &crate::profile::ProfileName::from("boom"),
+                ProfileActivity::Refreshing,
+            );
+            panic!("simulated worker panic mid-rotation")
+        },
+    );
+
+    assert!(
+        super::is_idle(&state.activity, &name),
+        "the join loop frees the dead worker's account marker as well as its leg"
+    );
+}
+
+/// The production completion boundaries clear only their own leg. Each leaves
+/// the sibling fetch visible and publishes its own exact cadence deadline.
+#[test]
+fn oauth_and_provider_completions_clear_only_their_own_activity() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["hybrid"]);
+    let before = super::now_ms();
+
+    let oauth = completion_order_state();
+    super::mark_fetch_activity(
+        &oauth.activity,
+        &tp_key("hybrid"),
+        ProfileActivity::Fetching,
+    );
+    super::fetch_oauth_due_with(
+        &oauth,
+        vec![token("hybrid")],
+        REFRESH_INTERVAL_MS,
+        |entry| cached_outcome(&entry.name),
+    );
+    {
+        let activity = oauth.activity.lock().unwrap();
+        let state = activity.get("hybrid").expect("provider activity survives");
+        assert_eq!(state.fetch(FetchLeg::OAuth), None);
+        assert_eq!(
+            state.fetch(FetchLeg::ThirdParty),
+            Some(ProfileActivity::Fetching)
+        );
+    }
+    let oauth_next = oauth.next_refresh_per_profile.lock().unwrap()[&oauth_key("hybrid")];
+    assert!(
+        (before + REFRESH_INTERVAL_MS..before + REFRESH_INTERVAL_MS + 2_000).contains(&oauth_next),
+        "OAuth completion publishes its own cadence deadline: {oauth_next}"
+    );
+
+    let provider = third_party_state(stub_ok_stats);
+    mark_activity(
+        &provider.activity,
+        &crate::profile::ProfileName::from("hybrid"),
+        ProfileActivity::Fetching,
+    );
+    let before = super::now_ms();
+    fetch_third_party_due(&provider, vec![tp_entry("hybrid")]);
+    {
+        let activity = provider.activity.lock().unwrap();
+        let state = activity.get("hybrid").expect("OAuth activity survives");
+        assert_eq!(
+            state.fetch(FetchLeg::OAuth),
+            Some(ProfileActivity::Fetching)
+        );
+        assert_eq!(state.fetch(FetchLeg::ThirdParty), None);
+    }
+    let provider_next = provider.next_refresh_per_profile.lock().unwrap()[&tp_key("hybrid")];
+    assert!(
+        (before + REFRESH_INTERVAL_MS..before + REFRESH_INTERVAL_MS + 2_000)
+            .contains(&provider_next),
+        "provider completion publishes its own cadence deadline: {provider_next}"
     );
 }
 
@@ -732,7 +1455,7 @@ fn merge_forced_skips_switching() {
         .map(|s| s.to_string())
         .collect();
     let mut due: Vec<TokenEntry> = Vec::new();
-    let mut next: HashMap<String, u64> = HashMap::new();
+    let mut next: HashMap<LegKey, u64> = HashMap::new();
 
     super::merge_forced(&snapshot, &forced, &mut due, &mut next, &activity, 1);
 
@@ -819,7 +1542,7 @@ fn failed_unmask_outcome_defers_and_streaks_like_a_429() {
     let stamp = last_fetched
         .lock()
         .unwrap()
-        .get("u")
+        .get(&oauth_key("u"))
         .copied()
         .expect("stamp present")
         .as_millis();
@@ -878,19 +1601,20 @@ fn orphaned_forced_cleared_but_scheduled_and_refreshing_kept() {
         .iter()
         .map(|s| s.to_string())
         .collect();
-    let scheduled: HashSet<String> = ["scheduled"].iter().map(|s| s.to_string()).collect();
+    let scheduled: HashSet<LegKey> = [oauth_key("scheduled")].into_iter().collect();
 
     clear_orphaned_forced(&activity, &forced, &scheduled);
 
     let a = activity.lock().unwrap();
     assert!(!a.contains_key("orphan"), "orphaned forced name is cleared");
     assert_eq!(
-        a.get("scheduled").copied(),
+        a.get("scheduled")
+            .and_then(|state| state.fetch(FetchLeg::OAuth)),
         Some(ProfileActivity::Queued),
         "a scheduled name keeps its mark"
     );
     assert_eq!(
-        a.get("rotating").copied(),
+        a.get("rotating").and_then(|state| state.account),
         Some(ProfileActivity::Refreshing),
         "a refreshing name is owned by the rotate worker, left alone"
     );
@@ -898,35 +1622,38 @@ fn orphaned_forced_cleared_but_scheduled_and_refreshing_kept() {
 
 // ── Panic-clear discipline ────────────────────────────────────────────────────
 
-/// The scheduler tick's mark/join/clear discipline must clear the ActivityStore
-/// slot even when a fetch worker panics — exercises the `Err(_)` arm of
-/// `h.join()` without real HTTP or a full scheduler.
+/// `refresh_all`'s join loop frees a panicked rotation worker's account slot.
+/// Its production form spawns real HTTP workers, so this is a hand-written stand
+/// in for that arm alone: it pins that the arm's `clear_activity` frees the
+/// account marker and that a concurrent fetch keeps the leg its OWN join loop
+/// frees. The real loop is driven by
+/// `a_panicking_oauth_worker_strands_neither_slot`.
 #[test]
-fn activity_cleared_on_worker_panic() {
+fn refresh_all_panic_arm_frees_the_account_slot_alone() {
     let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
-    let name = "test-profile";
+    let name = crate::profile::ProfileName::from("test-profile");
 
-    mark_activity(
-        &activity,
-        &crate::profile::ProfileName::from(name),
-        ProfileActivity::Fetching,
-    );
+    mark_activity(&activity, &name, ProfileActivity::Refreshing);
+    mark_activity(&activity, &name, ProfileActivity::Queued);
     assert!(
         !activity.lock().unwrap().is_empty(),
         "slot must be set after mark_activity"
     );
-
-    let h = std::thread::spawn(|| -> () { panic!("simulated worker panic") });
-
-    // join loop Err arm: clear slot on panic
-    match h.join() {
-        Ok(_) => panic!("expected panic in worker"),
-        Err(_) => clear_activity(&activity, &crate::profile::ProfileName::from(name)),
+    clear_activity(&activity, &name);
+    {
+        let states = activity.lock().unwrap();
+        let state = states.get("test-profile").expect("the fetch leg survives");
+        assert_eq!(state.account, None, "the panicked rotation's slot is freed");
+        assert_eq!(
+            state.fetch(FetchLeg::OAuth),
+            Some(ProfileActivity::Queued),
+            "a concurrent fetch keeps the leg its own join loop will free"
+        );
     }
-
+    super::clear_fetch_activity(&activity, &oauth_key("test-profile"));
     assert!(
         activity.lock().unwrap().is_empty(),
-        "activity slot must be cleared after worker panic"
+        "both slots freed leaves no entry behind"
     );
 }
 
@@ -1160,6 +1887,166 @@ fn cold_bail_records_a_plan_only_canceled_entry() {
         disk.and_then(|i| i.plan).is_some_and(|p| p.is_canceled()),
         "and persists to usage_cache.json so the flip survives and readers see it"
     );
+}
+
+/// The `fetched_at` age clock: a plan ride re-writes `usage_cache.json` (so its
+/// mtime advances) but must NOT re-age the body — the written body keeps the
+/// stamp the live fetch left, and the status age arm keys on that stamp rather
+/// than the re-stamped mtime.
+#[test]
+fn plan_ride_preserves_fetched_at_and_stays_stale_despite_advanced_mtime() {
+    use super::{FetchOutcome, FetchStatus, StatusStore, apply_outcome};
+    use crate::profile::{AppConfig, AppState};
+    use crate::usage::{PlanInfo, PlanTier, UsageInfo, UsageWindow};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+    let weekly_reset_kicks: super::WeeklyResetKicks = Arc::new(RankedMutex::new(HashSet::new()));
+
+    // Seed the disk body with a stamp past the age threshold.
+    let stale_ago_ms = crate::profile_json::stale_after_ms(REFRESH_INTERVAL_MS) + 60_000;
+    let seeded_fetched_at = crate::usage::now_ms() - stale_ago_ms;
+    let prior = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 42.0,
+            resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+        }),
+        plan: Some(PlanInfo {
+            tier: PlanTier::Pro,
+            subscription_status: None,
+        }),
+        fetched_at: Some(seeded_fetched_at),
+        ..Default::default()
+    };
+    crate::testutil::register_names(&["a"]);
+    super::write_profile_cache(
+        &crate::profile::ProfileName::from("a"),
+        super::USAGE_CACHE_FILE,
+        &prior,
+    );
+
+    let canceled = PlanInfo {
+        tier: PlanTier::Free,
+        subscription_status: Some("canceled".to_string()),
+    };
+    apply_outcome(
+        FetchOutcome::cached(
+            &crate::profile::ProfileName::from("a"),
+            FetchStatus::RateLimited,
+            None,
+            None,
+        )
+        .with_plan(Some(canceled)),
+        &store,
+        &status,
+        &last_fetched,
+        &streaks,
+        REFRESH_INTERVAL_MS,
+        false,
+        false,
+        &weekly_reset_kicks,
+    );
+
+    let disk = super::load_profile_cache::<UsageInfo>(
+        &crate::profile::ProfileName::from("a"),
+        super::USAGE_CACHE_FILE,
+    )
+    .unwrap();
+    assert!(
+        disk.plan.unwrap().is_canceled(),
+        "the plan ride still persists the tier flip"
+    );
+    assert_eq!(
+        disk.fetched_at,
+        Some(seeded_fetched_at),
+        "the plan ride keeps the live fetch's age stamp — it advances no age"
+    );
+
+    // The re-write advanced the cache mtime, but the age arm keys on fetched_at:
+    // the reading must still be stale.
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile_disabled("a", false)],
+    };
+    let entries = crate::daemon::build_profile_entries(&config, REFRESH_INTERVAL_MS, None, false);
+    let entry = entries
+        .iter()
+        .find(|e| e.name.as_str() == "a")
+        .expect("profile a present");
+    assert!(
+        entry.stale,
+        "the status arm reads stale off the old fetched_at stamp despite the advanced mtime"
+    );
+}
+
+/// The fresh direction: a live fetch body stamps `fetched_at` to now, and the
+/// same status arm reads it not-stale.
+#[test]
+fn fresh_body_stamps_fetched_at_and_reads_not_stale() {
+    use super::{FetchOutcome, FetchStatus, StatusStore, apply_outcome};
+    use crate::profile::{AppConfig, AppState};
+    use crate::usage::{UsageInfo, UsageWindow};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+    let weekly_reset_kicks: super::WeeklyResetKicks = Arc::new(RankedMutex::new(HashSet::new()));
+
+    crate::testutil::register_names(&["a"]);
+    let body = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 42.0,
+            resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+        }),
+        ..Default::default()
+    };
+    apply_outcome(
+        FetchOutcome {
+            name: crate::profile::ProfileName::from("a"),
+            info: Some(body),
+            status: FetchStatus::Fresh,
+            rotated: None,
+            from_fetch: true,
+            refresh_failed: false,
+            plan_override: None,
+            retry_after: None,
+        },
+        &store,
+        &status,
+        &last_fetched,
+        &streaks,
+        REFRESH_INTERVAL_MS,
+        false,
+        false,
+        &weekly_reset_kicks,
+    );
+
+    let disk = super::load_profile_cache::<UsageInfo>(
+        &crate::profile::ProfileName::from("a"),
+        super::USAGE_CACHE_FILE,
+    )
+    .unwrap();
+    let stamped = disk.fetched_at.expect("a live body is stamped");
+    assert!(
+        crate::usage::now_ms() - stamped < 60_000,
+        "the stamp is 'now', not a re-played older value"
+    );
+
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile_disabled("a", false)],
+    };
+    let entries = crate::daemon::build_profile_entries(&config, REFRESH_INTERVAL_MS, None, false);
+    let entry = entries
+        .iter()
+        .find(|e| e.name.as_str() == "a")
+        .expect("profile a present");
+    assert!(!entry.stale, "a freshly stamped body reads not stale");
 }
 
 /// `mark_window_open` synthesizes a live 5h window after a successful kick
@@ -3158,7 +4045,7 @@ fn retry_after_defers_next_fetch_slot() {
         last_fetched
             .lock()
             .unwrap()
-            .get(name)
+            .get(&oauth_key(name))
             .copied()
             .expect("stamp present")
             .as_millis()
@@ -3197,7 +4084,7 @@ fn retry_after_defers_next_fetch_slot() {
     );
     assert!(due.is_empty(), "not due before the deferred slot");
     assert_eq!(
-        next.get("a").copied(),
+        next.get(&oauth_key("a")).copied(),
         Some(a + REFRESH_INTERVAL_MS),
         "countdown publishes the deferred slot"
     );
@@ -3323,7 +4210,7 @@ fn consecutive_rate_limits_back_off_exponentially() {
         last_fetched
             .lock()
             .unwrap()
-            .get("a")
+            .get(&oauth_key("a"))
             .copied()
             .expect("stamp present")
             .as_millis()
@@ -3422,7 +4309,7 @@ fn hint_present_429s_still_ride_the_streak_ladder() {
         last_fetched
             .lock()
             .unwrap()
-            .get("a")
+            .get(&oauth_key("a"))
             .copied()
             .expect("stamp present")
             .as_millis()
@@ -3493,7 +4380,7 @@ fn transient_errors_preserve_rate_limit_streak() {
         last_fetched
             .lock()
             .unwrap()
-            .get("a")
+            .get(&oauth_key("a"))
             .copied()
             .expect("stamp present")
             .as_millis()
@@ -3631,13 +4518,139 @@ fn try_seed_cache_seeds_any_cache_and_resumes_timer() {
     let stamp = last_fetched
         .lock()
         .unwrap()
-        .get("idle")
+        .get(&oauth_key("idle"))
         .copied()
         .unwrap()
         .as_millis();
     assert!(
         stamp <= now.saturating_sub(20_000) && stamp >= now.saturating_sub(40_000),
         "stamped at the ~30s-old cache mtime (resume), not now"
+    );
+}
+
+/// The OAuth seed's freshness and `last_fetched` stamp date off the BODY's
+/// `fetched_at`, not the file's mtime: a plan-only rewrite from a prior run
+/// (the hourly `/profile` ride on a 429'd `/usage`) moves the mtime to now
+/// without producing a new reading, and seeding off it imported the re-age
+/// into the LIVE store (`fetch_status: "Fresh"` on a body hours stale), which
+/// the status feed then publishes verbatim (R8, #74).
+#[test]
+fn try_seed_cache_dates_the_seed_off_the_bodies_own_stamp() {
+    use std::time::{Duration, SystemTime};
+
+    use super::{FetchStatus, StatusStore, now_ms, try_seed_cache};
+    use crate::profile::profile_subpath;
+    use crate::profile_cache::{USAGE_CACHE_FILE, write_profile_cache};
+    use crate::testutil::{HomeSandbox, set_mtime};
+    use crate::usage::{UsageInfo, UsageWindow};
+
+    let _home = HomeSandbox::new();
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let interval = REFRESH_INTERVAL_MS;
+
+    crate::testutil::register_names(&["ridden"]);
+    // The plan-only shape: a body 3 intervals old under a file rewritten now.
+    let now = now_ms();
+    let mut body = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 42.0,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(
+                crate::usage::now_epoch_secs() + 3600,
+            )),
+        }),
+        ..Default::default()
+    };
+    body.fetched_at = Some(now - 3 * interval);
+    write_profile_cache(
+        &crate::profile::ProfileName::from("ridden"),
+        USAGE_CACHE_FILE,
+        &body,
+    );
+    let path = profile_subpath(
+        &crate::profile::ProfileName::from("ridden"),
+        "usage_cache.json",
+    )
+    .expect("cache path");
+    set_mtime(&path, SystemTime::now());
+
+    assert!(try_seed_cache(
+        &store,
+        &status,
+        &last_fetched,
+        &crate::profile::ProfileName::from("ridden"),
+        now,
+        interval
+    ));
+    assert_eq!(
+        status.lock().unwrap().get("ridden").copied(),
+        Some(FetchStatus::Cached),
+        "a rewrite is not a fetch: the seed status follows the body's stamp"
+    );
+    let stamp = last_fetched
+        .lock()
+        .unwrap()
+        .get(&oauth_key("ridden"))
+        .copied()
+        .unwrap()
+        .as_millis();
+    assert!(
+        stamp <= now.saturating_sub(3 * interval - 1_000),
+        "the cadence resumes from the last real fetch ({stamp}), not the rewrite"
+    );
+
+    // Control: the same body with its stamp moved to now — a real fetch —
+    // seeds Fresh, stamped ~now, so the resume behavior itself is unchanged.
+    let mut fresh = body.clone();
+    fresh.fetched_at = Some(now - 1_000);
+    write_profile_cache(
+        &crate::profile::ProfileName::from("ridden"),
+        USAGE_CACHE_FILE,
+        &fresh,
+    );
+    set_mtime(&path, SystemTime::now() - Duration::from_secs(2 * 3600));
+    assert!(try_seed_cache(
+        &store,
+        &status,
+        &last_fetched,
+        &crate::profile::ProfileName::from("ridden"),
+        now,
+        interval
+    ));
+    assert_eq!(
+        status.lock().unwrap().get("ridden").copied(),
+        Some(FetchStatus::Fresh),
+        "control: a body fetched just now seeds Fresh, mtime 2h old notwithstanding"
+    );
+
+    // An undatable body (plan-only cold fill, pre-`fetched_at` cache) has no
+    // stamp to trust, so the file's own write stays its clock.
+    let undated = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 42.0,
+            resets_at: None,
+        }),
+        ..Default::default()
+    };
+    write_profile_cache(
+        &crate::profile::ProfileName::from("ridden"),
+        USAGE_CACHE_FILE,
+        &undated,
+    );
+    set_mtime(&path, SystemTime::now() - Duration::from_secs(30));
+    assert!(try_seed_cache(
+        &store,
+        &status,
+        &last_fetched,
+        &crate::profile::ProfileName::from("ridden"),
+        now,
+        interval
+    ));
+    assert_eq!(
+        status.lock().unwrap().get("ridden").copied(),
+        Some(FetchStatus::Fresh),
+        "no stamp to trust, so the file's own write dates it"
     );
 }
 
@@ -3693,20 +4706,21 @@ fn deadline_spread_is_bounded_per_profile_and_per_cycle() {
 /// map (the steady state for healthy profiles) is a no-op fast path.
 #[test]
 fn filter_suppressed_drops_only_named_entries() {
-    let suppressed: SuppressedGenericStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let suppressed_auth_expired: SuppressedAuthExpiredStore =
+        Arc::new(RankedMutex::new(HashMap::new()));
     let victim = tp_entry("no-data");
-    suppressed
+    suppressed_auth_expired
         .lock()
         .unwrap()
         .insert("no-data".to_string(), victim.credential_fingerprint());
 
     let snap = vec![tp_entry("ok"), tp_entry("no-data"), tp_entry("also-ok")];
-    let out = filter_suppressed(&suppressed, snap);
+    let out = filter_suppressed(&suppressed_auth_expired, snap);
     let names: Vec<&str> = out.iter().map(|e| e.name.as_str()).collect();
     assert_eq!(names, vec!["ok", "also-ok"]);
 
     // Empty map → identity (the fast path).
-    let empty: SuppressedGenericStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let empty: SuppressedAuthExpiredStore = Arc::new(RankedMutex::new(HashMap::new()));
     let snap2 = vec![tp_entry("ok"), tp_entry("no-data")];
     assert_eq!(filter_suppressed(&empty, snap2).len(), 2);
 }
@@ -3718,19 +4732,20 @@ fn filter_suppressed_drops_only_named_entries() {
 /// (`daemon::tick::rebuild_tokens`), so the changed credential is the signal.
 #[test]
 fn filter_suppressed_re_admits_an_entry_whose_credential_changed() {
-    let suppressed: SuppressedGenericStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let suppressed_auth_expired: SuppressedAuthExpiredStore =
+        Arc::new(RankedMutex::new(HashMap::new()));
     let expired = alibaba_entry("qwen", "dead-console-token");
-    suppressed
+    suppressed_auth_expired
         .lock()
         .unwrap()
         .insert("qwen".to_string(), expired.credential_fingerprint());
 
     // Same credential → still suppressed, no cadence retry.
-    assert!(filter_suppressed(&suppressed, vec![expired]).is_empty());
+    assert!(filter_suppressed(&suppressed_auth_expired, vec![expired]).is_empty());
 
     // Re-login wrote a new console session; the rebuilt entry carries it.
     let relogged = alibaba_entry("qwen", "fresh-console-token");
-    let out = filter_suppressed(&suppressed, vec![relogged]);
+    let out = filter_suppressed(&suppressed_auth_expired, vec![relogged]);
     assert_eq!(
         out.len(),
         1,
@@ -3738,19 +4753,23 @@ fn filter_suppressed_re_admits_an_entry_whose_credential_changed() {
     );
 }
 
-/// The api key is part of the fingerprint too, so the generic no-data
+/// The api key is part of the fingerprint too, so a dead-credential
 /// suppression clears on a rotated key by the same mechanism.
 #[test]
 fn filter_suppressed_re_admits_a_generic_entry_on_a_rotated_key() {
-    let suppressed: SuppressedGenericStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let suppressed_auth_expired: SuppressedAuthExpiredStore =
+        Arc::new(RankedMutex::new(HashMap::new()));
     let old = tp_entry("proxy");
-    suppressed
+    suppressed_auth_expired
         .lock()
         .unwrap()
         .insert("proxy".to_string(), old.credential_fingerprint());
     let mut rotated = tp_entry("proxy");
     rotated.api_key = "a-different-key".to_string();
-    assert_eq!(filter_suppressed(&suppressed, vec![rotated]).len(), 1);
+    assert_eq!(
+        filter_suppressed(&suppressed_auth_expired, vec![rotated]).len(),
+        1
+    );
 }
 
 fn tp_entry(name: &str) -> ThirdPartyEntry {
@@ -3779,6 +4798,13 @@ fn alibaba_entry(name: &str, token: &str) -> ThirdPartyEntry {
 }
 
 fn third_party_state(fetcher: ThirdPartyFetcher) -> super::SchedulerState {
+    third_party_state_at_interval(fetcher, REFRESH_INTERVAL_MS)
+}
+
+fn third_party_state_at_interval(
+    fetcher: ThirdPartyFetcher,
+    interval_ms: u64,
+) -> super::SchedulerState {
     use crate::profile::{AppConfig, AppState};
     use std::sync::atomic::{AtomicBool, AtomicU64};
     super::SchedulerState {
@@ -3789,7 +4815,7 @@ fn third_party_state(fetcher: ThirdPartyFetcher) -> super::SchedulerState {
         tokens: Arc::new(RankedMutex::new(vec![])),
         store: Arc::new(RankedMutex::new(HashMap::new())),
         status: Arc::new(RankedMutex::new(HashMap::new())),
-        refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
+        refresh_interval: Arc::new(AtomicU64::new(interval_ms)),
         next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
         activity: Arc::new(RankedMutex::new(HashMap::new())),
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
@@ -3803,7 +4829,7 @@ fn third_party_state(fetcher: ThirdPartyFetcher) -> super::SchedulerState {
         third_party_tokens: Arc::new(RankedMutex::new(vec![])),
         third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
-        suppressed_generic: Arc::new(RankedMutex::new(HashMap::new())),
+        suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(false),
@@ -3837,6 +4863,63 @@ fn stub_network_error(
     Err(crate::providers::ThirdPartyError::Network)
 }
 
+fn stub_status_no_data(
+    _: &crate::providers::ThirdPartyTarget,
+    _: &str,
+    _: Option<&str>,
+) -> Result<crate::providers::ThirdPartyStats, crate::providers::ThirdPartyError> {
+    Err(crate::providers::ThirdPartyError::Status)
+}
+
+fn stub_rate_limited_hint(
+    _: &crate::providers::ThirdPartyTarget,
+    _: &str,
+    _: Option<&str>,
+) -> Result<crate::providers::ThirdPartyStats, crate::providers::ThirdPartyError> {
+    Err(crate::providers::ThirdPartyError::RateLimited {
+        // Above the streak-1 ladder (~100s at the 90s interval) so the hint,
+        // never the ladder, decides the gap a test asserts on.
+        retry_after: Some(std::time::Duration::from_secs(240)),
+    })
+}
+
+fn stub_ok_stats(
+    _: &crate::providers::ThirdPartyTarget,
+    _: &str,
+    _: Option<&str>,
+) -> Result<crate::providers::ThirdPartyStats, crate::providers::ThirdPartyError> {
+    Ok(crate::providers::ThirdPartyStats {
+        is_available: true,
+        rows: vec![],
+        bars: vec![],
+        plan: None,
+        endpoint: None,
+        best_effort: false,
+    })
+}
+
+fn stamped_gap_ms(state: &super::SchedulerState, name: &str, before: u64) -> u64 {
+    stamped_gap_ms_at(state, name, before, REFRESH_INTERVAL_MS)
+}
+
+fn stamped_gap_ms_at(
+    state: &super::SchedulerState,
+    name: &str,
+    before: u64,
+    interval_ms: u64,
+) -> u64 {
+    state
+        .last_fetched
+        .lock()
+        .unwrap()
+        .get(&tp_key(name))
+        .copied()
+        .unwrap()
+        .as_millis()
+        .saturating_add(interval_ms)
+        .saturating_sub(before)
+}
+
 #[test]
 fn fetch_third_party_due_inserts_generic_auth_expired() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -3846,12 +4929,23 @@ fn fetch_third_party_due_inserts_generic_auth_expired() {
     let fp = entry.credential_fingerprint();
     let state = third_party_state(stub_auth_expired);
     crate::usage::reset_request_slots();
+    let before = super::now_ms();
     fetch_third_party_due(&state, vec![entry]);
     assert_eq!(
-        state.suppressed_generic.lock().unwrap().get("generic-dead"),
+        state
+            .suppressed_auth_expired
+            .lock()
+            .unwrap()
+            .get("generic-dead"),
         Some(&fp)
     );
     assert!(crate::profile_cache::auth_expired_matches(&name, fp));
+    // Suppression, not the no-data floor: the stamp keeps the bare cadence.
+    let gap = stamped_gap_ms(&state, "generic-dead", before);
+    assert!(
+        (REFRESH_INTERVAL_MS..REFRESH_INTERVAL_MS + 2_000).contains(&gap),
+        "AuthExpired must not take the generic no-data floor, got gap {gap}ms"
+    );
 }
 
 #[test]
@@ -3865,14 +4959,165 @@ fn fetch_third_party_due_inserts_known_auth_expired() {
     crate::usage::reset_request_slots();
     fetch_third_party_due(&state, vec![entry]);
     assert_eq!(
-        state.suppressed_generic.lock().unwrap().get("qwen-dead"),
+        state
+            .suppressed_auth_expired
+            .lock()
+            .unwrap()
+            .get("qwen-dead"),
         Some(&fp)
     );
     assert!(crate::profile_cache::auth_expired_matches(&name, fp));
 }
 
+// --- wallet_history.jsonl: the balance series the wallet-burn rate replays ---
+
+fn wallet_stats(values: &[(&str, &str)]) -> crate::providers::ThirdPartyStats {
+    crate::providers::ThirdPartyStats {
+        is_available: true,
+        rows: values
+            .iter()
+            .map(|&(label, value)| crate::providers::StatRow {
+                label: label.to_string(),
+                value: value.to_string(),
+                kind: crate::providers::StatRowKind::Body,
+            })
+            .collect(),
+        bars: vec![],
+        plan: None,
+        endpoint: None,
+        best_effort: false,
+    }
+}
+
+fn stub_wallet_stats(
+    _: &crate::providers::ThirdPartyTarget,
+    _: &str,
+    _: Option<&str>,
+) -> Result<crate::providers::ThirdPartyStats, crate::providers::ThirdPartyError> {
+    Ok(wallet_stats(&[("api balance", "18.89 CNY")]))
+}
+
 #[test]
-fn fetch_third_party_due_inserts_generic_failed_without_cache() {
+fn wallet_series_records_first_reading_then_bridge_on_change() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("ds-series");
+    let t0 = 1_700_000_000_000u64;
+    crate::profile::append_wallet_readings_at(
+        &name,
+        &wallet_stats(&[("api balance", "10.00 CNY")]),
+        t0,
+    );
+    assert_eq!(
+        crate::profile::load_wallet_history(&name),
+        vec![crate::usage::WalletSample {
+            ts: t0,
+            label: "api balance".to_string(),
+            amount: 10.0,
+            currency: "CNY".to_string(),
+        }]
+    );
+    // Unchanged reading: nothing appended.
+    crate::profile::append_wallet_readings_at(
+        &name,
+        &wallet_stats(&[("api balance", "10.00 CNY")]),
+        t0 + 90_000,
+    );
+    assert_eq!(crate::profile::load_wallet_history(&name).len(), 1);
+    // Changed reading: bridge (prev amount 1 ms earlier) + the new one.
+    crate::profile::append_wallet_readings_at(
+        &name,
+        &wallet_stats(&[("api balance", "8.00 CNY")]),
+        t0 + 180_000,
+    );
+    let series = crate::profile::load_wallet_history(&name);
+    assert_eq!(series.len(), 3, "{series:?}");
+    assert_eq!((series[1].ts, series[1].amount), (t0 + 179_999, 10.0));
+    assert_eq!((series[2].ts, series[2].amount), (t0 + 180_000, 8.0));
+}
+
+#[test]
+fn wallet_series_keeps_each_wallets_readings_separate() {
+    // DS5/DS6 shape: an unfunded USD wallet listed before the funded CNY one,
+    // both under the SAME row label — a wallet's identity is (label, currency).
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("ds-two");
+    let t0 = 1_700_000_000_000u64;
+    let both = wallet_stats(&[("api balance", "0.00 USD"), ("api balance", "63.34 CNY")]);
+    crate::profile::append_wallet_readings_at(&name, &both, t0);
+    assert_eq!(crate::profile::load_wallet_history(&name).len(), 2);
+    // Only the CNY wallet moves: the USD wallet records nothing new.
+    let drifted = wallet_stats(&[("api balance", "0.00 USD"), ("api balance", "60.14 CNY")]);
+    crate::profile::append_wallet_readings_at(&name, &drifted, t0 + 90_000);
+    let series = crate::profile::load_wallet_history(&name);
+    let usd: Vec<&crate::usage::WalletSample> =
+        series.iter().filter(|s| s.currency == "USD").collect();
+    let cny: Vec<&crate::usage::WalletSample> =
+        series.iter().filter(|s| s.currency == "CNY").collect();
+    assert_eq!(usd.len(), 1, "the unchanged USD wallet records nothing");
+    assert_eq!(cny.len(), 3, "bridge + new for the moved wallet");
+    assert_eq!(cny[2].amount, 60.14);
+}
+
+#[test]
+fn wallet_series_prunes_past_retention_but_keeps_the_bridge() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("ds-prune");
+    let now = crate::usage::now_ms();
+    crate::profile::append_wallet_readings_at(
+        &name,
+        &wallet_stats(&[("api balance", "5.00 CNY")]),
+        now - 3 * 24 * 3_600_000,
+    );
+    crate::profile::append_wallet_readings_at(
+        &name,
+        &wallet_stats(&[("api balance", "4.00 CNY")]),
+        now - 3_600_000,
+    );
+    crate::profile::prune_wallet_history(&name);
+    let series = crate::profile::load_wallet_history(&name);
+    // The 3-day-old reading drops; the 1-hour-old bridge pair stays.
+    assert_eq!(series.len(), 2, "{series:?}");
+    assert_eq!(series[0].amount, 5.0);
+    assert_eq!(series[1].amount, 4.0);
+}
+
+#[test]
+fn fetch_third_party_due_appends_the_wallet_series_beside_the_stats_cache() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["ds-live"]);
+    let state = third_party_state(stub_wallet_stats);
+    crate::usage::reset_request_slots();
+    fetch_third_party_due(&state, vec![tp_entry("ds-live")]);
+    let series = crate::profile::load_wallet_history(&crate::profile::ProfileName::from("ds-live"));
+    assert_eq!(series.len(), 1, "{series:?}");
+    assert_eq!(
+        (
+            series[0].label.as_str(),
+            series[0].amount,
+            series[0].currency.as_str()
+        ),
+        ("api balance", 18.89, "CNY")
+    );
+}
+
+#[test]
+fn a_failed_third_party_fetch_appends_no_wallet_readings() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["ds-dead"]);
+    let state = third_party_state(stub_network_error);
+    crate::usage::reset_request_slots();
+    fetch_third_party_due(&state, vec![tp_entry("ds-dead")]);
+    assert!(
+        crate::profile::load_wallet_history(&crate::profile::ProfileName::from("ds-dead"))
+            .is_empty()
+    );
+}
+
+/// A generic profile whose fetch found nothing is NOT session-suppressed: its
+/// transient no-data is already clamped by the fetch deferral, and suppressing
+/// stopped it from rescanning for the whole session. The AuthExpired arm stays.
+#[test]
+fn fetch_third_party_due_does_not_insert_generic_failed_without_cache() {
     let _home = crate::testutil::HomeSandbox::new();
     crate::testutil::register_names(&["generic-no-data"]);
     let entry = tp_entry("generic-no-data");
@@ -3882,13 +5127,9 @@ fn fetch_third_party_due_inserts_generic_failed_without_cache() {
     let state = third_party_state(stub_network_error);
     crate::usage::reset_request_slots();
     fetch_third_party_due(&state, vec![entry]);
-    assert_eq!(
-        state
-            .suppressed_generic
-            .lock()
-            .unwrap()
-            .get("generic-no-data"),
-        Some(&fp)
+    assert!(
+        state.suppressed_auth_expired.lock().unwrap().is_empty(),
+        "a generic no-data result must not suppress — it rescans on the cadence"
     );
     assert!(!crate::profile_cache::auth_expired_matches(&name, fp));
 }
@@ -3904,7 +5145,7 @@ fn fetch_third_party_due_does_not_insert_rate_limited() {
     let state = third_party_state(stub_rate_limited);
     crate::usage::reset_request_slots();
     fetch_third_party_due(&state, vec![entry]);
-    assert!(state.suppressed_generic.lock().unwrap().is_empty());
+    assert!(state.suppressed_auth_expired.lock().unwrap().is_empty());
     assert!(!crate::profile_cache::auth_expired_matches(&name, fp));
 }
 
@@ -3931,7 +5172,7 @@ fn fetch_third_party_due_does_not_insert_cached() {
     let state = third_party_state(stub_network_error);
     crate::usage::reset_request_slots();
     fetch_third_party_due(&state, vec![entry]);
-    assert!(state.suppressed_generic.lock().unwrap().is_empty());
+    assert!(state.suppressed_auth_expired.lock().unwrap().is_empty());
     assert!(!crate::profile_cache::auth_expired_matches(&name, fp));
 }
 
@@ -3946,11 +5187,146 @@ fn fetch_third_party_due_does_not_insert_known_failed() {
     let state = third_party_state(stub_network_error);
     crate::usage::reset_request_slots();
     fetch_third_party_due(&state, vec![entry]);
-    assert!(state.suppressed_generic.lock().unwrap().is_empty());
+    assert!(state.suppressed_auth_expired.lock().unwrap().is_empty());
     assert!(!crate::profile_cache::auth_expired_matches(&name, fp));
     assert_eq!(
         state.third_party_status.lock().unwrap().get("qwen-failed"),
         Some(&super::FetchStatus::Failed)
+    );
+}
+
+/// A generic target whose scan found nothing defers its next poll to the
+/// degraded floor (`max(interval, 5min)`), so the multi-candidate rescan
+/// cannot re-probe at the bare cadence.
+#[test]
+fn fetch_third_party_due_generic_no_data_defers_to_floor() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["generic-floor"]);
+    let entry = tp_entry("generic-floor");
+    let state = third_party_state(stub_status_no_data);
+    crate::usage::reset_request_slots();
+    let before = super::now_ms();
+    fetch_third_party_due(&state, vec![entry]);
+    let gap = stamped_gap_ms(&state, "generic-floor", before);
+    let floor = REFRESH_INTERVAL_MS.max(super::DEGRADED_GAP_CEILING_MS);
+    assert!(
+        gap >= floor,
+        "generic no-data must defer to the 5-minute floor, gap {gap}ms"
+    );
+    assert!(
+        gap < floor + 2_000,
+        "the floor is the exact gap, got {gap}ms"
+    );
+}
+
+/// A typed provider's no-data keeps the normal cadence: only the generic
+/// rescan gets the floor.
+#[test]
+fn fetch_third_party_due_typed_no_data_keeps_cadence() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["qwen-nodata"]);
+    let entry = alibaba_entry("qwen-nodata", "console-token");
+    let state = third_party_state(stub_network_error);
+    crate::usage::reset_request_slots();
+    let before = super::now_ms();
+    fetch_third_party_due(&state, vec![entry]);
+    let gap = stamped_gap_ms(&state, "qwen-nodata", before);
+    assert!(
+        gap >= REFRESH_INTERVAL_MS,
+        "typed no-data must keep the normal cadence, gap {gap}ms"
+    );
+    assert!(
+        gap < REFRESH_INTERVAL_MS + 2_000,
+        "typed no-data must not floor, got gap {gap}ms"
+    );
+}
+
+#[test]
+fn fetch_third_party_due_generic_no_hint_429_uses_the_floor() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["generic-limited"]);
+    let state = third_party_state(stub_rate_limited);
+    crate::usage::reset_request_slots();
+    let before = super::now_ms();
+    fetch_third_party_due(&state, vec![tp_entry("generic-limited")]);
+    let gap = stamped_gap_ms(&state, "generic-limited", before);
+    let expected = REFRESH_INTERVAL_MS.max(super::DEGRADED_GAP_CEILING_MS);
+    assert!(
+        (expected..expected + 2_000).contains(&gap),
+        "generic no-hint 429 uses the rescan floor, got {gap}ms"
+    );
+}
+
+#[test]
+fn fetch_third_party_due_typed_no_hint_429_keeps_the_flat_rung() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["qwen-limited"]);
+    let entry = alibaba_entry("qwen-limited", "console-token");
+    let state = third_party_state(stub_rate_limited);
+    crate::usage::reset_request_slots();
+    let before = super::now_ms();
+    fetch_third_party_due(&state, vec![entry]);
+    let gap = stamped_gap_ms(&state, "qwen-limited", before);
+    let expected = REFRESH_INTERVAL_MS + super::RATE_LIMIT_MIN_BACKOFF_MS;
+    assert!(
+        (expected..expected + 2_000).contains(&gap),
+        "typed no-hint 429 keeps its flat rung, got {gap}ms"
+    );
+}
+
+/// A generic 429 with a server hint keeps the hint: the floor never widens a
+/// server-directed deferral, and the hint (240s, above the ~100s streak-1
+/// ladder) is what the assertion reads, so dropping the hint reds here.
+#[test]
+fn fetch_third_party_due_generic_429_hint_stays_unfloored() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["generic-hint"]);
+    let entry = tp_entry("generic-hint");
+    let state = third_party_state(stub_rate_limited_hint);
+    crate::usage::reset_request_slots();
+    let before = super::now_ms();
+    fetch_third_party_due(&state, vec![entry]);
+    let gap = stamped_gap_ms(&state, "generic-hint", before);
+    assert!(
+        (240_000..242_000).contains(&gap),
+        "a server hint must stay unfloored, got gap {gap}ms"
+    );
+}
+
+/// A successful fetch keeps the bare cadence: the floor is a no-data
+/// mechanism, never a tax on data.
+#[test]
+fn fetch_third_party_due_a_live_body_keeps_the_bare_cadence() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["generic-live"]);
+    let entry = tp_entry("generic-live");
+    let state = third_party_state(stub_ok_stats);
+    crate::usage::reset_request_slots();
+    let before = super::now_ms();
+    fetch_third_party_due(&state, vec![entry]);
+    let gap = stamped_gap_ms(&state, "generic-live", before);
+    assert!(
+        (REFRESH_INTERVAL_MS..REFRESH_INTERVAL_MS + 2_000).contains(&gap),
+        "a live body must keep the bare cadence, got gap {gap}ms"
+    );
+}
+
+/// An interval OVER the floor keeps its own cadence: `max(interval, 5min)` is
+/// the interval itself there, so the no-data floor adds nothing.
+#[test]
+fn fetch_third_party_due_no_data_at_a_wide_interval_adds_nothing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["generic-wide"]);
+    let entry = tp_entry("generic-wide");
+    let interval = 10 * 60_000;
+    let state = third_party_state_at_interval(stub_status_no_data, interval);
+    crate::usage::reset_request_slots();
+    let before = super::now_ms();
+    fetch_third_party_due(&state, vec![entry]);
+    let gap = stamped_gap_ms_at(&state, "generic-wide", before, interval);
+    assert!(
+        (interval..interval + 2_000).contains(&gap),
+        "a wide interval must not be extended, got gap {gap}ms"
     );
 }
 
@@ -3992,7 +5368,8 @@ fn bootstrap_third_party_seeds_any_cache() {
     use std::time::{Duration, SystemTime};
 
     use super::{
-        FetchStatus, ThirdPartyStatusStore, ThirdPartyUsageStore, bootstrap_third_party, now_ms,
+        FetchStatus, ThirdPartyStatusStore, ThirdPartyUsageStore, UsageStore,
+        bootstrap_third_party, now_ms,
     };
     use crate::profile::profile_subpath;
     use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, write_profile_cache};
@@ -4003,6 +5380,9 @@ fn bootstrap_third_party_seeds_any_cache() {
     let store: ThirdPartyUsageStore = Arc::new(RankedMutex::new(HashMap::new()));
     let status: ThirdPartyStatusStore = Arc::new(RankedMutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    // The OAuth-shaped map the auto-switch walk reads: a seeded third-party
+    // account has to reach it too, or its window is invisible to the chain.
+    let usage_store_for_mirror: UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
 
     let stats = |pct: f64| ThirdPartyStats {
         is_available: true,
@@ -4019,7 +5399,7 @@ fn bootstrap_third_party_seeds_any_cache() {
         best_effort: false,
     };
     // Fresh cache (just written) seeds `Fresh`; a 2h-old cache seeds `Cached`.
-    crate::testutil::register_names(&["cached", "stale"]);
+    crate::testutil::register_names(&["cached", "stale", "windowless"]);
     write_profile_cache(
         &crate::profile::ProfileName::from("cached"),
         THIRD_PARTY_CACHE_FILE,
@@ -4029,6 +5409,27 @@ fn bootstrap_third_party_seeds_any_cache() {
         &crate::profile::ProfileName::from("stale"),
         THIRD_PARTY_CACHE_FILE,
         &stats(20.0),
+    );
+    // A best-effort cache the derivation declines: whatever the mirror held
+    // for the account must be REMOVED, not left standing — a provider that
+    // stopped publishing windows must not keep answering the walk with a
+    // frozen figure.
+    let mut windowless = stats(50.0);
+    windowless.best_effort = true;
+    write_profile_cache(
+        &crate::profile::ProfileName::from("windowless"),
+        THIRD_PARTY_CACHE_FILE,
+        &windowless,
+    );
+    usage_store_for_mirror.lock().unwrap().insert(
+        "windowless".to_string(),
+        crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 50.0,
+                resets_at: None,
+            }),
+            ..Default::default()
+        },
     );
     let stale_path = profile_subpath(
         &crate::profile::ProfileName::from("stale"),
@@ -4040,9 +5441,15 @@ fn bootstrap_third_party_seeds_any_cache() {
         SystemTime::now() - Duration::from_secs(2 * 3600),
     );
 
-    let entries = vec![tp_entry("cached"), tp_entry("stale"), tp_entry("missing")];
+    let entries = vec![
+        tp_entry("cached"),
+        tp_entry("stale"),
+        tp_entry("windowless"),
+        tp_entry("missing"),
+    ];
     bootstrap_third_party(
         &store,
+        &usage_store_for_mirror,
         &status,
         &last_fetched,
         &entries,
@@ -4062,6 +5469,31 @@ fn bootstrap_third_party_seeds_any_cache() {
         "a profile with no cache is left for the scheduler"
     );
     assert_eq!(
+        usage_store_for_mirror
+            .lock()
+            .unwrap()
+            .get("cached")
+            .and_then(|u| u.five_hour.as_ref())
+            .map(|w| w.utilization),
+        Some(12.0),
+        "the seeded window is mirrored into the map auto-switch reads"
+    );
+    assert!(
+        !usage_store_for_mirror
+            .lock()
+            .unwrap()
+            .contains_key("missing"),
+        "a profile with no cache contributes no mirrored window either"
+    );
+    assert!(
+        !usage_store_for_mirror
+            .lock()
+            .unwrap()
+            .contains_key("windowless"),
+        "a cache the derivation declines REMOVES the mirrored entry, so a \
+         stopped publication stops answering the walk"
+    );
+    assert_eq!(
         status.lock().unwrap().get("cached").copied(),
         Some(FetchStatus::Fresh),
         "a third-party cache younger than one interval surfaces as Fresh"
@@ -4072,7 +5504,10 @@ fn bootstrap_third_party_seeds_any_cache() {
         "a third-party cache older than one interval surfaces as Cached"
     );
     assert!(
-        !last_fetched.lock().unwrap().contains_key("missing"),
+        !last_fetched
+            .lock()
+            .unwrap()
+            .contains_key(&tp_key("missing")),
         "a no-cache profile is left unstamped so it fetches on the first tick"
     );
     // Stamped at the cache mtime (~now, just written), so the cadence resumes.
@@ -4080,13 +5515,49 @@ fn bootstrap_third_party_seeds_any_cache() {
     let stamp = last_fetched
         .lock()
         .unwrap()
-        .get("cached")
+        .get(&tp_key("cached"))
         .copied()
         .unwrap()
         .as_millis();
     assert!(
         stamp <= now && stamp >= now.saturating_sub(5_000),
         "the seeded third-party profile stamps last_fetched at the cache mtime"
+    );
+}
+
+/// The mirror's `None` arm on its own — the stale-cache guard half of
+/// `publish_third_party_windows`'s own doc, which the bootstrap test above
+/// drives only through a seeded cache: a provider that stopped publishing
+/// windows has no current reading, and a frozen entry would keep answering
+/// the walk with a figure nothing refreshes.
+#[test]
+fn a_none_derivation_removes_the_mirrored_window() {
+    use super::publish_third_party_windows;
+    use crate::profile::ProfileName;
+    use crate::usage::{UsageInfo, UsageWindow};
+
+    let store: UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let name = ProfileName::from("windowless");
+    let live = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 40.0,
+            resets_at: None,
+        }),
+        ..Default::default()
+    };
+    store
+        .lock()
+        .unwrap()
+        .insert("windowless".to_string(), live.clone());
+    publish_third_party_windows(&store, &name, None);
+    assert!(
+        !store.lock().unwrap().contains_key("windowless"),
+        "a stopped publication removes the entry the walk reads"
+    );
+    publish_third_party_windows(&store, &name, Some(live));
+    assert!(
+        store.lock().unwrap().contains_key("windowless"),
+        "a resumed publication re-inserts it"
     );
 }
 
@@ -4130,6 +5601,7 @@ fn a_disk_pair_that_moved_past_the_spent_token_is_returned_not_quarantined() {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     crate::profile::save_profile(&p).expect("save profile");
@@ -4165,6 +5637,7 @@ fn carrying_an_external_rotation_clears_a_stale_quarantine() {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     crate::profile::save_profile(&p).expect("save profile");
@@ -4551,7 +6024,11 @@ fn standdown_hydrate_seeds_the_store_from_the_daemon_cache() {
         status.lock().unwrap().get("kitty").copied(),
         Some(super::FetchStatus::Fresh),
     );
-    let stamp = last_fetched.lock().unwrap().get("kitty").copied();
+    let stamp = last_fetched
+        .lock()
+        .unwrap()
+        .get(&oauth_key("kitty"))
+        .copied();
     let now = super::now_ms();
     assert!(
         stamp.is_some_and(|s| now.saturating_sub(s.as_millis()) < 30_000),
@@ -4562,7 +6039,13 @@ fn standdown_hydrate_seeds_the_store_from_the_daemon_cache() {
     // synthetic entry that would render as data.
     assert!(store.lock().unwrap().get("cacheless").is_none());
     assert!(status.lock().unwrap().get("cacheless").is_none());
-    assert!(last_fetched.lock().unwrap().get("cacheless").is_none());
+    assert!(
+        last_fetched
+            .lock()
+            .unwrap()
+            .get(&oauth_key("cacheless"))
+            .is_none()
+    );
 }
 
 /// Re-hydrating every tick must track the daemon's writes: a NEWER cache body
@@ -4665,7 +6148,7 @@ fn standdown_tick_drains_forced_and_publishes_countdowns() {
         third_party_tokens: Arc::new(RankedMutex::new(vec![])),
         third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
-        suppressed_generic: Arc::new(RankedMutex::new(HashMap::new())),
+        suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(true),
@@ -4700,13 +6183,13 @@ fn standdown_tick_drains_forced_and_publishes_countdowns() {
         .next_refresh_per_profile
         .lock()
         .unwrap()
-        .get("kitty")
+        .get(&oauth_key("kitty"))
         .copied();
     let stamp = state
         .last_fetched
         .lock()
         .unwrap()
-        .get("kitty")
+        .get(&oauth_key("kitty"))
         .map(|e| e.as_millis());
     assert_eq!(
         next,
@@ -4758,7 +6241,7 @@ fn standdown_sweeps_bootstrap_queued_marks() {
         third_party_tokens: Arc::new(RankedMutex::new(vec![])),
         third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
-        suppressed_generic: Arc::new(RankedMutex::new(HashMap::new())),
+        suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(true),
@@ -4787,8 +6270,9 @@ fn standdown_sweeps_bootstrap_queued_marks() {
         a.get("stale").is_none(),
         "an un-owned Queued mark is swept — no frozen spinner"
     );
-    assert!(
-        matches!(a.get("kitty"), Some(ProfileActivity::Refreshing)),
+    assert_eq!(
+        a.get("kitty").and_then(|state| state.account),
+        Some(ProfileActivity::Refreshing),
         "an in-flight worker's mark survives (it clears itself on landing)"
     );
 }
@@ -4854,7 +6338,7 @@ fn tick_stands_down_when_another_instance_holds_the_fetch_lease() {
         third_party_tokens: Arc::new(RankedMutex::new(vec![])),
         third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
-        suppressed_generic: Arc::new(RankedMutex::new(HashMap::new())),
+        suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         // A DIFFERENT lease over the same file → its acquire() is denied while
         // `other` holds the flock.
@@ -4868,11 +6352,10 @@ fn tick_stands_down_when_another_instance_holds_the_fetch_lease() {
     // Stamp `kitty` as just-fetched so it is NOT due this tick: an armed tick
     // would then fetch nothing (no live request on a regression) and leave the
     // marks/store below untouched, which is what makes each assert discriminate.
-    state
-        .last_fetched
-        .lock()
-        .unwrap()
-        .insert("kitty".to_string(), EpochMs::from_millis(super::now_ms()));
+    state.last_fetched.lock().unwrap().insert(
+        oauth_key("kitty"),
+        FetchStamp::at(EpochMs::from_millis(super::now_ms())),
+    );
 
     // A bootstrap-only `Queued` mark: `standdown_tick` sweeps every Queued mark,
     // while an armed tick with nothing due leaves it in place.
@@ -4958,7 +6441,7 @@ fn tick_fetches_the_third_party_leg_under_its_own_lease() {
         third_party_tokens: Arc::new(RankedMutex::new(vec![entry])),
         third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
-        suppressed_generic: Arc::new(RankedMutex::new(HashMap::new())),
+        suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         // Nothing else holds the flock, so this tick is the fetcher.
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
@@ -5003,7 +6486,11 @@ fn tick_fetches_the_third_party_leg_under_its_own_lease() {
         "a landed body is Fresh, not a cache fallback"
     );
     assert!(
-        state.last_fetched.lock().unwrap().contains_key(name),
+        state
+            .last_fetched
+            .lock()
+            .unwrap()
+            .contains_key(&tp_key(name)),
         "the fetch stamps its slot, or the profile re-fetches every tick"
     );
     assert!(
@@ -5075,7 +6562,7 @@ fn tick_prunes_histories_and_throttles_a_second_tick_inside_the_cadence_window()
         third_party_tokens: Arc::new(RankedMutex::new(vec![entry])),
         third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
-        suppressed_generic: Arc::new(RankedMutex::new(HashMap::new())),
+        suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(false),
@@ -5092,7 +6579,11 @@ fn tick_prunes_histories_and_throttles_a_second_tick_inside_the_cadence_window()
         "the history prune leg advanced the stale stamp"
     );
     assert!(
-        state.last_fetched.lock().unwrap().contains_key(name),
+        state
+            .last_fetched
+            .lock()
+            .unwrap()
+            .contains_key(&tp_key(name)),
         "the first tick stamped last_fetched"
     );
 
@@ -5183,7 +6674,7 @@ fn auto_start_queue_election_is_wired_into_tick() {
         third_party_tokens: Arc::new(RankedMutex::new(vec![])),
         third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
-        suppressed_generic: Arc::new(RankedMutex::new(HashMap::new())),
+        suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(false),
@@ -5562,12 +7053,12 @@ fn auto_start_queue_run_fetch_records_the_failure_when_refused_before_the_kick()
 
 #[test]
 fn active_profile_rate_limit_ladder_caps_at_one_extra_interval() {
-    use super::{IntervalMs, MAX_RETRY_AFTER_MS, next_slot_deferral};
+    use super::{DEGRADED_GAP_CEILING_MS, IntervalMs, next_slot_deferral};
     let interval = 90_000u64;
-    // Deep streak: the idle ladder pushes the slot to the 15-min ceiling.
+    // Deep streak: the idle ladder clamps its total gap to the 5-min floor.
     assert_eq!(
         next_slot_deferral(true, None, 6, interval, false),
-        IntervalMs::from_millis(MAX_RETRY_AFTER_MS - interval),
+        IntervalMs::from_millis(DEGRADED_GAP_CEILING_MS - interval),
         "idle keeps the full drain ladder"
     );
     // Active: the slot lands at most one extra interval out (2x cadence).
@@ -5608,13 +7099,28 @@ fn active_profile_cap_leaves_shallow_streaks_alone() {
     );
 }
 
+/// The flat base rung a third-party 429 gets (`stamp_last_fetched` always
+/// passes streak 1) sits UNDER the #74 floor at a sub-cadence interval: 90s
+/// cadence + 10s = 100s total gap, so the floor clamp must raise nothing. The
+/// clamp only narrows a gap that exceeds `max(interval, 5min)`.
+#[test]
+fn third_party_flat_rung_stays_under_the_floor_at_a_sub_cadence_interval() {
+    use super::{IntervalMs, RATE_LIMIT_MIN_BACKOFF_MS, next_slot_deferral};
+    let interval = 90_000u64;
+    assert_eq!(
+        next_slot_deferral(true, None, 1, interval, false),
+        IntervalMs::from_millis(RATE_LIMIT_MIN_BACKOFF_MS),
+        "a 90s cadence keeps its 100s flat gap"
+    );
+}
+
 /// Pins where the cap first bites and where it releases, so a drift in either
 /// boundary fails loudly. At 90s cadence: streak 3's ladder (90s + 90s) equals
 /// the 2× cap exactly (a no-op), streak 4 (90s + 270s) is the first capped
 /// step, streak 6 the last, and streak 7 releases to the idle drain ladder.
 #[test]
 fn active_profile_cap_bites_at_streak_4_and_releases_past_6() {
-    use super::{IntervalMs, MAX_RETRY_AFTER_MS, next_slot_deferral};
+    use super::{DEGRADED_GAP_CEILING_MS, IntervalMs, next_slot_deferral};
     let interval = 90_000u64;
     // streak 3: ladder == cap, active and idle agree.
     assert_eq!(
@@ -5642,8 +7148,8 @@ fn active_profile_cap_bites_at_streak_4_and_releases_past_6() {
     );
     assert_eq!(
         next_slot_deferral(true, None, 7, interval, true),
-        IntervalMs::from_millis(MAX_RETRY_AFTER_MS - interval),
-        "a released deep streak sits at the 15-min ceiling"
+        IntervalMs::from_millis(DEGRADED_GAP_CEILING_MS - interval),
+        "a released deep streak sits at the 5-min floor"
     );
 }
 
@@ -5707,7 +7213,7 @@ fn apply_outcome_threads_is_active_into_the_deferral() {
         last_fetched
             .lock()
             .unwrap()
-            .get(name)
+            .get(&oauth_key(name))
             .copied()
             .expect("stamp present")
             .as_millis()
@@ -5717,8 +7223,8 @@ fn apply_outcome_threads_is_active_into_the_deferral() {
         (before + REFRESH_INTERVAL_MS..=after + REFRESH_INTERVAL_MS).contains(&stamp("act")),
         "active stamp must carry the 2x-cadence cap"
     );
-    // Idle at streak 6: full ladder → the 15-min ceiling.
-    let idle_extra = super::MAX_RETRY_AFTER_MS - REFRESH_INTERVAL_MS;
+    // Idle at streak 6: full ladder → the 5-min degraded floor.
+    let idle_extra = super::DEGRADED_GAP_CEILING_MS - REFRESH_INTERVAL_MS;
     assert!(
         (before + idle_extra..=after + idle_extra).contains(&stamp("idle")),
         "idle stamp must carry the full drain ladder"
@@ -5761,7 +7267,7 @@ fn completion_order_state() -> super::SchedulerState {
         third_party_tokens: Arc::new(RankedMutex::new(vec![])),
         third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
-        suppressed_generic: Arc::new(RankedMutex::new(HashMap::new())),
+        suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(false),
@@ -5837,7 +7343,7 @@ fn oauth_completions_apply_in_completion_order_not_list_order() {
             .next_refresh_per_profile
             .lock()
             .unwrap()
-            .contains_key("fast")
+            .contains_key(&oauth_key("fast"))
         {
             assert!(
                 Instant::now() < deadline,
@@ -5856,8 +7362,11 @@ fn oauth_completions_apply_in_completion_order_not_list_order() {
                 activity.get("fast").is_none(),
                 "`fast` spinner cleared on its own completion"
             );
-            assert!(
-                matches!(activity.get("slow"), Some(ProfileActivity::Queued)),
+            assert_eq!(
+                activity
+                    .get("slow")
+                    .and_then(|state| state.fetch(FetchLeg::OAuth)),
+                Some(ProfileActivity::Queued),
                 "`slow` is still queued — it did not gate `fast`"
             );
         }
@@ -5866,7 +7375,7 @@ fn oauth_completions_apply_in_completion_order_not_list_order() {
                 .next_refresh_per_profile
                 .lock()
                 .unwrap()
-                .contains_key("slow"),
+                .contains_key(&oauth_key("slow")),
             "`slow` countdown is not yet published — it lands after `fast`"
         );
     });
@@ -5880,7 +7389,7 @@ fn oauth_completions_apply_in_completion_order_not_list_order() {
     );
     let nrpp = state.next_refresh_per_profile.lock().unwrap();
     assert!(
-        nrpp.contains_key("fast") && nrpp.contains_key("slow"),
+        nrpp.contains_key(&oauth_key("fast")) && nrpp.contains_key(&oauth_key("slow")),
         "both countdowns published by batch end"
     );
 }
@@ -7164,6 +8673,594 @@ fn auto_start_kick_does_not_rotate_under_a_live_session_on_macos() {
     );
 }
 
+/// A standing `auth_broken` quarantine means the refresh token is already dead,
+/// so the rotation leg must NOT spend it. The plain fetch still runs (the 401
+/// probe — that's what set the flag) and the adopt legs above still run; the
+/// leg bails to cache. Only a login, adopt, or carry lifts the flag.
+#[test]
+fn a_flagged_profile_skips_the_dead_refresh_but_keeps_the_401_probe() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "rot-auth-broken";
+    // usage 401 → (skip) → no token call. `max` is 2 so a buggy refresh is
+    // still RECORDED before the server exits — the pin must see it, not mask it.
+    let (base, server) = crate::testutil::serve_endpoints(2, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    seed_usage_cache(name);
+    let entry = super::TokenEntry {
+        name: crate::profile::ProfileName::from(name),
+        access_token: "at-old".into(),
+        refresh_token: Some("rt-old".into()),
+        auto_start: false,
+        access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+        auth_broken: true,
+        may_open_window: true,
+    };
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+
+    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/api/oauth/usage")),
+        "the 401 probe must still run: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "a quarantined profile must not spend the dead refresh: {seen:?}"
+    );
+    assert_eq!(outcome.status, super::FetchStatus::Cached);
+    assert_eq!(outcome.rotated, None, "nothing may be rotated");
+}
+
+/// The flagged-profile skip must take the `bail_unrotated` shape, never an
+/// inline cached bail: on the PROACTIVE arm (access token still clock-valid,
+/// inside the lead window) `bail_unrotated` serves the LIVE usage reading, so
+/// refusing the dead refresh must never cost the live poll. An inline
+/// `rotation_bail_context` bail — the shape a first cut of the skip took —
+/// drops that fetch and the flagged profile's usage freezes until login.
+#[test]
+fn a_flagged_profile_still_gets_its_live_usage_poll_on_the_proactive_arm() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "rot-auth-broken-proactive";
+    // usage 200 → skip → no token call. `max` is 2 so a buggy refresh is
+    // still RECORDED before the server exits.
+    let (base, server) = crate::testutil::serve_endpoints(2, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (
+                200,
+                r#"{"object":"list","data":[],"plan":{"tier":"max5"}}"#.to_string(),
+            )
+        } else if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    {
+        let mut cfg = config.lock().unwrap();
+        let oauth = cfg
+            .find_mut(&crate::profile::ProfileName::from(name))
+            .and_then(|p| p.credentials.as_mut())
+            .expect("oauth credentials");
+        if let Some(token) = oauth.claude_ai_oauth.as_mut() {
+            // Inside the lead window (floor 15 min): with `preemptive_rotation`
+            // on (the fixture default), the poll takes the PROACTIVE arm, so
+            // the plain fetch runs first and its 200 must be served through
+            // the skip.
+            token.expires_at = Some(crate::usage::now_ms() as i64 + 300_000);
+        }
+    }
+    seed_usage_cache(name);
+    let entry = super::TokenEntry {
+        name: crate::profile::ProfileName::from(name),
+        access_token: "at-old".into(),
+        refresh_token: Some("rt-old".into()),
+        auto_start: false,
+        access_expires_at: Some(crate::usage::now_ms() as i64 + 300_000),
+        auth_broken: true,
+        may_open_window: true,
+    };
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+
+    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/api/oauth/usage")),
+        "the live usage poll must survive the skip on the proactive arm: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "a quarantined profile must not spend the dead refresh: {seen:?}"
+    );
+    assert_eq!(outcome.status, super::FetchStatus::Fresh);
+    assert_eq!(outcome.rotated, None, "nothing may be rotated");
+}
+
+/// A NON-active flagged profile whose on-disk pair moved past the entry's token
+/// must self-heal: the carry leg above the `auth_broken` bail proves the chain
+/// is alive, lifts the stale quarantine, and never spends the dead refresh. The
+/// carry must run even though the profile is not active — external re-login is
+/// exactly the recovery the adopt legs (active-only) cannot reach.
+#[test]
+fn a_flagged_non_active_profile_carries_a_moved_disk_pair_without_a_refresh() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "rot-carry-non-active";
+    // usage 401 → (carry) → no token call. `max` is 2 so a buggy refresh is
+    // still RECORDED before the server exits — the pin must see it, not mask it.
+    let (base, server) = crate::testutil::serve_endpoints(2, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-leak","refresh_token":"rt-leak","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    {
+        let mut cfg = config.lock().unwrap();
+        cfg.state.active_profile = Some(crate::profile::ProfileName::from("other"));
+        cfg.set_auth_broken(&crate::profile::ProfileName::from(name), true);
+    }
+    // Move the ON-DISK pair past the entry's token: someone else rotated.
+    {
+        let mut profile = crate::profile::load_profile(&crate::profile::ProfileName::from(name))
+            .expect("fixture profile on disk");
+        let creds = profile.credentials.as_mut().expect("fixture credentials");
+        let oauth = creds.claude_ai_oauth.as_mut().expect("fixture oauth");
+        oauth.access_token = "at-new".into();
+        oauth.refresh_token = Some("rt-new".into());
+        crate::profile::save_profile(&profile).expect("save moved pair");
+    }
+    seed_usage_cache(name);
+    let entry = super::TokenEntry {
+        name: crate::profile::ProfileName::from(name),
+        access_token: "at-old".into(),
+        refresh_token: Some("rt-old".into()),
+        auto_start: false,
+        access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+        auth_broken: true,
+        may_open_window: true,
+    };
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+
+    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/api/oauth/usage")),
+        "the 401 probe must still run: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "a carried non-active pair must not spend the dead refresh: {seen:?}"
+    );
+    assert!(
+        !config
+            .lock()
+            .unwrap()
+            .is_auth_broken(&crate::profile::ProfileName::from(name)),
+        "the moved pair must lift the stale quarantine"
+    );
+    assert!(
+        refetch.lock().unwrap().contains(name),
+        "the carried pair is refetched next tick"
+    );
+    assert_eq!(
+        outcome.rotated,
+        Some(("at-new".to_string(), Some("rt-new".to_string()))),
+        "the carried pair must sync the caller's TokenList"
+    );
+    assert_eq!(outcome.status, super::FetchStatus::Cached);
+}
+
+/// The sibling control: same NON-active flag, same 401 probe, but the disk pair
+/// is UNCHANGED. The carry finds nothing, so the bail still refuses the dead
+/// refresh — no spend, no refetch, the quarantine stays set.
+#[test]
+fn a_flagged_non_active_profile_with_an_unchanged_pair_still_bails_without_a_refresh() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "rot-carry-unchanged";
+    let (base, server) = crate::testutil::serve_endpoints(2, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-leak","refresh_token":"rt-leak","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    {
+        let mut cfg = config.lock().unwrap();
+        cfg.state.active_profile = Some(crate::profile::ProfileName::from("other"));
+        cfg.set_auth_broken(&crate::profile::ProfileName::from(name), true);
+    }
+    // Leave the disk pair as the fixture's "rt-old" — the SAME pair the entry
+    // carries, so the carry must find nothing.
+    seed_usage_cache(name);
+    let entry = super::TokenEntry {
+        name: crate::profile::ProfileName::from(name),
+        access_token: "at-old".into(),
+        refresh_token: Some("rt-old".into()),
+        auto_start: false,
+        access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+        auth_broken: true,
+        may_open_window: true,
+    };
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+
+    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/api/oauth/usage")),
+        "the 401 probe must still run: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "an unchanged pair must not spend the dead refresh: {seen:?}"
+    );
+    assert!(
+        config
+            .lock()
+            .unwrap()
+            .is_auth_broken(&crate::profile::ProfileName::from(name)),
+        "an unchanged pair keeps the quarantine"
+    );
+    assert!(refetch.lock().unwrap().is_empty(), "no refetch is queued");
+    assert_eq!(outcome.rotated, None, "nothing may be rotated");
+    assert_eq!(outcome.status, super::FetchStatus::Cached);
+}
+
+// ── the macOS refusal vs the carry ───────────────────────────────────────────
+//
+// The refusal is forced through the test seam (`crate::runtime::
+// set_rotation_blocked_override`): the predicate's first term is compile-time
+// false off macOS, so no Linux run reaches a `true` arm any other way.
+
+/// The refusal must not gate the carry. A live `clauth start` session blocks
+/// the ROTATION — clauth cannot write the Keychain item that session's CC
+/// reads — but the carry spends no refresh token; it only reads the store. So
+/// a flagged profile whose on-disk pair an external re-login through the
+/// session's own chain already moved still self-heals: quarantine lifted,
+/// refetch queued, fresh pair carried. Bailing at the guard BEFORE the carry
+/// (the pre-fix order) is the defect this pin reds.
+#[test]
+fn a_live_session_blocking_rotation_still_carries_a_moved_disk_pair() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "rot-carry-blocked";
+    // usage 401 → (carry) → no token call. `max` is 2 so a buggy refresh is
+    // still RECORDED before the server exits — the pin must see it, not mask it.
+    let (base, server) = crate::testutil::serve_endpoints(2, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-leak","refresh_token":"rt-leak","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    {
+        let mut cfg = config.lock().unwrap();
+        cfg.state.active_profile = Some(crate::profile::ProfileName::from("other"));
+        cfg.set_auth_broken(&crate::profile::ProfileName::from(name), true);
+    }
+    // Move the ON-DISK pair past the entry's token: an external re-login
+    // through the live session's own chain.
+    {
+        let mut profile = crate::profile::load_profile(&crate::profile::ProfileName::from(name))
+            .expect("fixture profile on disk");
+        let creds = profile.credentials.as_mut().expect("fixture credentials");
+        let oauth = creds.claude_ai_oauth.as_mut().expect("fixture oauth");
+        oauth.access_token = "at-new".into();
+        oauth.refresh_token = Some("rt-new".into());
+        crate::profile::save_profile(&profile).expect("save moved pair");
+    }
+    seed_usage_cache(name);
+    let entry = super::TokenEntry {
+        name: crate::profile::ProfileName::from(name),
+        access_token: "at-old".into(),
+        refresh_token: Some("rt-old".into()),
+        auto_start: false,
+        access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+        auth_broken: true,
+        may_open_window: true,
+    };
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+
+    crate::runtime::set_rotation_blocked_override(Some(true));
+    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    crate::runtime::set_rotation_blocked_override(None);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/api/oauth/usage")),
+        "the 401 probe must still run: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "a blocked rotation must not spend the refresh — the carry reads disk only: {seen:?}"
+    );
+    assert!(
+        !config
+            .lock()
+            .unwrap()
+            .is_auth_broken(&crate::profile::ProfileName::from(name)),
+        "the moved pair must lift the stale quarantine even under a live session"
+    );
+    assert!(
+        refetch.lock().unwrap().contains(name),
+        "the carried pair is refetched next tick"
+    );
+    assert_eq!(
+        outcome.rotated,
+        Some(("at-new".to_string(), Some("rt-new".to_string()))),
+        "the carried pair must sync the caller's TokenList"
+    );
+    assert_eq!(outcome.status, super::FetchStatus::Cached);
+}
+
+/// The sibling control under a forced refusal: the disk pair UNCHANGED and the
+/// entry unflagged. The carry finds nothing, so the guard still bails — no
+/// spend, no refetch. An unflagged entry keeps the pin sharp against the guard
+/// vanishing from the swapped order: without the bail the leg walks straight
+/// into the refresh, and the token call this server records would be the spend.
+#[test]
+fn a_live_session_blocking_rotation_with_an_unchanged_pair_still_bails() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "rot-blocked-unchanged";
+    let (base, server) = crate::testutil::serve_endpoints(2, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-leak","refresh_token":"rt-leak","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    {
+        let mut cfg = config.lock().unwrap();
+        cfg.state.active_profile = Some(crate::profile::ProfileName::from("other"));
+    }
+    // Leave the disk pair as the fixture's "rt-old" — the SAME pair the entry
+    // carries, so the carry must find nothing.
+    seed_usage_cache(name);
+    let entry = super::TokenEntry {
+        name: crate::profile::ProfileName::from(name),
+        access_token: "at-old".into(),
+        refresh_token: Some("rt-old".into()),
+        auto_start: false,
+        access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+        auth_broken: false,
+        may_open_window: true,
+    };
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+
+    crate::runtime::set_rotation_blocked_override(Some(true));
+    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    crate::runtime::set_rotation_blocked_override(None);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/api/oauth/usage")),
+        "the 401 probe must still run: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "an unchanged pair under a blocked rotation must not spend the refresh: {seen:?}"
+    );
+    assert!(refetch.lock().unwrap().is_empty(), "no refetch is queued");
+    assert_eq!(outcome.rotated, None, "nothing may be rotated");
+    assert_eq!(outcome.status, super::FetchStatus::Cached);
+}
+
+/// The unblocked control for the same seam: refusal forced OFF, moved pair —
+/// the carry outcome must be exactly the one the unforced path already serves,
+/// so the swap changed nothing the predicate cannot see. Also the seam's
+/// false-arm control: same call shape as the blocked pins, opposite value,
+/// opposite verdict.
+#[test]
+fn a_disarmed_refusal_keeps_the_carry_outcome_on_the_unblocked_path() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "rot-carry-disarmed";
+    let (base, server) = crate::testutil::serve_endpoints(2, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-leak","refresh_token":"rt-leak","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    {
+        let mut cfg = config.lock().unwrap();
+        cfg.state.active_profile = Some(crate::profile::ProfileName::from("other"));
+        cfg.set_auth_broken(&crate::profile::ProfileName::from(name), true);
+    }
+    // Move the ON-DISK pair past the entry's token.
+    {
+        let mut profile = crate::profile::load_profile(&crate::profile::ProfileName::from(name))
+            .expect("fixture profile on disk");
+        let creds = profile.credentials.as_mut().expect("fixture credentials");
+        let oauth = creds.claude_ai_oauth.as_mut().expect("fixture oauth");
+        oauth.access_token = "at-new".into();
+        oauth.refresh_token = Some("rt-new".into());
+        crate::profile::save_profile(&profile).expect("save moved pair");
+    }
+    seed_usage_cache(name);
+    let entry = super::TokenEntry {
+        name: crate::profile::ProfileName::from(name),
+        access_token: "at-old".into(),
+        refresh_token: Some("rt-old".into()),
+        auto_start: false,
+        access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+        auth_broken: true,
+        may_open_window: true,
+    };
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+
+    crate::runtime::set_rotation_blocked_override(Some(false));
+    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    crate::runtime::set_rotation_blocked_override(None);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/api/oauth/usage")),
+        "the 401 probe must still run: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "a carried pair must not spend the dead refresh: {seen:?}"
+    );
+    assert!(
+        !config
+            .lock()
+            .unwrap()
+            .is_auth_broken(&crate::profile::ProfileName::from(name)),
+        "the moved pair must lift the stale quarantine"
+    );
+    assert!(
+        refetch.lock().unwrap().contains(name),
+        "the carried pair is refetched next tick"
+    );
+    assert_eq!(
+        outcome.rotated,
+        Some(("at-new".to_string(), Some("rt-new".to_string()))),
+        "the carried pair must sync the caller's TokenList"
+    );
+    assert_eq!(outcome.status, super::FetchStatus::Cached);
+}
+
+/// A tokenless entry bails BEFORE anything else: the `let Some(rt)` guard
+/// stays first, ahead of both the carry and the macOS refusal, so nothing is
+/// queued and nothing rotates. The disk pair is MOVED so a carry that ran
+/// anyway would be visible — the inequality would fire it.
+#[test]
+fn a_tokenless_profile_bails_before_the_carry_runs() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "rot-tokenless";
+    let (base, server) = crate::testutil::serve_endpoints(2, |path, _| {
+        if path.starts_with("/api/oauth/usage") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-leak","refresh_token":"rt-leak","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    {
+        let mut cfg = config.lock().unwrap();
+        cfg.state.active_profile = Some(crate::profile::ProfileName::from("other"));
+        cfg.set_auth_broken(&crate::profile::ProfileName::from(name), true);
+    }
+    // Move the ON-DISK pair past the token the entry does not carry.
+    {
+        let mut profile = crate::profile::load_profile(&crate::profile::ProfileName::from(name))
+            .expect("fixture profile on disk");
+        let creds = profile.credentials.as_mut().expect("fixture credentials");
+        let oauth = creds.claude_ai_oauth.as_mut().expect("fixture oauth");
+        oauth.access_token = "at-new".into();
+        oauth.refresh_token = Some("rt-new".into());
+        crate::profile::save_profile(&profile).expect("save moved pair");
+    }
+    seed_usage_cache(name);
+    let entry = super::TokenEntry {
+        name: crate::profile::ProfileName::from(name),
+        access_token: "at-old".into(),
+        refresh_token: None,
+        auto_start: false,
+        access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+        auth_broken: true,
+        may_open_window: true,
+    };
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+
+    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/api/oauth/usage")),
+        "the 401 probe must still run: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "a tokenless profile has nothing to spend: {seen:?}"
+    );
+    assert!(
+        config
+            .lock()
+            .unwrap()
+            .is_auth_broken(&crate::profile::ProfileName::from(name)),
+        "nothing may lift the quarantine on a tokenless bail"
+    );
+    assert!(refetch.lock().unwrap().is_empty(), "no refetch is queued");
+    assert_eq!(outcome.rotated, None, "nothing may be rotated");
+    assert_eq!(outcome.status, super::FetchStatus::Cached);
+}
+
 // ── the rest of `fetch_with_rotation`, driven offline ────────────────────────
 //
 // Everything below the 401 arm above: the clock-expired-429 unmask, both retry
@@ -7256,6 +9353,7 @@ fn write_live_mirror(access: &str, expires_at: i64) {
             expires_at: Some(expires_at),
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
     std::fs::write(&live, serde_json::to_vec(&creds).expect("serialize mirror"))
@@ -7852,6 +9950,7 @@ fn write_rolling_sidecar(name: &str, exp_in_ms: i64) {
             expires_at: Some(crate::usage::now_ms() as i64 + exp_in_ms),
             scopes: Some(vec!["user:inference".into(), "user:profile".into()]),
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         },
     )
     .expect("stamp rolling sidecar");
@@ -8310,6 +10409,7 @@ fn claude_rolling_tick_relogin_hold_releases_on_a_credential_write() {
                 expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         })
         .expect("ser"),
@@ -8353,6 +10453,7 @@ fn claude_rolling_tick_reaches_the_gate_for_a_misfilled_sidecar() {
                 expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         })
         .expect("ser"),
@@ -8520,7 +10621,7 @@ fn auto_start_queue_election_picks_one_member_and_holds_the_rest() {
         third_party_tokens: Arc::new(RankedMutex::new(vec![])),
         third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
-        suppressed_generic: Arc::new(RankedMutex::new(HashMap::new())),
+        suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(false),
@@ -8736,7 +10837,7 @@ fn auto_start_queue_election_is_a_no_op_when_the_toggle_is_off() {
         third_party_tokens: Arc::new(RankedMutex::new(vec![])),
         third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
-        suppressed_generic: Arc::new(RankedMutex::new(HashMap::new())),
+        suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(false),

@@ -35,12 +35,14 @@ fn oauth_profile(name: &str, refresh: &str) -> Profile {
                 expires_at: None,
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         }),
         usage: None,
         fetch_status: None,
         provider: None,
         third_party_usage: None,
+        usage_stale: false,
     }
 }
 
@@ -68,6 +70,7 @@ fn endpoint_profile(name: &str) -> Profile {
         fetch_status: None,
         provider: None,
         third_party_usage: None,
+        usage_stale: false,
     }
 }
 
@@ -95,6 +98,7 @@ fn blank_profile(name: &str) -> Profile {
         fetch_status: None,
         provider: None,
         third_party_usage: None,
+        usage_stale: false,
     }
 }
 
@@ -106,6 +110,7 @@ fn live_oauth(refresh: Option<&str>) -> ClaudeCredentials {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     }
 }
@@ -140,6 +145,7 @@ fn live_session_token(access: &str) -> ClaudeCredentials {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     }
 }
@@ -471,6 +477,7 @@ fn a_rotating_login_is_never_attributed_to_a_sidecar() {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
     assert_eq!(
@@ -728,7 +735,8 @@ fn json_tier_agrees_with_the_status_json_surface() {
     let resolved = ("kerry".to_string(), Source::RefreshMatch);
 
     let which = json_view(&config, Some(&resolved));
-    let status = crate::daemon::build_status(&config, 60_000, None, false);
+    let status =
+        serde_json::to_value(crate::daemon::build_status(&config, 60_000, None, false)).unwrap();
 
     assert_eq!(which["tier"], "Free", "fixture control: the cached tier");
     assert_eq!(
@@ -767,7 +775,8 @@ fn json_base_url_carries_a_third_partys_endpoint() {
     let resolved = ("deepseek".to_string(), Source::CredentialLessActive);
 
     let value = json_view(&config, Some(&resolved));
-    let status = crate::daemon::build_status(&config, 60_000, None, false);
+    let status =
+        serde_json::to_value(crate::daemon::build_status(&config, 60_000, None, false)).unwrap();
 
     assert_eq!(value["base_url"], "https://api.deepseek.com/anthropic");
     assert!(

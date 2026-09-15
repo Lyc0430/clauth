@@ -36,6 +36,7 @@ fn oauth_profile(name: &str, five_hour_pct: f64) -> Profile {
         fetch_status: None,
         provider: None,
         third_party_usage: None,
+        usage_stale: false,
     }
 }
 
@@ -63,6 +64,7 @@ fn provider_profile(name: &str) -> Profile {
         fetch_status: None,
         provider: None,
         third_party_usage: None,
+        usage_stale: false,
     }
 }
 

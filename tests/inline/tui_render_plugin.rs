@@ -23,6 +23,9 @@ fn entry(enabled: bool, min: Option<&str>, warnings: Vec<&str>) -> RegistryEntry
         min_herdr_version: min.map(str::to_string),
         plugin_root: None,
         source_kind: Some("github".into()),
+        resolved_commit: None,
+        source_owner: None,
+        source_repo: None,
         warnings: warnings.into_iter().map(str::to_string).collect(),
     }
 }
@@ -439,40 +442,6 @@ fn the_delegates_pane_reports_what_monitor_reports_for_the_same_record() {
             crate::usage::humanize_duration(idle as i64)
         )),
         "the next deadline disagrees with monitor's {payload}: {facts}"
-    );
-}
-
-/// A record an older server wrote carries no deadlines at all, and both surfaces
-/// have to say so rather than counting down from a default. Real bytes: the
-/// shape is one only a previous version emitted, so a struct literal would agree
-/// with whatever the fields are today and prove nothing about the wire.
-#[test]
-fn a_record_from_an_older_server_reads_as_liveness_not_recorded() {
-    let _home = crate::testutil::HomeSandbox::new();
-    let dir = jobs::jobs_dir().unwrap();
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(
-        dir.join("d-legacy-0.json"),
-        format!(
-            r#"{{"job_id":"d-legacy-0","profile":"uwuclxdy","state":"running","started_at":{}}}"#,
-            NOW - 61_000
-        ),
-    )
-    .unwrap();
-
-    let cells = super::delegate_cells(&jobs::list_banded(NOW), NOW);
-    let facts = cells[0].facts.join(" · ");
-    assert!(
-        facts.contains("elapsed 1m 1s"),
-        "the one figure such a record still supports: {facts}"
-    );
-    assert!(
-        facts.contains("liveness not recorded"),
-        "and the rest is named absent, never counted down from a default: {facts}"
-    );
-    assert!(
-        !facts.contains("kill in"),
-        "no deadline is invented for it: {facts}"
     );
 }
 

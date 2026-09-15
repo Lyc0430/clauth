@@ -105,14 +105,15 @@ fn delegate_depth_refusal_answers_prose_in_one_block() {
         DelegateArgs {
             profiles: Some(vec!["any".to_string()]),
             prompt: Some("hi".to_string()),
-            prompt_file: None,
             model: None,
             cwd: None,
             env: None,
             args: None,
-            timeout_secs: None,
-            idle_secs: None,
-            resume: None,
+            session_id: None,
+            subagent_type: None,
+            allowed_tools: None,
+            permission_mode: None,
+            result: None,
             isolated: None,
             background: None,
         },
@@ -135,15 +136,10 @@ fn delegate_depth_refusal_answers_prose_in_one_block() {
 
 #[test]
 fn monitor_invalid_job_id_answers_prose_in_one_block() {
-    let prose = drive(ClauthServer::new().monitor_with(
-        MonitorArgs {
-            job_ids: Some(vec!["../evil".to_string()]),
-            wait_secs: None,
-            return_on: None,
-            cancel: None,
-        },
-        ProgressSink::none(),
-    ));
+    let prose = drive(ClauthServer::new().monitor_with(MonitorArgs {
+        job_ids: Some(vec!["../evil".to_string()]),
+        cancel: None,
+    }));
     assert_eq!(prose.is_error, Some(true));
     assert_eq!(assert_one_prose_block(&prose), "error: invalid job_id");
 }

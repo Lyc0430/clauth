@@ -6,11 +6,9 @@
 //! request between calls — so this is the pull-shaped answer: every reply that
 //! already carries a live-usage footer (`profiles({scope:"session"})`,
 //! `switch_profile`, `delegate`, `monitor`) names what moved since the last
-//! digest-bearing reply, and `monitor` with no `job_ids` long-polls the same
-//! comparison for a caller that wants to block until something moves.
+//! digest-bearing reply.
 //!
-//! Three observables, all local disk, zero network and zero quota on every
-//! path including the state-waiting loop:
+//! Three observables, all local disk, zero network and zero quota:
 //!
 //! - the config's `active_profile` VALUE (content, not mtime — a rewrite that
 //!   keeps the name is not news);
@@ -43,14 +41,10 @@
 //!   session-scope roster does, because nothing of ours moved.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::SystemTime;
 
 use crate::lockorder::RankedMutex;
 use crate::lockorder::rank::McpDigest;
-
-/// Poll cadence for `monitor`'s state-waiting long-poll, mirroring the job
-/// mode's `JOB_POLL_INTERVAL` so both modes answer on the same rhythm.
-const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Which observables one call watches. There is no filtered subset anymore:
 /// `monitor`'s state mode and every folded reply watch all three, so this is a
@@ -266,73 +260,11 @@ impl DigestTracker {
         *self.lock() = Some(sample_digest());
     }
 
-    /// Long-poll for a change in the watched set: check, sleep one
-    /// [`WATCH_POLL_INTERVAL`] slice, repeat, until something moves or
-    /// `wait_secs` elapses. Mirrors the job mode's `wait_for_done` cadence;
-    /// the baseline lock is taken and dropped inside [`report`], never held
-    /// across a sleep OR an await. `wait_secs` 0 samples exactly once. Each
-    /// slice re-reads `profiles.toml` and two file stats: small local reads
-    /// whose total is bounded by `wait_secs`, and a cached value could not see
-    /// the writer this loop exists to catch.
-    ///
-    /// It ticks the same progress sink the job mode does, on the same throttle:
-    /// one tool cannot hold two ceilings, and the raised ceiling is only safe on
-    /// a peer that receives progress. It races the same cancellation token too,
-    /// so a client abandoning the call ends the loop instead of leaving it to
-    /// run out an hour against a request id that no longer exists.
-    pub(super) async fn watch(
-        &self,
-        watched: WatchSet,
-        wait_secs: u64,
-        progress: &mut super::ProgressSink,
-    ) -> WatchOutcome {
-        let start = Instant::now();
-        let deadline = Duration::from_secs(wait_secs);
-        let mut cancelled = false;
-        loop {
-            match self.report(watched) {
-                DigestVerdict::Changed(delta) => return WatchOutcome::Changed(delta),
-                // A first call with no wait arms the baseline and answers at
-                // once; with a wait it keeps polling against the baseline it
-                // just established, which is a real comparison from here on.
-                DigestVerdict::Seeded if wait_secs == 0 => return WatchOutcome::Armed,
-                DigestVerdict::Seeded | DigestVerdict::Unchanged
-                    if cancelled || start.elapsed() >= deadline =>
-                {
-                    return WatchOutcome::Unchanged {
-                        waited_secs: start.elapsed().as_secs(),
-                    };
-                }
-                DigestVerdict::Seeded | DigestVerdict::Unchanged => {}
-            }
-            progress
-                .tick(|| {
-                    format!(
-                        "waiting on clauth's state, {}s of {wait_secs}s",
-                        start.elapsed().as_secs()
-                    )
-                })
-                .await;
-            cancelled = progress.sleep_or_cancelled(WATCH_POLL_INTERVAL).await;
-        }
-    }
-
     fn lock(&self) -> crate::lockorder::RankedGuard<'_, Option<DigestSample>> {
         self.shared
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
-}
-
-/// Result of `monitor`'s state-waiting long-poll.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum WatchOutcome {
-    /// No baseline existed and there was no wait: this call set it.
-    Armed,
-    /// The wait elapsed with nothing in the watched set having moved.
-    Unchanged { waited_secs: u64 },
-    /// Something moved; the delta is carried (and consumed).
-    Changed(DigestDelta),
 }
 
 /// How a folded reply treats the digest baseline alongside its live-usage

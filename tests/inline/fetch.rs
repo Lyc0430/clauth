@@ -662,6 +662,98 @@ fn retry_after_parses_delta_seconds_and_http_date() {
     );
 }
 
+/// The parser clamps a server `retry-after` at
+/// [`crate::usage::MAX_RETRY_AFTER_MS`] (cloudy's 2026-09-07 ruling, applied at
+/// the source so no consumer's `as_millis() as u64` cast can wrap: 2^61
+/// delta-seconds would otherwise cast to exactly 0 ms — "retry now"). A hint
+/// past the cap becomes exactly the cap; at or under it passes verbatim;
+/// `Duration::ZERO` survives.
+#[test]
+fn retry_after_clamps_huge_hints_at_max() {
+    let cap = Duration::from_millis(crate::usage::MAX_RETRY_AFTER_MS);
+    // 2^61 delta-seconds: unbounded today, and the wrapping-cast input.
+    assert_eq!(
+        parse_retry_after_at("2305843009213693952", 0),
+        Some(cap),
+        "2^61 delta-seconds clamps to the cap"
+    );
+    // The 15-minute boundary, both sides.
+    assert_eq!(
+        parse_retry_after_at("899", 0),
+        Some(Duration::from_secs(899)),
+        "just under the cap passes verbatim"
+    );
+    assert_eq!(
+        parse_retry_after_at("900", 0),
+        Some(cap),
+        "exactly at the cap passes verbatim"
+    );
+    assert_eq!(
+        parse_retry_after_at("901", 0),
+        Some(cap),
+        "just over the cap clamps to it"
+    );
+    // A far-future HTTP-date clamps the same way, on the date branch.
+    assert_eq!(
+        parse_retry_after_at("Fri, 31 Dec 9999 23:59:59 GMT", 0),
+        Some(cap),
+        "a far-future HTTP-date clamps to the cap"
+    );
+    // A past date is still `ZERO` ("retry now") — the clamp never widens it.
+    assert_eq!(
+        parse_retry_after_at("Wed, 21 Oct 2015 07:28:00 GMT", 1_445_412_480 + 120),
+        Some(Duration::ZERO)
+    );
+}
+
+/// Out-of-range HTTP-date fields are rejected BEFORE any calendar arithmetic:
+/// `None`, never a garbage delay. The year bound is the IMF-fixdate 4DIGIT
+/// grammar (0..=9999); the day must exist in its month (leap-year-correct
+/// February); time fields must be non-negative.
+#[test]
+fn retry_after_rejects_invalid_calendar_dates() {
+    // 30 Feb 2015 is not a calendar date.
+    assert_eq!(
+        parse_retry_after_at("Wed, 30 Feb 2015 07:28:00 GMT", 0),
+        None
+    );
+    // 29 Feb parses in a leap year and only in a leap year.
+    // 2016-02-29 07:28:00 GMT == 1_456_730_880 epoch seconds.
+    assert_eq!(
+        parse_retry_after_at("Mon, 29 Feb 2016 07:28:00 GMT", 1_456_730_880 - 60),
+        Some(Duration::from_secs(60)),
+        "leap-day February parses"
+    );
+    assert_eq!(
+        parse_retry_after_at("Sun, 29 Feb 2015 07:28:00 GMT", 1_456_730_880 - 60),
+        None,
+        "non-leap February has no 29th"
+    );
+    // Negative time field: today `hour > 23` admits it and shifts the delay.
+    assert_eq!(
+        parse_retry_after_at("Wed, 21 Oct 2015 -07:28:00 GMT", 0),
+        None,
+        "a negative hour is malformed"
+    );
+    // 5-digit year: in range for i64, outside the 4DIGIT grammar.
+    assert_eq!(
+        parse_retry_after_at("Wed, 21 Oct 10000 07:28:00 GMT", 0),
+        None
+    );
+}
+
+/// An i64-scale year must be no-hint (`None`) on BOTH profiles: today it
+/// overflows `days_from_civil`'s `era * 146097` in debug (panic) and wraps to
+/// garbage in release.
+#[test]
+fn retry_after_rejects_huge_year_without_panic() {
+    assert_eq!(
+        parse_retry_after_at("Wed, 21 Oct 9223372036854775807 07:28:00 GMT", 0),
+        None,
+        "an i64-scale year is no hint, not a panic"
+    );
+}
+
 /// `reserve_slot` spaces same-host requests by `REQUEST_SPACING_MS`: a cold slot
 /// (now already past it) fires immediately, and a slot still ahead of now waits
 /// until it — each reservation advancing that host's slot by exactly one spacing.

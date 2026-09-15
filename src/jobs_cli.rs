@@ -280,29 +280,15 @@ fn elapsed_cell(row: &JobRow) -> String {
 
 /// How long since the run's last line of output.
 ///
-/// Three spellings over FOUR inputs, and the dash is the overloaded one: an age
-/// where a stamp exists, `never` where a run is going and has said nothing yet,
-/// and `-` for both a record with no run AND one written before the liveness
-/// fields existed, which has a run going and no way to answer. Collapsing
-/// `never` into the dash as well would report a delegate that has produced
-/// nothing exactly like a finished one, which is the distinction worth a
-/// spelling.
-///
-/// The two dash causes are NOT told apart here, deliberately: a table column has
-/// one cell, and `monitor`'s running check is the surface that separates them
-/// (`liveness not recorded (started under an older clauth)`). `--json` separates
-/// them structurally instead — `elapsed_secs` is non-null exactly when a run is
-/// going.
+/// Two spellings: an age where a stamp exists, `never` where a run is going and
+/// has said nothing yet. `-` is the no-run row. Output age always renders for a
+/// running record, so there is no pre-liveness spelling to tell apart.
 fn last_output_cell(row: &JobRow) -> String {
     let Some(live) = row.live else {
         return "-".to_string();
     };
     match live.last_output_secs_ago {
         Some(secs) => duration_cell(secs),
-        // A record from before the liveness fields existed knows nothing about
-        // its own output; one that has them and no stamp has genuinely said
-        // nothing.
-        None if !live.recorded => "-".to_string(),
         None => "never".to_string(),
     }
 }
@@ -314,13 +300,10 @@ fn last_output_cell(row: &JobRow) -> String {
 /// would be a second derivation of a question the TUI pane already answers its
 /// own way for a row that has one cell to spend.
 ///
-/// A dash here does NOT mean "clauth knows there is no deadline". A run
-/// legitimately has neither — a streaming run has no wall clock, a
-/// pinned-`--output-format` one no idle guard — and a record written before the
-/// liveness fields carries neither because that server recorded nothing. The
-/// first is clauth knowing there is none, the second is clauth not knowing, and
-/// this column renders both as `-`. That split `monitor` keeps (`no wall clock` against
-/// `liveness not recorded`); a table cell cannot, so it claims neither.
+/// A dash here does NOT mean "clauth knows there is no deadline". A new record
+/// carries no deadline pair because a delegate has none anymore; an old record
+/// carried neither only if its server recorded none. This column renders both as
+/// `-` and claims neither.
 fn kill_cell(row: &JobRow) -> String {
     let Some(live) = row.live else {
         return "-".to_string();

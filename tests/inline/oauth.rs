@@ -8,7 +8,6 @@
 use super::*;
 use crate::lockorder::RankedMutex;
 use crate::profile::{AppState, ClaudeCredentials, OAuthToken, Profile, profile_dir};
-use crate::runtime::open_pid_file;
 use crate::usage::is_idle;
 
 /// Read an ENTIRE HTTP request (headers + any `Content-Length` body) off a
@@ -76,12 +75,14 @@ fn single_profile_config(name: &str, refresh_token: &str) -> AppConfig {
                 expires_at: None,
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         }),
         usage: None,
         fetch_status: None,
         provider: None,
         third_party_usage: None,
+        usage_stale: false,
     };
     let mut config = AppConfig {
         state: AppState::default(),
@@ -92,20 +93,6 @@ fn single_profile_config(name: &str, refresh_token: &str) -> AppConfig {
 }
 
 use crate::testutil::HomeSandbox;
-
-/// Simulate a live `clauth start` session for `name`: a locked marker in its
-/// sessions dir reads as alive via `has_live_session`. The caller must hold the
-/// returned file for as long as the session should read as live — dropping it
-/// releases the flock.
-fn arm_live_session(name: &str) -> std::fs::File {
-    let sessions = profile_dir(&crate::profile::ProfileName::from(name))
-        .expect("profile_dir")
-        .join("sessions");
-    std::fs::create_dir_all(&sessions).expect("create sessions dir");
-    let file = open_pid_file(&sessions.join("test-pid")).expect("open pid file");
-    file.lock().expect("lock pid file");
-    file
-}
 
 #[test]
 fn no_live_session_included_with_force_false() {
@@ -126,9 +113,9 @@ fn no_live_session_included_with_force_true() {
 
 #[test]
 fn live_session_included_when_force_false() {
-    let _home = HomeSandbox::new();
+    let home = HomeSandbox::new();
     let name = "test-oauth-live-session-guard";
-    let file = arm_live_session(name);
+    let file = crate::testutil::arm_live_session(home.home(), name);
 
     let config = single_profile_config(name, "rt-ghi");
     let candidates = rotation_candidates(&config, false);
@@ -147,9 +134,9 @@ fn live_session_included_when_force_false() {
 
 #[test]
 fn live_session_included_with_force_true() {
-    let _home = HomeSandbox::new();
+    let home = HomeSandbox::new();
     let name = "test-oauth-live-session-force";
-    let file = arm_live_session(name);
+    let file = crate::testutil::arm_live_session(home.home(), name);
 
     let config = single_profile_config(name, "rt-jkl");
     let candidates = rotation_candidates(&config, true);
@@ -211,12 +198,14 @@ fn rotate_one_no_stamp_when_no_refresh_token() {
                 expires_at: None,
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         }),
         usage: None,
         fetch_status: None,
         provider: None,
         third_party_usage: None,
+        usage_stale: false,
     };
     let mut config = AppConfig {
         state: AppState::default(),
@@ -276,12 +265,14 @@ fn profile_without_refresh_token_excluded() {
                 expires_at: None,
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         }),
         usage: None,
         fetch_status: None,
         provider: None,
         third_party_usage: None,
+        usage_stale: false,
     };
     let mut config = AppConfig {
         state: AppState::default(),
@@ -370,12 +361,14 @@ fn oauth_config(name: &str, refresh_token: Option<&str>, expires_at: Option<i64>
                 expires_at,
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         }),
         usage: None,
         fetch_status: None,
         provider: None,
         third_party_usage: None,
+        usage_stale: false,
     };
     let mut config = AppConfig {
         state: AppState::default(),
@@ -411,6 +404,7 @@ fn third_party_config(name: &str) -> AppConfig {
         fetch_status: None,
         provider: None,
         third_party_usage: None,
+        usage_stale: false,
     };
     let mut config = AppConfig {
         state: AppState::default(),
@@ -513,9 +507,9 @@ fn gate_valid_token_ready_without_refresh() {
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn gate_refreshes_an_expiring_token_under_a_live_session() {
-    let _home = HomeSandbox::new();
+    let home = HomeSandbox::new();
     let name = "test-gate-live-session";
-    let file = arm_live_session(name);
+    let file = crate::testutil::arm_live_session(home.home(), name);
     let handle = Arc::new(RankedMutex::new(oauth_config(
         name,
         Some("rt-old"),
@@ -553,9 +547,9 @@ fn gate_refreshes_an_expiring_token_under_a_live_session() {
 #[cfg(target_os = "macos")]
 #[test]
 fn gate_installs_as_is_under_a_live_session_on_macos() {
-    let _home = HomeSandbox::new();
+    let home = HomeSandbox::new();
     let name = "test-gate-live-session-macos";
-    let file = arm_live_session(name);
+    let file = crate::testutil::arm_live_session(home.home(), name);
     let handle = Arc::new(RankedMutex::new(oauth_config(
         name,
         Some("rt-old"),
@@ -893,6 +887,7 @@ mod keychain_mirror_gate {
                 expires_at: None,
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         }
     }
@@ -990,6 +985,7 @@ mod adopt_live_rotation {
                 expires_at,
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         }
     }
@@ -1659,6 +1655,7 @@ mod adopt_live_rotation {
                     expires_at: Some(future_expiry() + 86_400_000),
                     scopes: None,
                     subscription_type: None,
+                    ..crate::profile::OAuthToken::default_extra()
                 }),
             })
             .unwrap(),
@@ -2031,6 +2028,7 @@ fn save_disk_profile(name: &str, refresh: &str, expires_at: Option<i64>) {
             expires_at,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     crate::profile::save_profile(&p).expect("save disk profile");
@@ -2697,6 +2695,7 @@ fn gate_session_token_ready_even_when_auth_broken() {
                 expires_at: None,
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         })
         .expect("ser"),
@@ -2738,6 +2737,7 @@ fn gate_refuses_a_mint_inside_ccs_refresh_window() {
                     expires_at: Some(crate::usage::now_ms() as i64 + exp_in_ms),
                     scopes: None,
                     subscription_type: None,
+                    ..crate::profile::OAuthToken::default_extra()
                 }),
             })
             .expect("ser"),
@@ -2781,8 +2781,11 @@ fn gate_refuses_a_mint_inside_ccs_refresh_window() {
 // HTTP call, so nothing that stops short of answering that call can see it.
 
 /// A live-session profile whose stored pair the leg would spend.
-fn live_rotate_fixture(name: &str) -> (crate::profile::ConfigHandle, std::fs::File) {
-    let pid = arm_live_session(name);
+fn live_rotate_fixture(
+    home: &std::path::Path,
+    name: &str,
+) -> (crate::profile::ConfigHandle, std::fs::File) {
+    let pid = crate::testutil::arm_live_session(home, name);
     (
         crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name)),
         pid,
@@ -2804,7 +2807,7 @@ fn rotate_one_inner_rotates_under_a_live_session() {
         )
     });
     let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
-    let (config, pid) = live_rotate_fixture(name);
+    let (config, pid) = live_rotate_fixture(home.home(), name);
     let activity: ActivityStore = Arc::new(RankedMutex::new(std::collections::HashMap::new()));
     let (tx, rx) = mpsc::channel();
 
@@ -2847,7 +2850,7 @@ fn rotate_one_inner_does_not_rotate_under_a_live_session_on_macos() {
         )
     });
     let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
-    let (config, pid) = live_rotate_fixture(name);
+    let (config, pid) = live_rotate_fixture(home.home(), name);
     let activity: ActivityStore = Arc::new(RankedMutex::new(std::collections::HashMap::new()));
     let (tx, rx) = mpsc::channel();
 
@@ -3428,6 +3431,7 @@ fn rotate_names_the_api_key_command_for_a_keyless_third_party_profile() {
             expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     crate::profile::save_profile(&profile).expect("save profile");
@@ -3488,6 +3492,7 @@ fn rotate_names_the_split_state_for_a_keyed_third_party_profile() {
             expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     crate::profile::save_profile(&profile).expect("save profile");
@@ -3652,6 +3657,7 @@ fn rolling_gate_fresh_sidecar_ready_without_refresh() {
             expires_at: Some(future_expiry()),
             scopes: None,
             subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
         },
     )
     .expect("feed");
@@ -3740,6 +3746,7 @@ fn rolling_gate_stale_sidecar_feeds_from_comfortable_chain_without_spend() {
             expires_at: Some(past_expiry()),
             scopes: None,
             subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
         },
     )
     .expect("feed");
@@ -3792,6 +3799,7 @@ fn rolling_gate_stale_sidecar_stale_chain_refreshes_and_restamps() {
             expires_at: Some(past_expiry()),
             scopes: None,
             subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
         },
     )
     .expect("feed");
@@ -3873,6 +3881,7 @@ fn rolling_gate_dead_chain_restores_static_mint() {
             expires_at: Some(past_expiry()),
             scopes: None,
             subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
         },
     )
     .expect("feed");
@@ -3907,6 +3916,7 @@ fn rolling_gate_dead_chain_without_backup_stays_broken() {
             expires_at: Some(past_expiry()),
             scopes: None,
             subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
         },
     )
     .expect("feed");
@@ -4059,6 +4069,7 @@ fn rotation_hook_never_overwrites_a_misfilled_sidecar() {
                 expires_at: Some(future_expiry()),
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         })
         .expect("ser"),
@@ -4106,6 +4117,7 @@ fn rolling_gate_heals_a_misfilled_sidecar_when_a_backup_exists() {
             expires_at: Some(future_expiry()),
             scopes: None,
             subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
         },
     )
     .expect("feed preserves mint");
@@ -4119,6 +4131,7 @@ fn rolling_gate_heals_a_misfilled_sidecar_when_a_backup_exists() {
                 expires_at: Some(future_expiry()),
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         })
         .expect("ser"),
@@ -4212,6 +4225,7 @@ fn rolling_gate_misfill_without_backup_keeps_the_disengaged_vanilla_posture() {
                 expires_at: Some(future_expiry()),
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         })
         .expect("ser"),
@@ -4272,6 +4286,7 @@ fn restamp_due_fires_inside_the_horizon_or_on_a_misfill() {
                 expires_at: Some(beyond_horizon_expiry()),
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         })
         .expect("ser"),
@@ -4293,6 +4308,7 @@ fn restamp_due_fires_inside_the_horizon_or_on_a_misfill() {
                 "user:profile".to_string(),
             ]),
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         },
     )
     .expect("stamp");
@@ -4311,6 +4327,7 @@ fn restamp_due_fires_inside_the_horizon_or_on_a_misfill() {
                 "user:profile".to_string(),
             ]),
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         },
     )
     .expect("stamp");
@@ -4337,6 +4354,7 @@ fn restamp_restamps_a_dying_bearer_the_switch_gate_calls_fresh() {
             expires_at: Some(future_expiry()), // +1h: dying,  but "fresh" to the switch gate
             scopes: None,
             subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
         },
     )
     .expect("feed");
@@ -4387,6 +4405,7 @@ fn restamp_rotates_when_the_chain_is_inside_the_horizon_too() {
             expires_at: Some(future_expiry()),
             scopes: None,
             subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
         },
     )
     .expect("feed");
@@ -4436,6 +4455,7 @@ fn rolling_gate_dead_chain_with_expired_backup_stays_broken() {
                 "user:sessions:claude_code".to_string(),
             ]),
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
     std::fs::write(
@@ -4452,6 +4472,7 @@ fn rolling_gate_dead_chain_with_expired_backup_stays_broken() {
             expires_at: Some(past_expiry()),
             scopes: None,
             subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
         },
     )
     .expect("stamp");
@@ -4500,6 +4521,7 @@ fn restamp_never_parks_behind_a_held_rotation_lock() {
                 "user:profile".to_string(),
             ]),
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         },
     )
     .expect("stamp");
@@ -4572,6 +4594,7 @@ fn restamp_on_a_misfill_with_no_live_backup_never_takes_the_vanilla_gate() {
             expires_at: Some(now_ms() as i64 + 3_600_000),
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
     std::fs::write(
@@ -4591,6 +4614,7 @@ fn restamp_on_a_misfill_with_no_live_backup_never_takes_the_vanilla_gate() {
                 "user:sessions:claude_code".to_string(),
             ]),
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
     std::fs::write(
@@ -4714,6 +4738,7 @@ fn rotated_tokens_do_not_resurrect_a_deleted_profile() {
             expires_at: Some(future_expiry()),
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     crate::profile::save_profile(&profile).expect("save profile");
@@ -4877,6 +4902,205 @@ fn mark_auth_broken_does_not_resurrect_a_deleted_profiles_row() {
             .find(&crate::profile::ProfileName::from("kept-row"))
             .is_some(),
         "the surviving profile's row is untouched"
+    );
+}
+
+// ── quarantine persist-retry pins ──────────────────────────────────────────
+//
+// The quarantine write goes to disk, and disk can refuse it. These pins hold
+// `mark_auth_broken` to the contract that keeps a refused write recoverable
+// in-process: the memory flag flips anyway (live readers keep skipping the
+// refresh spend on a quarantined account), the refusal is logged once naming
+// the profile and direction, and the NEXT call is the retry — which is why
+// the persist cannot sit behind the memory gate: after a failed write memory
+// already matches, and the changed-return would early-return the retry away.
+
+/// One OAuth profile on disk and in a fresh handle, with the on-disk
+/// `auth_broken` list seeded to `broken`.
+fn quarantine_persist_fixture(name: &str, broken: bool) -> crate::profile::ConfigHandle {
+    let profile = Profile::new(name.to_string(), None, None);
+    let state = AppState {
+        profiles: vec![name.into()],
+        auth_broken: broken.then(|| name.into()).into_iter().collect(),
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("save state");
+    Arc::new(RankedMutex::new(AppConfig {
+        state,
+        profiles: vec![profile],
+    }))
+}
+
+/// Make the next `set_auth_broken_persisted` fail: a DIRECTORY where
+/// `profiles.toml` should be makes the read inside the persist fail, the same
+/// injection `testutil::block_credentials_write` aims at a credentials write.
+/// The last-good file is gone until [`unblock_state_persist`] restores it.
+fn block_state_persist() {
+    let path = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("profiles.toml");
+    std::fs::remove_file(&path).expect("drop the last-good state file");
+    std::fs::create_dir(&path).expect("block the state file with a directory");
+}
+
+/// Put `state` back as the on-disk `profiles.toml` — the file the failed
+/// write never touched, rewritten through the production saver.
+fn unblock_state_persist(state: &AppState) {
+    let path = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("profiles.toml");
+    std::fs::remove_dir(&path).expect("drop the blocking directory");
+    crate::profile::save_app_state(state).expect("restore the last-good state");
+}
+
+/// A refused quarantine write must not vanish: the flag flips in memory (the
+/// scheduler's TokenEntry leg reads `config.is_auth_broken` to skip the
+/// refresh spend, so this is what keeps a quarantined account quarantined for
+/// live readers), the refusal is logged with the profile and direction, and
+/// the next call — whose memory already matches, so the changed-return cannot
+/// gate it — retries the write and re-logs nothing.
+#[test]
+fn a_failed_set_persist_is_logged_and_retried_by_the_next_call() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("qp-set");
+    let handle = quarantine_persist_fixture("qp-set", false);
+    let sink = crate::logline::LogLines::new();
+    let _capture = sink.capture_here();
+
+    block_state_persist();
+    mark_auth_broken(&handle, &name, true);
+
+    assert!(
+        handle.lock().expect("lock handle").is_auth_broken(&name),
+        "the in-memory flag flips even when the write is refused"
+    );
+    let lines = sink.snapshot();
+    assert_eq!(
+        lines.len(),
+        2,
+        "one transition line, one failure line — nothing else: {lines:?}"
+    );
+    assert_eq!(
+        lines[0],
+        "clauth: login for 'qp-set' has expired: refresh token revoked or \
+         invalid: run clauth login qp-set (flagged auth_broken)"
+    );
+    assert!(
+        lines[1]
+            .starts_with("clauth: failed to persist auth_broken set for 'qp-set': failed to read "),
+        "the failure line names the profile and the direction: {lines:?}"
+    );
+
+    // The next poll is the retry: with the failure removed it lands the flag
+    // on disk, and the memory-matching call re-logs nothing.
+    unblock_state_persist(&AppState {
+        profiles: vec![name.clone()],
+        ..AppState::default()
+    });
+    assert!(
+        !crate::profile::load_app_state()
+            .expect("reload")
+            .is_auth_broken(&name),
+        "fixture control: the restored last-good file carries no flag"
+    );
+    mark_auth_broken(&handle, &name, true);
+    assert!(
+        crate::profile::load_app_state()
+            .expect("reload")
+            .is_auth_broken(&name),
+        "the retry lands the flag on disk"
+    );
+    assert_eq!(
+        sink.snapshot().len(),
+        2,
+        "the retry adds no log lines: {:?}",
+        sink.snapshot()
+    );
+}
+
+/// The clear direction mirrors the set: memory heals even when the write is
+/// refused, the refusal is logged, and the next call retries it onto disk.
+#[test]
+fn a_failed_clear_persist_is_logged_and_retried_by_the_next_call() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("qp-clear");
+    let handle = quarantine_persist_fixture("qp-clear", true);
+    let sink = crate::logline::LogLines::new();
+    let _capture = sink.capture_here();
+
+    block_state_persist();
+    mark_auth_broken(&handle, &name, false);
+
+    assert!(
+        !handle.lock().expect("lock handle").is_auth_broken(&name),
+        "memory clears even when the write is refused"
+    );
+    let lines = sink.snapshot();
+    assert_eq!(
+        lines.len(),
+        2,
+        "one transition line, one failure line — nothing else: {lines:?}"
+    );
+    assert_eq!(
+        lines[0],
+        "clauth: 'qp-clear' re-authenticated: auth_broken cleared"
+    );
+    assert!(
+        lines[1].starts_with(
+            "clauth: failed to persist auth_broken clear for 'qp-clear': failed to read "
+        ),
+        "the failure line names the profile and the direction: {lines:?}"
+    );
+
+    unblock_state_persist(&AppState {
+        profiles: vec![name.clone()],
+        auth_broken: vec![name.clone()],
+        ..AppState::default()
+    });
+    assert!(
+        crate::profile::load_app_state()
+            .expect("reload")
+            .is_auth_broken(&name),
+        "fixture control: the restored last-good file still carries the flag"
+    );
+    mark_auth_broken(&handle, &name, false);
+    assert!(
+        !crate::profile::load_app_state()
+            .expect("reload")
+            .is_auth_broken(&name),
+        "the retry clears the flag on disk"
+    );
+    assert_eq!(
+        sink.snapshot().len(),
+        2,
+        "the retry adds no log lines: {:?}",
+        sink.snapshot()
+    );
+}
+
+/// The honest boundary of the in-process retry: a write that never reached
+/// disk and whose process died before a retry is invisible to a fresh load —
+/// the pre-existing semantics of an unwritten flag, pinned so the retry
+/// cannot silently widen into restart-time resurrection.
+#[test]
+fn a_failed_set_persist_that_never_retried_stays_invisible_to_a_fresh_load() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("qp-dead");
+    let handle = quarantine_persist_fixture("qp-dead", false);
+
+    block_state_persist();
+    // Refused; the "process" dies here, before any retry.
+    mark_auth_broken(&handle, &name, true);
+
+    unblock_state_persist(&AppState {
+        profiles: vec![name.clone()],
+        ..AppState::default()
+    });
+    assert!(
+        !crate::profile::load_app_state()
+            .expect("fresh load")
+            .is_auth_broken(&name),
+        "a write that never landed leaves no flag for the next process"
     );
 }
 

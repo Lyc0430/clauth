@@ -7,7 +7,7 @@
 | Tab | Holds | You can |
 |-----|-------|---------|
 | **Overview** | account table, live 5h / 7d bars, chain position | switch accounts, reorder them |
-| **Usage** | per-account window breakdown: 5h, 7d, per-model weeks, extra-usage spend | refresh one account, toggle estimates and the pace marker |
+| **Usage** | per-account window breakdown: 5h, 7d, per-model weeks, extra-usage spend, peak-rate state | refresh one account, toggle estimates and the pace marker |
 | **Tokens** | global Claude Code token stats and API-equivalent cost | drill into models, change the period lens, count cache tokens |
 | **Setup** | per-account endpoint, key, env, model routing, auto-start | edit any of it, log in, log out, disable, delete |
 | **Fallback** | the auto-switch chain | reorder members, edit thresholds, flip gates, set a spend ceiling |
@@ -15,7 +15,7 @@
 | **Status** | incidents from status.claude.com with per-component health | open an incident's timeline or its page in a browser |
 | **Plugin** | Claude Code wiring health, per-profile runtime state, running delegates | apply one-key fixes |
 
-The active account is orange. Usage numbers are cached on disk, so they stay on screen when the API is rate-limited or unreachable.
+The active account is orange. A `▲` on an account's row means the provider behind it is on peak-rate hours right now — some providers charge more at set times of day (DeepSeek roughly doubles its API rate; Z.ai's GLM peak hours consume the coding plan's quota faster). The active account's `●` outranks `▲` on its own row, so an active account on peak hours keeps its dot and `▲` shows on the other accounts. The Usage tab's `pricing` row names the state, the countdown to the next switch, and nothing renders for flat-rate accounts. The marker follows the provider's own published rate schedule, never which models the profile pins; an account on an endpoint clauth doesn't recognize shows none. Usage numbers are cached on disk, so they stay on screen when the API is rate-limited or unreachable. Once those figures age past the refresh cadence's stale threshold, the Usage tab's status block adds a `[ stale ]` pill; it reads the age of the reading — an OAuth account's own fetch stamp, one it cannot date reading stale at once, or a third-party account's cache write time — not the last fetch outcome, so a `[ cached ]` pill and it can appear together.
 
 ## Keys
 
@@ -75,13 +75,15 @@ The Setup detail pane is itself a list of actions, so <kbd>⏎</kbd> on a row is
 | `duplicate account` | asks for a name, then copies every setting onto a new account: endpoint, api key, env, models, thresholds. The stored login stays behind, as do the chain's `preferred` and `last resort` marks, which only one account may hold |
 | `save as preset` | stores this account's base url and models under a name you type ([Configuration](Configuration#presets)). An existing preset asks first; a built-in's name is refused |
 | `apply preset` | opens the picker, built-ins first. Applying replaces the endpoint and the whole model block, naming the fields first when any are set. <kbd>d</kbd> deletes a saved preset |
-| `open provider console` | opens the page this account's api key is minted on, in your browser. Only for DeepSeek, Z.ai, OpenRouter and Alibaba Model Studio endpoints, so it is absent on an OAuth account and on any endpoint clauth does not recognise. An Alibaba account gets its own plan's page: Token Plan and Coding Plan are separate products, on separate pages, per console |
+| `open provider console` | opens the page this account's api key is minted on, in your browser. Only for DeepSeek, Z.ai, OpenRouter, MiniMax and Alibaba Model Studio endpoints, so it is absent on an OAuth account and on any endpoint clauth does not recognise. An Alibaba account gets its own plan's page: Token Plan and Coding Plan are separate products, on separate pages, per console |
 
 There is no `remove field`: an env row's <kbd>⏎</kbd> edits its value, and an empty value saves as empty, so the key stays. Drop one by editing the account's `config.toml`.
 
 `disable account` from Overview or Usage asks first, since disabling drops the account from auto-switch, usage polling and status mid-flight; re-enabling is immediate. Neither runs for the active account or for one holding a live `clauth start` session; the pick names whichever is in the way.
 
 ## Setup tab rows
+
+The account list ends in an action row: `+ new`, which turns this pane into the create form. On that form, below `+ login`, `+ capture current login` stashes the login Claude Code is using now (it appears only when that login exists and no saved account owns it); <kbd>⏎</kbd> on `create account` then saves it under the name you typed.
 
 | Row | Sets |
 |-----|------|
@@ -113,6 +115,7 @@ There is no `remove field`: an env row's <kbd>⏎</kbd> edits its value, and an 
 | `on mismatch` | `ask`, `overwrite`, `new`, `discard` | `ask` |
 | `refresh` | 15 / 30 / 60 / 90 / 120 / 300 s, or a typed value from 10 s to 1 h | `90s` |
 | `refresh spent` | keep polling accounts already at 100% | on |
+| `context nudge` | off / 300k / 400k / 600k / 900k, or a typed value from 50k to 2M tokens | off |
 | `auto-start queue` | space `auto_start` accounts' 5h window opens `5h / N` apart | off |
 | `rotation` | `lazy`, `preemptive` | `preemptive` |
 | `weekly limit` | chain-wide 7d exhaustion line, 50-100% | `98%` |

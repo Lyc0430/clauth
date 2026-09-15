@@ -10,7 +10,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use super::super::app::{
-    App, ConfigDraft, ConfigFocus, ConfigRow, InputState, MODEL_PRESETS, config_rows,
+    App, ConfigDraft, ConfigFocus, ConfigRow, DraftLogin, InputState, MODEL_PRESETS, config_rows,
 };
 use super::super::theme;
 use super::panes::{
@@ -109,9 +109,12 @@ struct Snap {
     /// both states until 2026-08-12. Mirrors `claude::has_stored_oauth_login`,
     /// which the CLI and the action itself read.
     clear_falls_back_to_oauth: bool,
-    /// `+ new` form only: the draft holds a minted login awaiting `create
-    /// account` — flips the `Login` row to its `✓ logged in` state.
+    /// `+ new` form only: the draft holds a login stash awaiting `create
+    /// account`, flipping its row to the ✓ done state. `captured` is `+
+    /// login`'s mint (oauth mode only, mirroring the consume rule);
+    /// `captured_live` is `+ capture current login`'s snapshot.
     captured: bool,
+    captured_live: bool,
     /// Recognised third-party provider display name, if any.
     provider: Option<&'static str>,
     /// This account's login IS the Alibaba console login
@@ -184,6 +187,7 @@ impl Snap {
             has_other_login: false,
             clear_falls_back_to_oauth: false,
             captured: false,
+            captured_live: false,
             provider: None,
             console_login: false,
             session_token: None,
@@ -205,12 +209,20 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
     let cfg = app.config();
     if app.profile_cursor >= cfg.profiles.len() {
         let mut snap = Snap::blank("+ new account");
-        // Mirror commit_new_account's consume rule: a typed base url flips the
-        // form to API mode and the mint will be discarded, so no stale ✓.
-        snap.captured = app
+        let stash = app
             .config_draft
             .as_ref()
-            .is_some_and(|d| d.captured_login.is_some() && d.base_url.value.trim().is_empty());
+            .and_then(|d| d.captured_login.as_ref());
+        // Mirror commit_new_account's consume rule: a typed base url flips the
+        // form to API mode and the mint will be discarded, so no stale ✓. The
+        // live-login stash survives into api mode, so its ✓ tracks the stash
+        // alone.
+        let oauth_mode = app
+            .config_draft
+            .as_ref()
+            .is_some_and(|d| d.base_url.value.trim().is_empty());
+        snap.captured = oauth_mode && stash.is_some_and(|s| matches!(s, DraftLogin::Mint(_)));
+        snap.captured_live = stash.is_some_and(|s| matches!(s, DraftLogin::LiveLogin(_)));
         return snap;
     }
     match cfg.profiles.get(app.profile_cursor) {
@@ -259,6 +271,7 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
                 has_other_login: p.credentials.is_some() || p.api_key.is_some(),
                 clear_falls_back_to_oauth: p.credentials.is_some(),
                 captured: false,
+                captured_live: false,
                 provider: p.provider.map(|p| p.display_name()),
                 console_login: p.console_login_target().is_some(),
                 // ONE sidecar read per frame feeds both facts. The status is
@@ -553,6 +566,7 @@ fn snap_value(snap: &Snap, row: ConfigRow) -> &str {
         | ConfigRow::EnvAdd
         | ConfigRow::Login
         | ConfigRow::ManualLogin
+        | ConfigRow::CaptureLogin
         | ConfigRow::DeleteCreds
         | ConfigRow::ClearSessionToken
         | ConfigRow::Disabled
@@ -570,57 +584,42 @@ fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
     let api_login = !snap.login_is_oauth;
     let hint = match row {
         ConfigRow::BaseUrl if snap.base_url.trim().is_empty() => {
-            "leave empty for a claude.ai account, or set an api endpoint"
+            "leave empty for a Claude account, or set an API endpoint"
         }
-        ConfigRow::BaseUrl => "the api endpoint this account calls instead of claude.ai",
-        ConfigRow::ApiKey => "api key sent to the endpoint above",
-        // The value grammar (`space cycle · ↵ custom`) already lives in the footer.
-        ConfigRow::Model => "default model for this account",
-        ConfigRow::OpusModel => "what the opus alias resolves to (full model id)",
-        ConfigRow::SonnetModel => "what the sonnet alias resolves to (full model id)",
-        ConfigRow::HaikuModel => "what the haiku alias resolves to (full model id)",
-        ConfigRow::FableModel => "what the fable alias resolves to (full model id)",
-        ConfigRow::SubagentModel => "model forced for every subagent in this account",
-        // No row or key drops the key itself — an emptied value saves as an
-        // empty string — so the hint has to say where the entry actually goes.
-        ConfigRow::EnvEntry(_) => "set while this account is active · an empty value keeps the key",
-        ConfigRow::EnvAdd => "add an env var for this account",
+        ConfigRow::BaseUrl => "the API endpoint this account calls instead of claude.ai",
+        ConfigRow::ApiKey => "provided to Claude Code via \"apiKeyHelper\" field",
+        ConfigRow::SubagentModel => "default subagent model in this account",
         // Gate reasons name the same blockers as the CLI's own refusal copy
         // (`actions::disable_profile`), then the on/off state — checked in that
         // order since a gate can only ever bite the OFF (not-yet-disabled)
         // state. `live session` is the app-wide noun for a running `clauth
         // start`; the CLI's wording is its own.
-        ConfigRow::Disabled if snap.is_active => {
-            "the active account can't be disabled · switch away first"
-        }
+        ConfigRow::Disabled if snap.is_active => "cannot disable the global active account",
         ConfigRow::Disabled if snap.has_live_session => {
-            "has a live session, close it before disabling"
+            "cannot disable an account with a live session"
         }
         ConfigRow::Disabled if snap.disabled => {
             "excluded from auto-switch, usage polling, and status until re-enabled"
         }
         ConfigRow::Disabled => {
-            "removes this account from auto-switch, usage polling, and status until re-enabled"
+            "excludes this account from auto-switch, usage polling, and status until re-enabled"
         }
         ConfigRow::AutoStart if snap.auto_start => {
-            "starts a throwaway session when idle so the 5h window counts"
+            "sends a 1-token request to Haiku at every 5h usage reset"
         }
-        ConfigRow::AutoStart => "never starts a session on its own",
-        ConfigRow::ModelOverrideAdd => "pin what an alias resolves to, or force the subagent model",
+        ConfigRow::AutoStart => "5h usage window stays closed after reset",
+        ConfigRow::ModelOverrideAdd => "set custom model names on this account",
         ConfigRow::Login if snap.console_login => {
-            "opens the alibaba console to capture this account's usage session"
+            "log into alibaba console to see this account's usage"
         }
-        ConfigRow::Login if api_login => "re-enter the base url + api key for this account",
+        ConfigRow::Login if api_login => "re-enter the base URL + API key for this account",
         ConfigRow::Login => "opens a browser on this machine; mints fresh tokens for this account",
         ConfigRow::ManualLogin => {
             "shows a link to open on any device, then takes the code it gives you; for ssh and hosts with no browser"
         }
-        ConfigRow::DeleteCreds if api_login => {
-            "clears the stored api key; keeps the account and its settings"
-        }
-        ConfigRow::DeleteCreds => {
-            "clears the stored OAuth login; keeps the account and its settings"
-        }
+        ConfigRow::CaptureLogin => "save the current global credentials into a new account",
+        ConfigRow::DeleteCreds if api_login => "clears the stored API key",
+        ConfigRow::DeleteCreds => "clears the stored OAuth login",
         // Gate reason first (same order as `Disabled` above — a gate only ever
         // bites the clearable state), then what the clear does from here. The
         // active account's wording names the relink, since that is the half a
@@ -637,7 +636,9 @@ fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
         // (armed, nothing stamped, no preserved mint) disarms without
         // stripping a credential, so it skips past — a gate line over a row
         // that acts would be the one lie a hint can tell.
-        ConfigRow::ClearSessionToken if snap.clear_gated() => "no other login stored, log in first",
+        ConfigRow::ClearSessionToken if snap.clear_gated() => {
+            "cannot clear with no other login stored"
+        }
         // The flag-only state with NO login gets its own lines rather than the
         // 4-way base below: those arms were written under the old invariant
         // that "no OAuth login" implies an api key behind it, and promising an
@@ -654,9 +655,9 @@ fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
         ConfigRow::ClearSessionToken => {
             let base = match (snap.is_active, snap.clear_falls_back_to_oauth) {
                 (true, true) => "relinks this account's own login now · running sessions follow",
-                (true, false) => "signs Claude Code out now · this account runs on its api key",
+                (true, false) => "signs Claude Code out now · this account runs on its API key",
                 (false, true) => "the next switch installs this account's own login again",
-                (false, false) => "the next switch runs this account on its api key",
+                (false, false) => "the next switch runs this account on its API key",
             };
             let mut hint = base.to_string();
             if snap.rolling_armed || snap.rolling_token {
@@ -670,7 +671,15 @@ fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
         ConfigRow::Delete => {
             "deletes the account and everything stored for it, usage history included"
         }
-        ConfigRow::Name | ConfigRow::Create => return None,
+        ConfigRow::Model
+        | ConfigRow::OpusModel
+        | ConfigRow::SonnetModel
+        | ConfigRow::HaikuModel
+        | ConfigRow::FableModel
+        | ConfigRow::EnvEntry(_)
+        | ConfigRow::EnvAdd
+        | ConfigRow::Name
+        | ConfigRow::Create => return None,
     };
     Some(hint.to_string())
 }
@@ -775,6 +784,27 @@ fn detail_row(
             arrow,
             Span::styled("create account", bold_when(theme::accent(), selected)),
         ]),
+        // Same done-state pattern as `Login`: a stashed snapshot renders the ✓,
+        // ⏎ re-captures but confirms first before replacing a stashed mint.
+        ConfigRow::CaptureLogin => {
+            if snap.captured_live {
+                Line::from(vec![
+                    arrow,
+                    Span::styled(
+                        "✓ captured current login",
+                        bold_when(theme::success(), selected),
+                    ),
+                ])
+            } else {
+                Line::from(vec![
+                    arrow,
+                    Span::styled(
+                        "+ capture current login",
+                        bold_when(theme::accent(), selected),
+                    ),
+                ])
+            }
+        }
         ConfigRow::Login => {
             // A draft-held mint renders the done state; ⏎ re-runs the login but
             // confirms first before replacing the stash.
