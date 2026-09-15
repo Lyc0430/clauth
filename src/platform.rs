@@ -44,12 +44,12 @@ pub(crate) fn open_url(url: &str) -> anyhow::Result<()> {
 }
 
 /// Put `text` on the LOCAL terminal's clipboard through OSC 52, the escape
-/// iTerm2, Terminal.app, kitty, WezTerm, Windows Terminal, and tmux (with
-/// `set-clipboard on`) honor across an ssh hop. Used by the TUI's manual login
-/// to hand over an authorize link too long to select cleanly once wrapped.
-/// `Ok` means the bytes were written and flushed; whether the terminal acted
-/// on them is not observable from here, so the caller's copy must not promise
-/// more than "sent".
+/// iTerm2 (with `General > Selection > Applications in terminal may access
+/// clipboard` on), kitty, WezTerm, Windows Terminal, and tmux (with
+/// `set-clipboard on`) honor across an ssh hop; Terminal.app ignores it. Used
+/// by the TUI's login modal to hand over the hosted authorize link, which is
+/// never drawn on screen. `Ok` means the bytes were written and flushed;
+/// whether the terminal acted on them is not observable from here.
 pub(crate) fn copy_to_clipboard_osc52(text: &str) -> std::io::Result<()> {
     use std::io::Write as _;
     let mut out = std::io::stdout().lock();

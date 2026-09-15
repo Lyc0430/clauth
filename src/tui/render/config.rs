@@ -565,7 +565,6 @@ fn snap_value(snap: &Snap, row: ConfigRow) -> &str {
         | ConfigRow::ModelOverrideAdd
         | ConfigRow::EnvAdd
         | ConfigRow::Login
-        | ConfigRow::ManualLogin
         | ConfigRow::CaptureLogin
         | ConfigRow::DeleteCreds
         | ConfigRow::ClearSessionToken
@@ -613,10 +612,7 @@ fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
             "log into alibaba console to see this account's usage"
         }
         ConfigRow::Login if api_login => "re-enter the base URL + API key for this account",
-        ConfigRow::Login => "opens a browser on this machine; mints fresh tokens for this account",
-        ConfigRow::ManualLogin => {
-            "shows a link to open on any device, then takes the code it gives you; for ssh and hosts with no browser"
-        }
+        ConfigRow::Login => "browser OAuth login",
         ConfigRow::CaptureLogin => "save the current global credentials into a new account",
         ConfigRow::DeleteCreds if api_login => "clears the stored API key",
         ConfigRow::DeleteCreds => "clears the stored OAuth login",
@@ -814,32 +810,16 @@ fn detail_row(
                     Span::styled("✓ logged in", bold_when(theme::success(), selected)),
                 ])
             } else {
-                // Only the OAuth mint carries the `web` qualifier: it is the
-                // one flow with a manual twin on the row below. The api-key
-                // re-entry and the console capture keep their plain labels.
-                let oauth_mint = snap.login_is_oauth && !snap.console_login;
-                let label = match (oauth_mint, snap.logged_in) {
-                    (true, true) => "web re-login",
-                    (true, false) => "+ web login",
-                    (false, true) => "re-login",
-                    (false, false) => "+ login",
+                let label = if snap.logged_in {
+                    "re-login"
+                } else {
+                    "+ login"
                 };
                 Line::from(vec![
                     arrow,
                     Span::styled(label, bold_when(theme::accent(), selected)),
                 ])
             }
-        }
-        ConfigRow::ManualLogin => {
-            let label = if snap.logged_in {
-                "manual re-login (no browser)"
-            } else {
-                "+ manual login (no browser)"
-            };
-            Line::from(vec![
-                arrow,
-                Span::styled(label, bold_when(theme::accent(), selected)),
-            ])
         }
         ConfigRow::DeleteCreds => {
             Line::from(vec![arrow, Span::styled("log out", theme::danger().bold())])

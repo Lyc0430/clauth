@@ -352,7 +352,7 @@ pub(crate) fn serve_endpoints(
 }
 
 /// [`serve_endpoints`] that also hands back each request's BODY, for a leg
-/// whose correctness is in what it sent (the manual login's `redirect_uri` and
+/// whose correctness is in what it sent (the paste door's `redirect_uri` and
 /// `state`) rather than in which endpoint it reached. Same listener, same
 /// deadlines; `serve_endpoints` is a projection of this one.
 pub(crate) fn serve_endpoints_recording(

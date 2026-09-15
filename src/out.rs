@@ -11,6 +11,9 @@
 //! [`outln!`] and [`out!`] are what the crate prints with, [`errln!`] is the
 //! stderr half; a bare `println!` or `eprintln!` under `src/` is the bug this
 //! module exists to stop, and a guard test fails on one.
+//! `platform::copy_to_clipboard_osc52` is the one sanctioned raw stdout
+//! writer, for the OSC 52 clipboard escape, which is a terminal command rather
+//! than a line of output.
 //!
 //! The two halves answer a closed reader differently. Stdout carries the
 //! payload, so a gone reader ends the run at exit 0. Stderr carries diagnostics

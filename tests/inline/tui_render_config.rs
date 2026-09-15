@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! The Setup-tab `model` row is a segmented alias cycle sharing the Config-tab
 //! contract: bare labels when blurred, the active option bracketed only on focus
 //! (the row widens by 2 on focus — the bracket pair is the only width change).
@@ -112,12 +113,11 @@ fn action_rows_bold_on_select_and_keep_their_color() {
     let mut snap = Snap::blank("+ new account");
     let input = InputState::new("");
     // (row, the style the label holds in both states)
-    let cases: [(ConfigRow, Style); 5] = [
+    let cases: [(ConfigRow, Style); 4] = [
         (ConfigRow::EnvAdd, theme::accent()),
         (ConfigRow::ModelOverrideAdd, theme::accent()),
         (ConfigRow::Create, theme::accent()),
         (ConfigRow::Login, theme::accent()),
-        (ConfigRow::ManualLogin, theme::accent()),
     ];
     for (row, want) in cases {
         let blurred = detail_row(row, false, false, None, &snap, &input);
@@ -1082,11 +1082,10 @@ fn stalled_rolling_fix_line_uses_the_title_that_survives_a_draft() {
     );
 }
 
-/// Only the OAuth mint carries the `web` qualifier, because only it has a
-/// manual twin on the row below. The api-key re-entry and the console capture
-/// keep the labels they had, since neither has a browser-free variant.
+/// One login row, one pair of labels: `+ login` until a credential exists,
+/// `re-login` after, whichever of its three flows the account routes to.
 #[test]
-fn login_labels_qualify_only_the_oauth_mint() {
+fn login_labels_read_the_same_for_every_flow() {
     let input = InputState::new("");
     let text = |snap: &Snap, row: ConfigRow| {
         line_text(&detail_row(row, false, false, None, snap, &input))
@@ -1094,19 +1093,11 @@ fn login_labels_qualify_only_the_oauth_mint() {
             .to_string()
     };
     let mut snap = Snap::blank("a");
-    assert_eq!(text(&snap, ConfigRow::Login), "+ web login");
-    assert_eq!(
-        text(&snap, ConfigRow::ManualLogin),
-        "+ manual login (no browser)"
-    );
+    assert_eq!(text(&snap, ConfigRow::Login), "+ login");
     snap.logged_in = true;
-    assert_eq!(text(&snap, ConfigRow::Login), "web re-login");
-    assert_eq!(
-        text(&snap, ConfigRow::ManualLogin),
-        "manual re-login (no browser)"
-    );
+    assert_eq!(text(&snap, ConfigRow::Login), "re-login");
 
-    // An api-key account: the row re-enters the key, so no `web`.
+    // An api-key account: the row re-enters the key.
     snap.login_is_oauth = false;
     assert_eq!(text(&snap, ConfigRow::Login), "re-login");
     snap.logged_in = false;

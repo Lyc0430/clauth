@@ -2,14 +2,14 @@
 //! `clauth login` CLI and the TUI Setup tab (login / re-login rows). Both
 //! observe the flow through [`LoginProgress`] callbacks.
 //!
-//! Two flows mint the same credential. [`login_with`] reproduces the Claude Code
-//! `/login` PKCE + RFC 8252 loopback flow: it opens the browser on this machine
-//! and catches the redirect on `http://localhost:<port>/callback`. The manual
-//! flow ([`begin_manual_login`] then [`PendingManualLogin::complete`]) is Claude
-//! Code's "Browser didn't open?" path: the same authorize request with
-//! [`MANUAL_REDIRECT_URI`] as the redirect, a page that shows the user a
-//! `code#state` string, and a paste back into the terminal. No listener, no
-//! browser on this host, so it is the login for an ssh session.
+//! One login, two doors. [`begin_login`] mints ONE PKCE pair and ONE `state`,
+//! binds the loopback listener, and builds both URLs ([`LoginLinks`]): the
+//! loopback one for a browser on this machine and the hosted one
+//! ([`MANUAL_REDIRECT_URI`]) for any other device. [`PendingLogin::run`] then
+//! accepts the first code through either door — the loopback callback or a
+//! pasted `code#state` — and exchanges it against the redirect that door used.
+//! The CLI and the TUI both drive exactly that pair; neither has a flow of its
+//! own.
 //!
 //! Ground truth is the installed Claude Code binary (v2.1.199 for the loopback
 //! flow, v2.1.260 for the manual one): the Pro/Max **subscription** login
@@ -43,7 +43,7 @@ const AUTHORIZE_URL: &str = "https://claude.com/cai/oauth/authorize";
 /// v2.1.260: every `/login` builds both URLs from one PKCE pair and one `state`,
 /// prints this one under "Browser didn't open? Visit:", and sends it as the
 /// exchange's `redirect_uri` whenever the paste, not the listener, delivered the
-/// code. If a live manual login 4xx's at authorize time, this constant is the
+/// code. If a live paste-door login 4xx's at authorize time, this constant is the
 /// knob: Anthropic moved the platform host once already (console.anthropic.com).
 pub(crate) const MANUAL_REDIRECT_URI: &str = "https://platform.claude.com/oauth/code/callback";
 
@@ -51,16 +51,12 @@ pub(crate) const MANUAL_REDIRECT_URI: &str = "https://platform.claude.com/oauth/
 /// the cap bounds what a piped stdin or a TUI paste can make the process hold.
 pub(crate) const MANUAL_CODE_MAX: usize = 4096;
 
-/// Which login flow runs. Both mint the same credential; the CLI picks by
-/// `--manual`, the TUI by which Setup row was chosen. The progress modal and
-/// the footer read it so a manual exchange is never told to "complete it in
-/// your browser".
+/// Which door delivered the code. The exchange's `redirect_uri` follows it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LoginMethod {
-    /// A browser round-trip on this host, catching the loopback redirect. In
-    /// the TUI this also covers the Alibaba console login.
+    /// The loopback callback from the browser on this host.
     Browser,
-    /// A link to open anywhere, then the pasted code; no browser on this host.
+    /// A pasted `code#state` from the hosted link.
     Manual,
 }
 
@@ -69,8 +65,9 @@ pub(crate) enum LoginMethod {
 /// the claude.ai path harmlessly; drop it first if authorize rejects the scope set.
 const SCOPES: &str = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 
-/// How long to wait for the browser round-trip before giving up.
-const LOGIN_TIMEOUT_SECS: u64 = 180;
+/// How long to wait for a code through either door — the loopback callback or a
+/// pasted `code#state` — before giving up.
+const LOGIN_TIMEOUT_SECS: u64 = 600;
 
 /// Base64url without padding (RFC 4648 §5) — the encoding OAuth PKCE mandates.
 fn base64url_nopad(input: &[u8]) -> String {
@@ -200,16 +197,13 @@ fn request_target(request_line: &str) -> Option<&str> {
     parts.next()
 }
 
-/// Progress milestones reported through `login_with`'s callback. The CLI
-/// prints the authorize URL; the TUI login modal also renders the later
-/// milestones as a live stage line.
+/// Progress milestones reported through the login's callback. The CLI's paste
+/// prompt ends on the first one (a door landed); the TUI login modal renders
+/// both as a live stage line and takes the door off the first.
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum LoginProgress<'a> {
-    /// The authorize URL is built, just before the browser opens — surfaced so
-    /// the flow is observable and the URL can be pasted if the open fails.
-    AuthorizeUrl(&'a str),
-    /// The loopback callback landed; exchanging the code for tokens.
-    ExchangingCode,
+pub(crate) enum LoginProgress {
+    /// The code arrived through this door; exchanging it for tokens.
+    ExchangingCode(LoginMethod),
     /// Tokens minted; probing the plan tier to confirm they work.
     Verifying,
 }
@@ -463,25 +457,36 @@ fn handle_callback(stream: TcpStream, expected_state: &str) -> Result<Option<Str
     Ok(Some(code))
 }
 
-/// Accept loop until the callback arrives or `deadline` passes. Non-`/callback`
-/// requests (favicon probes) are answered and ignored.
+/// Accept loop until a code arrives through either door or `deadline` passes.
+/// The paste door is polled first: `Ok` wins it, `Disconnected` closes it (the
+/// listener keeps waiting), `Empty` falls through to the loopback accept.
+/// Non-`/callback` requests (favicon probes) are answered and ignored.
 fn wait_for_code(
     listener: &TcpListener,
+    paste: &std::sync::mpsc::Receiver<ManualCode>,
     expected_state: &str,
     deadline: Instant,
-) -> Result<String> {
+) -> Result<(String, LoginMethod)> {
     listener.set_nonblocking(true)?;
+    let mut paste_open = true;
     loop {
         if Instant::now() >= deadline {
             anyhow::bail!(
-                "timed out waiting for the browser login callback ({LOGIN_TIMEOUT_SECS}s)"
+                "timed out waiting for the login code (browser callback or pasted code, {LOGIN_TIMEOUT_SECS}s)"
             );
+        }
+        if paste_open {
+            match paste.try_recv() {
+                Ok(code) => return Ok((code.0, LoginMethod::Manual)),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => paste_open = false,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
         }
         match listener.accept() {
             Ok((stream, _)) => {
                 stream.set_nonblocking(false).ok();
                 if let Some(code) = handle_callback(stream, expected_state)? {
-                    return Ok(code);
+                    return Ok((code, LoginMethod::Browser));
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -494,7 +499,7 @@ fn wait_for_code(
 
 /// Build `ClaudeCredentials` from a minted token pair. `subscriptionType` is not
 /// in the token response (Claude Code re-derives it), so it starts `None` here and
-/// is stamped by `login_with` from a live `/profile` probe.
+/// is stamped by `finish_login` from a live `/profile` probe.
 fn credentials_from_token(token: crate::oauth::TokenResponse) -> ClaudeCredentials {
     let scopes = token
         .scope
@@ -525,14 +530,6 @@ pub(crate) struct LoginOutcome {
     pub(crate) account_uuid: Option<AccountId>,
 }
 
-/// Run the full interactive login: open the browser, catch the loopback
-/// redirect, exchange the code, and return a completed [`LoginOutcome`].
-/// `progress` receives [`LoginProgress`] milestones — the `AuthorizeUrl` event
-/// fires just before opening the browser (the CLI prints it so the flow is
-/// observable and the URL can be pasted if the browser doesn't open; the TUI
-/// also renders the later stages). Opening the browser is best-effort: on
-/// failure the announced URL is the fallback and the listener still waits.
-/// Blocks the caller for the browser round-trip (up to [`LOGIN_TIMEOUT_SECS`]).
 /// Why a `clauth login` produced no credential.
 ///
 /// Typed so its two callers can diverge exactly as the switch path's already do:
@@ -548,7 +545,7 @@ pub(crate) enum LoginError {
     /// Everything else: the authorize callback's rejection (already canned by
     /// [`AuthorizeRejection`], and a browser redirect carries no HTTP status of
     /// ours to name), CSPRNG, the loopback bind/accept, the state mismatch, the
-    /// browser timeout. All clauth-authored, so both renderings coincide.
+    /// login timeout. All clauth-authored, so both renderings coincide.
     Local(anyhow::Error),
 }
 
@@ -558,9 +555,10 @@ impl LoginError {
     ///
     /// The operative fact is that this function has NO retry path around
     /// `exchange_code`: whatever the status, the failure unwinds out of
-    /// `login_with` and the only action left to anyone is running `clauth login`
-    /// again. So the refresh path's `Wait` — right for a 429 it will re-attempt
-    /// on its next tick — names an action that does not exist here.
+    /// [`PendingLogin::run`] and the only action left to anyone is running
+    /// `clauth login` again. So the refresh path's `Wait` — right for a 429 it
+    /// will re-attempt on its next tick — names an action that does not exist
+    /// here.
     ///
     /// Deliberately NOT justified by "the code is spent" or "the listener is
     /// torn down": the first is true of a 400 and not of a 429 (which likely
@@ -602,43 +600,20 @@ impl LoginError {
     }
 }
 
-pub(crate) fn login_with(
-    progress: impl Fn(LoginProgress<'_>),
-) -> std::result::Result<LoginOutcome, LoginError> {
-    let (verifier, challenge) = new_pkce().map_err(LoginError::Local)?;
-    let state = random_b64url(32).map_err(LoginError::Local)?;
-
-    let listener = TcpListener::bind(("127.0.0.1", 0))
-        .context("failed to bind the loopback listener for the OAuth callback")
-        .map_err(LoginError::Local)?;
-    let port = listener
-        .local_addr()
-        .map_err(anyhow::Error::from)
-        .map_err(LoginError::Local)?
-        .port();
-    let redirect_uri = format!("http://localhost:{port}/callback");
-    let url = authorize_url(&redirect_uri, &challenge, &state);
-
-    progress(LoginProgress::AuthorizeUrl(&url));
-    let _ = crate::platform::open_url(&url);
-
-    let deadline = Instant::now() + Duration::from_secs(LOGIN_TIMEOUT_SECS);
-    let code = wait_for_code(&listener, &state, deadline).map_err(LoginError::Local)?;
-    finish_login(&code, &verifier, &redirect_uri, &state, &progress)
-}
-
-/// The tail both flows share once an authorization code is in hand: exchange
+/// The tail both doors share once an authorization code is in hand: exchange
 /// it at the token endpoint, then verify the mint with one `/profile` probe.
-/// `redirect_uri` MUST be the one the authorize request carried (the loopback
-/// URL or [`MANUAL_REDIRECT_URI`]); the token endpoint rejects a mismatch.
+/// `door` is the one that delivered `code`, and `redirect_uri` MUST be the one
+/// that door's authorize request carried (the loopback URL or
+/// [`MANUAL_REDIRECT_URI`]); the token endpoint rejects a mismatch.
 fn finish_login(
     code: &str,
     verifier: &str,
+    door: LoginMethod,
     redirect_uri: &str,
     state: &str,
-    progress: &impl Fn(LoginProgress<'_>),
+    progress: &impl Fn(LoginProgress),
 ) -> std::result::Result<LoginOutcome, LoginError> {
-    progress(LoginProgress::ExchangingCode);
+    progress(LoginProgress::ExchangingCode(door));
     let token = crate::oauth::exchange_code(code, verifier, redirect_uri, state).map_err(|e| {
         // The BODY stops here; the status rides the typed value so stderr can
         // name it and the toast cannot.
@@ -668,38 +643,119 @@ fn finish_login(
     })
 }
 
-// ── manual (no browser) flow ─────────────────────────────────────────────────
+// ── one login, two doors ─────────────────────────────────────────────────────
 
-/// A manual login in flight: the authorize URL to show the user, plus the PKCE
-/// verifier and `state` the exchange needs. Nothing is held open (no socket, no
-/// timeout), so it can sit in a TUI modal for as long as the user takes; the
-/// authorize code's own server-side expiry is the ceiling.
-///
-/// `Clone` because the TUI clones its top modal per keystroke. `Debug` is
-/// hand-written to print nothing: the verifier is the PKCE secret and the URL
-/// carries `state`.
-#[derive(Clone)]
-pub(crate) struct PendingManualLogin {
-    url: String,
-    verifier: String,
-    state: String,
+/// What a login shows and checks against; nothing secret (the verifier never
+/// leaves [`PendingLogin`]).
+#[derive(Debug, Clone)]
+pub(crate) struct LoginLinks {
+    /// The loopback authorize URL for a browser on this host.
+    pub(crate) browser_url: String,
+    /// The hosted authorize URL ([`MANUAL_REDIRECT_URI`]) for any other device.
+    pub(crate) hosted_url: String,
+    /// The `state` a pasted code must carry.
+    pub(crate) state: String,
 }
 
-impl std::fmt::Debug for PendingManualLogin {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("PendingManualLogin { .. }")
+impl LoginLinks {
+    /// [`parse_manual_code`] against this login's `state`, wrapped in the
+    /// [`ManualCode`] newtype with the typed error kept.
+    pub(crate) fn parse(&self, pasted: &str) -> std::result::Result<ManualCode, ManualCodeError> {
+        parse_manual_code(pasted, &self.state).map(ManualCode)
     }
 }
 
-/// An authorization code that passed [`PendingManualLogin::parse`] against the
-/// pending login's own `state`. Redacted `Debug`: until exchanged it is worth
-/// exactly what the token pair will be.
+/// A login minted and bound, not yet waiting. Made on the caller's thread (no
+/// network); [`PendingLogin::run`] blocks on whichever thread the caller picks.
+pub(crate) struct PendingLogin {
+    verifier: String,
+    listener: TcpListener,
+    redirect_uri: String,
+    links: LoginLinks,
+}
+
+/// Mint ONE PKCE pair and ONE `state`, bind `127.0.0.1:0`, and build both URLs
+/// through [`authorize_url`]. The only failure is the CSPRNG or the bind.
+pub(crate) fn begin_login() -> std::result::Result<PendingLogin, LoginError> {
+    let (verifier, challenge) = new_pkce().map_err(LoginError::Local)?;
+    let state = random_b64url(32).map_err(LoginError::Local)?;
+
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .context("failed to bind the loopback listener for the OAuth callback")
+        .map_err(LoginError::Local)?;
+    let port = listener
+        .local_addr()
+        .map_err(anyhow::Error::from)
+        .map_err(LoginError::Local)?
+        .port();
+    let redirect_uri = format!("http://localhost:{port}/callback");
+    let links = LoginLinks {
+        browser_url: authorize_url(&redirect_uri, &challenge, &state),
+        hosted_url: authorize_url(MANUAL_REDIRECT_URI, &challenge, &state),
+        state,
+    };
+
+    Ok(PendingLogin {
+        verifier,
+        listener,
+        redirect_uri,
+        links,
+    })
+}
+
+impl PendingLogin {
+    /// Both authorize URLs and the `state` a pasted code must carry.
+    pub(crate) fn links(&self) -> &LoginLinks {
+        &self.links
+    }
+
+    /// Wait for the first door (the loopback callback, or a [`ManualCode`] on
+    /// `paste`), then exchange with that door's redirect. Fires
+    /// [`LoginProgress::ExchangingCode`] naming the door that won, then
+    /// [`LoginProgress::Verifying`]. Never opens a browser: the caller does
+    /// that with [`LoginLinks::browser_url`].
+    pub(crate) fn run(
+        self,
+        paste: std::sync::mpsc::Receiver<ManualCode>,
+        progress: impl Fn(LoginProgress),
+    ) -> std::result::Result<LoginOutcome, LoginError> {
+        let deadline = Instant::now() + Duration::from_secs(LOGIN_TIMEOUT_SECS);
+        let (code, door) = wait_for_code(&self.listener, &paste, &self.links.state, deadline)
+            .map_err(LoginError::Local)?;
+        let redirect_uri = match door {
+            LoginMethod::Browser => self.redirect_uri.as_str(),
+            LoginMethod::Manual => MANUAL_REDIRECT_URI,
+        };
+        finish_login(
+            &code,
+            &self.verifier,
+            door,
+            redirect_uri,
+            &self.links.state,
+            &progress,
+        )
+    }
+}
+
+// ── the pasted code ──────────────────────────────────────────────────────────
+
+/// An authorization code that passed [`LoginLinks::parse`] against the login's
+/// own `state`. Redacted `Debug`: until exchanged it is worth exactly what the
+/// token pair will be.
 #[derive(Clone)]
 pub(crate) struct ManualCode(String);
 
 impl std::fmt::Debug for ManualCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("ManualCode(..)")
+    }
+}
+
+#[cfg(test)]
+impl ManualCode {
+    /// The code's bytes, for a test to check what a paste delivered.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -724,9 +780,7 @@ impl ManualCodeError {
                 "that is far longer than a login code; paste only the code the page shows"
             }
             Self::Shape => "invalid code; paste the whole string the page shows (it contains a #)",
-            Self::StateMismatch => {
-                "state mismatch: this code came from a different login; use the link shown here"
-            }
+            Self::StateMismatch => "state mismatch: code came from a different login",
         }
     }
 }
@@ -760,52 +814,6 @@ pub(crate) fn parse_manual_code(
     Ok(code.to_string())
 }
 
-/// Start a manual login: mint the PKCE pair and `state`, build the authorize
-/// URL against [`MANUAL_REDIRECT_URI`]. No network, no socket; the only failure
-/// is the CSPRNG. Callers show [`PendingManualLogin::url`] themselves — there is
-/// no [`LoginProgress::AuthorizeUrl`] event on this path.
-pub(crate) fn begin_manual_login() -> std::result::Result<PendingManualLogin, LoginError> {
-    let (verifier, challenge) = new_pkce().map_err(LoginError::Local)?;
-    let state = random_b64url(32).map_err(LoginError::Local)?;
-    let url = authorize_url(MANUAL_REDIRECT_URI, &challenge, &state);
-    Ok(PendingManualLogin {
-        url,
-        verifier,
-        state,
-    })
-}
-
-impl PendingManualLogin {
-    /// The authorize URL for the user to open on any device.
-    pub(crate) fn url(&self) -> &str {
-        &self.url
-    }
-
-    /// Check a pasted string WITHOUT consuming the pending login, so a bad paste
-    /// can be corrected against the same URL instead of forcing a fresh one.
-    pub(crate) fn parse(&self, pasted: &str) -> std::result::Result<ManualCode, LoginError> {
-        parse_manual_code(pasted, &self.state)
-            .map(ManualCode)
-            .map_err(|e| LoginError::Local(anyhow::anyhow!("{}", e.message())))
-    }
-
-    /// Exchange a parsed code and verify the mint. `ExchangingCode` and
-    /// `Verifying` fire through `progress`, exactly as the loopback flow's do.
-    pub(crate) fn complete(
-        self,
-        code: ManualCode,
-        progress: impl Fn(LoginProgress<'_>),
-    ) -> std::result::Result<LoginOutcome, LoginError> {
-        finish_login(
-            &code.0,
-            &self.verifier,
-            MANUAL_REDIRECT_URI,
-            &self.state,
-            &progress,
-        )
-    }
-}
-
 /// A one-glance summary of a captured login for the `clauth login` CLI. Never
 /// prints the tokens — just a sha256 prefix of the refresh token (proves it is
 /// real and lets you confirm it differs from other profiles), the granted
@@ -837,8 +845,8 @@ pub(crate) fn login_summary(creds: &ClaudeCredentials) -> String {
         .expires_at
         .map(|ms| format!("{}s from now", (ms - now_ms() as i64) / 1000))
         .unwrap_or_else(|| "(unknown)".to_string());
-    // The plan tier is stamped from a live `/profile` probe in `login_with`, so a
-    // present value doubles as proof the minted token works against the API.
+    // The plan tier is stamped from a live `/profile` probe in `finish_login`,
+    // so a present value doubles as proof the minted token works against the API.
     let plan = match oauth.subscription_type.as_deref() {
         // An unclassifiable claim still proves the token works, so echo it raw
         // rather than dropping the line or naming a tier the token never made.

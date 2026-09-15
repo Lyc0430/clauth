@@ -243,11 +243,6 @@ pub(crate) enum ConfigRow {
     /// Browser OAuth login: mint fresh tokens into this account (or, on the
     /// `+ new` form, create the account from the login). Async — runs on a worker.
     Login,
-    /// The same OAuth mint without a browser on this host: a link to open on
-    /// any device, then the `code#state` that page shows, pasted back. Rendered
-    /// only where `Login` would run the browser mint; the api-key re-entry and
-    /// the console capture have no manual twin. Async once a code is submitted.
-    ManualLogin,
     /// `+ new`-form only: stash the live login Claude Code is using now into
     /// the draft, like [`ConfigRow::Login`] stashes its mint; `create account`
     /// commits it. Renders only while the live login is real and unowned
@@ -460,7 +455,6 @@ impl ConfigDraft {
             | ConfigRow::EnvEntry(_)
             | ConfigRow::EnvAdd
             | ConfigRow::Login
-            | ConfigRow::ManualLogin
             | ConfigRow::CaptureLogin
             | ConfigRow::DeleteCreds
             | ConfigRow::ClearSessionToken
@@ -488,7 +482,6 @@ impl ConfigDraft {
             | ConfigRow::EnvEntry(_)
             | ConfigRow::EnvAdd
             | ConfigRow::Login
-            | ConfigRow::ManualLogin
             | ConfigRow::CaptureLogin
             | ConfigRow::DeleteCreds
             | ConfigRow::ClearSessionToken
@@ -556,10 +549,7 @@ pub(crate) enum ConfirmAction {
     /// Setup `+ new` draft: a login already stashed a mint (the `✓ logged in`
     /// row), so re-running would silently replace it. Confirm first, then
     /// re-dispatch `start_login`. `bool` = `is_new`, carried to the restart.
-    /// Replace a captured stash by re-running the login of the ROW that was
-    /// pressed (`bool` = `is_new`); the stash itself does not remember which
-    /// flow minted it, and does not need to.
-    RestartLogin(String, bool, LoginMethod),
+    RestartLogin(String, bool),
     /// Setup `+ new` draft: `+ capture current login` pressed while a browser
     /// mint is already stashed. Confirm, then stash the snapshot in its place.
     CaptureOverMintStash(Box<CaptureSnapshot>),
@@ -976,48 +966,10 @@ pub(crate) enum Modal {
     ActionMenu(ActionMenuState),
     /// Custom env key collides with an existing source; overwrite/keep/cancel.
     EnvCollision(EnvCollisionForm),
-    /// Manual (no browser) login: the link to open elsewhere, then the pasted
-    /// code. Holds the pending PKCE state itself; a [`LoginSession`] starts
-    /// only once a code is submitted, so esc here is a plain close.
-    ManualLogin(ManualLoginForm),
-    /// In-flight login progress (a browser round-trip, or a manual exchange);
-    /// renders live from [`App::login`]. esc/q collapse it to the footer
-    /// indicator — the login keeps running.
+    /// In-flight login progress; renders live from [`App::login`], the inline
+    /// code field ([`LoginSession::paste_field`]) included. esc/q collapse it
+    /// to the footer indicator — the login keeps running.
     Login,
-}
-
-/// The manual (no browser) login modal, in two phases so the copy key and the
-/// pasted code can never collide: `Link` shows the URL and answers `c`, ⏎, and
-/// esc only; `Code` is a text field where every printable character is data.
-#[derive(Clone)]
-pub(crate) struct ManualLoginForm {
-    pub(crate) name: String,
-    /// Same meaning as [`LoginSession::is_new`].
-    pub(crate) is_new: bool,
-    pub(crate) pending: crate::oauth_login::PendingManualLogin,
-    pub(crate) phase: ManualPhase,
-    /// The pasted `code#state`; masked in render, never logged.
-    pub(crate) input: InputState,
-}
-
-/// Hand-written so the pasted code cannot ride a `{:?}` anywhere (`Modal`
-/// derives `Debug`, and the derived `InputState` one prints its value).
-impl std::fmt::Debug for ManualLoginForm {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ManualLoginForm")
-            .field("name", &self.name)
-            .field("is_new", &self.is_new)
-            .field("phase", &self.phase)
-            .finish_non_exhaustive()
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ManualPhase {
-    /// Showing the link: `c` copies it, ⏎ moves on to the code, esc cancels.
-    Link,
-    /// Taking the code: ⏎ submits, esc goes back to the link.
-    Code,
 }
 
 // ── Toasts ────────────────────────────────────────────────────────────────────
@@ -1556,52 +1508,84 @@ pub(crate) enum MainItemKind {
 
 // ── Login session ─────────────────────────────────────────────────────────────
 
-/// An in-flight OAuth login. A browser one blocks its worker up to 180s in
-/// `oauth_login::login_with`; a manual one starts at the exchange, once the
-/// code is pasted. Either way the UI stays live and applies the result in
-/// `on_tick`. `generation` discards a stale result from a login the user
-/// superseded (esc-cancel or a fresh login start).
+/// An in-flight login. The worker blocks up to the login bound in
+/// `oauth_login` for the first door — the browser callback or a pasted code —
+/// while the UI stays live and applies the result in `on_tick`. `generation`
+/// discards a stale result from a login the user superseded (esc-cancel or a
+/// fresh login start).
 pub(crate) struct LoginSession {
     pub(crate) name: String,
     /// true → the mint lands in the `+ new` draft (capture-then-commit);
     /// false → re-login an existing profile in place (overwrite).
     pub(crate) is_new: bool,
     pub(crate) generation: u64,
-    /// The authorize URL once the worker announces it; shown in the login modal.
+    /// The URL `r` re-opens: an OAuth login's browser link, known at start; the
+    /// console login's page, once its worker announces it.
     pub(crate) url: Option<String>,
     /// Live milestone for the modal's stage line.
     pub(crate) stage: LoginStage,
-    /// Which flow this is, for the copy the modal and footer show.
+    /// The door that delivered the code, as the worker reported it; `Browser`
+    /// until then. The modal's stage copy follows it, so it is never set
+    /// from the UI's own paste: the browser callback may have won first.
     pub(crate) method: LoginMethod,
+    /// An OAuth login's paste door. `None` for the console login, which has no
+    /// hosted link and no code to paste, so `c` and `p` are inert there.
+    pub(crate) paste: Option<PasteDoor>,
+    /// The login modal's inline code field, open (`Some`) from `p` until esc,
+    /// a good submit, or the door closing. It lives here, not on the modal, so
+    /// it dies with the session and never outlives the door it feeds. The
+    /// typed bytes are a bearer-grade secret until exchanged: `LoginSession`
+    /// derives no `Debug`, so they cannot ride a `{:?}`.
+    pub(crate) paste_field: Option<InputState>,
+}
+
+/// The paste half of an OAuth login: the links `c` copies and a paste is
+/// checked against, and the sender a parsed code goes down to the worker.
+pub(crate) struct PasteDoor {
+    pub(crate) links: crate::oauth_login::LoginLinks,
+    pub(crate) tx: std::sync::mpsc::Sender<crate::oauth_login::ManualCode>,
+}
+
+impl LoginSession {
+    /// The paste door while it can still win: the login is waiting on its
+    /// first code. Once a door delivered one there is nothing to race, and the
+    /// console login never had a door. Every `c`/`p` affordance gates on this.
+    pub(crate) fn open_door(&self) -> Option<&PasteDoor> {
+        match self.stage {
+            LoginStage::WaitingBrowser => self.paste.as_ref(),
+            LoginStage::ExchangingCode(_) | LoginStage::Verifying => None,
+        }
+    }
 }
 
 // Re-exported so the render code and the tests keep addressing it as this
-// module's type: the CLI runs the same two flows off the same enum.
+// module's type: the CLI's login reports the same two doors off the same enum.
 pub(crate) use crate::oauth_login::LoginMethod;
 
 /// Where an in-flight login currently sits, mapped from
 /// [`crate::oauth_login::LoginProgress`] worker events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LoginStage {
-    /// Waiting for the user to finish the browser round-trip.
+    /// Waiting for the first door: the browser round-trip, or a pasted code.
     WaitingBrowser,
-    /// Callback landed; exchanging the code for tokens.
-    ExchangingCode,
+    /// A code landed through this door; exchanging it for tokens.
+    ExchangingCode(LoginMethod),
     /// Tokens minted; verifying them against the API.
     Verifying,
 }
 
-/// Worker→UI login channel payload: the announced URL or a stage bump.
+/// Worker→UI login channel payload: the console login's announced URL, or a
+/// stage bump (the first of which names the door that delivered the code).
 pub(crate) enum LoginEvent {
     Url(String),
     Stage(LoginStage),
 }
 
-/// What a finished login worker produced. Every flow (browser, manual paste,
-/// Alibaba console) reports through the same [`LoginEvent`] channel and is
-/// drawn by the same modal, and they diverge only at apply time: an Anthropic
-/// login replaces the profile's credentials, an Alibaba console login replaces
-/// its usage session and touches nothing else.
+/// What a finished login worker produced. Both flows (the two-door OAuth
+/// login, the Alibaba console) report through the same [`LoginEvent`] channel
+/// and are drawn by the same modal, and they diverge only at apply time: an
+/// Anthropic login replaces the profile's credentials, an Alibaba console login
+/// replaces its usage session and touches nothing else.
 ///
 /// The drain routes on this payload rather than on anything recorded in
 /// [`LoginSession`], so a session and its result cannot disagree about which
@@ -1725,6 +1709,11 @@ pub(crate) struct App {
 
     /// In-flight login worker of any method (Setup tab); `None` when idle.
     pub(crate) login: Option<LoginSession>,
+    /// What the login modal's `c` hands the hosted link to: OSC 52 on the
+    /// terminal's stdout. Replaceable so a test keeps the escape off the
+    /// terminal running the suite, which would take the fixture's link onto
+    /// its clipboard.
+    pub(crate) clipboard: fn(&str) -> std::io::Result<()>,
     /// Monotonic login id; bumped on each start so a superseded worker's result
     /// is discarded when it lands.
     pub(crate) login_generation: u64,
@@ -2176,6 +2165,7 @@ impl App {
             update_results,
             update_handle,
             login: None,
+            clipboard: crate::platform::copy_to_clipboard_osc52,
             login_generation: 0,
             login_event_rx,
             login_event_tx,
@@ -6221,26 +6211,124 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
         Modal::DivergenceTarget(_) => handle_divergence_target_key(app, key),
         Modal::ActionMenu(_) => handle_action_menu_key(app, key),
         Modal::EnvCollision(_) => handle_env_collision_key(app, key),
-        Modal::ManualLogin(_) => handle_manual_login_key(app, key),
-        Modal::Login => match key.code {
-            // Re-fire the browser open. The URL exists once the worker announced
-            // it; before that there is nothing to open, so `r` is a no-op.
-            KeyCode::Char('r') | KeyCode::Char('R') => {
-                if let Some(url) = app.login.as_ref().and_then(|s| s.url.clone()) {
-                    match crate::platform::open_url(&url) {
-                        Ok(()) => app.toast(ToastKind::Info, "opening your browser…"),
-                        Err(_) => app.toast(ToastKind::Danger, "couldn't open the browser"),
-                    }
+        Modal::Login => handle_login_modal_key(app, key),
+    }
+}
+
+/// Keys on the login progress modal. While the inline code field is open it
+/// owns every key ([`handle_paste_field_key`]). Otherwise `r` re-opens the URL
+/// the session holds; `c` copies the hosted link and `p` opens the code field
+/// on the session, both only while the paste door is open
+/// ([`LoginSession::open_door`]), so the console login and a login already
+/// exchanging a code leave them inert. esc/q/⏎ collapse to the footer
+/// indicator; the login keeps running (the generation is untouched). A real
+/// cancel is the top-level esc once collapsed; ⏎ on the login row re-expands.
+fn handle_login_modal_key(app: &mut App, key: KeyEvent) {
+    if app.login.as_ref().is_some_and(|s| s.paste_field.is_some()) {
+        handle_paste_field_key(app, key);
+        return;
+    }
+    match key.code {
+        // The console login's URL exists once its worker announced it; before
+        // that there is nothing to open, so `r` is a no-op.
+        KeyCode::Char('r' | 'R') => {
+            if let Some(url) = app.login.as_ref().and_then(|s| s.url.clone()) {
+                match crate::platform::open_url(&url) {
+                    Ok(()) => app.toast(ToastKind::Info, "opening your browser…"),
+                    Err(_) => app.toast(ToastKind::Danger, "couldn't open the browser"),
                 }
             }
-            // Collapse to the footer indicator; the login keeps running (the
-            // generation is untouched). A real cancel is the top-level esc
-            // once collapsed; ⏎ on the login row re-expands.
-            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
-                app.modals.pop();
+        }
+        // OSC 52 lands the link on the LOCAL terminal's clipboard, even over ssh.
+        KeyCode::Char('c' | 'C') => {
+            let link = app
+                .login
+                .as_ref()
+                .and_then(LoginSession::open_door)
+                .map(|door| door.links.hosted_url.clone());
+            if let Some(link) = link {
+                match (app.clipboard)(&link) {
+                    Ok(()) => app.toast(ToastKind::Info, "link copied to clipboard"),
+                    Err(e) => app.toast(
+                        ToastKind::Danger,
+                        format!("couldn't copy the link to clipboard\n{e}"),
+                    ),
+                }
             }
-            _ => {}
-        },
+        }
+        KeyCode::Char('p' | 'P') => {
+            if let Some(session) = app.login.as_mut()
+                && session.open_door().is_some()
+            {
+                session.paste_field = Some(InputState::new(""));
+            }
+        }
+        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+            app.modals.pop();
+        }
+        _ => {}
+    }
+}
+
+/// Keys while the login modal's code field is open. It is a text field, so
+/// every printable character is data (`c`, `q` and `p` included — a paste
+/// arrives as one key event per character), capped at `MANUAL_CODE_MAX` at the
+/// door so a runaway paste is never held first and refused after. esc clears
+/// the field and restores the `p  paste code` row (the modal stays); ⏎ submits.
+fn handle_paste_field_key(app: &mut App, key: KeyEvent) {
+    let Some(session) = app.login.as_mut() else {
+        return;
+    };
+    let Some(field) = session.paste_field.as_mut() else {
+        return;
+    };
+    match key.code {
+        KeyCode::Esc => session.paste_field = None,
+        KeyCode::Enter => submit_paste_code(app),
+        KeyCode::Char(_) if field.value.len() >= crate::oauth_login::MANUAL_CODE_MAX => {}
+        _ => apply_input_edit(field, key),
+    }
+}
+
+/// ⏎ on the code field: parse against the running login's own `state`, send a
+/// good code down its paste door and close the field. The session's method is
+/// NOT flipped here: the browser callback may already have won, so the
+/// worker's own `ExchangingCode` report is what names the door. A bad paste is
+/// cleared, not kept: a corrected paste appended to leftover bytes would pass
+/// the shape check and burn the exchange. A field whose door closed meanwhile
+/// (the drain closes it a tick later) has nothing to feed and closes too.
+fn submit_paste_code(app: &mut App) {
+    let Some(session) = app.login.as_mut() else {
+        return;
+    };
+    let Some(raw) = session
+        .paste_field
+        .as_ref()
+        .map(|field| field.trimmed().to_string())
+    else {
+        return;
+    };
+    if raw.is_empty() {
+        return;
+    }
+    let Some(door) = session.open_door() else {
+        session.paste_field = None;
+        return;
+    };
+    match door.links.parse(&raw) {
+        Ok(code) => {
+            // A late paste is never read: `run` already picked its door, so
+            // the send's result is discarded; the result drain handles the rest.
+            let _ = door.tx.send(code);
+            session.paste_field = None;
+        }
+        Err(e) => {
+            session.paste_field = Some(InputState::new(""));
+            app.toast(
+                ToastKind::Danger,
+                format!("{}\ncleared, paste the code again", e.message()),
+            );
+        }
     }
 }
 
@@ -6633,9 +6721,6 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
         rows.push(ConfigRow::Model);
         if draft.is_none_or(|d| d.base_url.value.trim().is_empty()) {
             rows.push(ConfigRow::Login);
-            // Stays beside a captured stash: `Login` renders the `✓ logged in`
-            // state, and ⏎ on either row goes through the same replace-confirm.
-            rows.push(ConfigRow::ManualLogin);
         }
         // The live-login capture row sits right below `+ login` and survives
         // into api mode (`+ login` doesn't): a live setup can be an endpoint
@@ -6713,12 +6798,6 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
     // row acts on what's on disk, so a hybrid's token can't be hidden behind
     // either a base url or an uncommitted draft.
     rows.push(ConfigRow::Login);
-    // The manual twin exists only where `Login` runs the browser mint. Decided
-    // on the profile ALREADY borrowed here: `cfg` holds the config mutex, which
-    // is not reentrant, so `login_row_flow` (which locks) cannot be asked.
-    if login_flow_for(profile) == LoginRowFlow::OauthMint {
-        rows.push(ConfigRow::ManualLogin);
-    }
     let has_creds = if profile.is_some_and(|p| p.login_is_oauth()) {
         profile.and_then(|p| p.credentials.as_ref()).is_some()
     } else {
@@ -6948,19 +7027,7 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                 LoginRowFlow::OauthMint => {}
             }
             if let Some((name, is_new)) = oauth_login_target(app, editing) {
-                begin_oauth_login(app, name, is_new, LoginMethod::Browser);
-            }
-        }
-        ConfigRow::ManualLogin => {
-            // Rendered only where `Login` resolves to the OAuth mint (see
-            // `config_rows`), so there is no flow to dispatch: this row IS the
-            // mint, minus the browser.
-            let editing = app
-                .config_draft
-                .as_ref()
-                .and_then(|d| d.editing_name.clone());
-            if let Some((name, is_new)) = oauth_login_target(app, editing) {
-                begin_oauth_login(app, name, is_new, LoginMethod::Manual);
+                begin_oauth_login(app, name, is_new);
             }
         }
         ConfigRow::CaptureLogin => {
@@ -7290,28 +7357,51 @@ fn start_api_relogin(app: &mut App) {
     }
 }
 
-/// Kick a browser OAuth login on a worker. `is_new` → the mint lands in the
-/// `+ new` draft when it arrives; else an existing profile is overwritten
-/// (divergence-gated in `apply_login`). A second ⏎ while one is in flight
-/// re-expands the progress modal instead of starting another login.
+/// Kick an OAuth login: mint it on this thread (no network), open the browser
+/// on its loopback link, and hand the wait to a worker that takes the first
+/// door — the loopback callback, or a code pasted through the login modal.
+/// `is_new` → the mint lands in the `+ new` draft when it arrives; else an
+/// existing profile is overwritten (divergence-gated in `apply_login`). A
+/// second ⏎ while one is in flight re-expands the progress modal instead of
+/// starting another login.
 fn start_login(app: &mut App, name: String, is_new: bool) {
     if login_in_flight(app, &name, is_new) {
         return;
     }
+    let pending = match crate::oauth_login::begin_login() {
+        Ok(pending) => pending,
+        Err(e) => {
+            app.toast(
+                ToastKind::Danger,
+                format!("login failed\n{}", e.user_message()),
+            );
+            return;
+        }
+    };
+    let links = pending.links().clone();
+    let (paste_tx, paste_rx) = std::sync::mpsc::channel();
     app.login_generation += 1;
     let generation = app.login_generation;
     app.login = Some(LoginSession {
         name,
         is_new,
         generation,
-        url: None,
+        url: Some(links.browser_url.clone()),
         stage: LoginStage::WaitingBrowser,
         method: LoginMethod::Browser,
+        paste: Some(PasteDoor {
+            links,
+            tx: paste_tx,
+        }),
+        paste_field: None,
     });
+    // Best effort: the modal's `r` retries it, and the hosted link is the
+    // way in where no browser can open.
+    let _ = crate::platform::open_url(&pending.links().browser_url);
     let event_tx = app.login_event_tx.clone();
     let result_tx = app.login_result_tx.clone();
     spawn_worker(move || {
-        let res = crate::oauth_login::login_with(|progress| {
+        let res = pending.run(paste_rx, |progress| {
             let _ = event_tx.send((generation, login_event(progress)));
         });
         // A toast, not stderr: the canned line without the HTTP status. The
@@ -7347,22 +7437,16 @@ pub(crate) enum LoginRowFlow {
 }
 
 /// Resolve the `log in` row's flow for the draft's account (`None` on the
-/// `+ new` form, which can only mint). Locks the config; callers already
-/// holding the guard use [`login_flow_for`] directly.
+/// `+ new` form, which can only mint; so does an unknown name, which has no
+/// key to re-enter). The console verdict is [`Profile::console_login_target`],
+/// shared with the row's hint and label so the copy cannot describe a
+/// different flow than the one ⏎ runs.
 fn login_row_flow(app: &App, editing: Option<&str>) -> LoginRowFlow {
     let Some(name) = editing else {
         return LoginRowFlow::OauthMint;
     };
     let cfg = app.config();
-    login_flow_for(cfg.find(&ProfileName::from(name)))
-}
-
-/// The flow decision itself, on an already-borrowed profile (`None` = no
-/// account, which can only mint). The console verdict is
-/// [`Profile::console_login_target`], shared with the row's hint and label so
-/// the copy cannot describe a different flow than the one ⏎ runs.
-pub(crate) fn login_flow_for(profile: Option<&Profile>) -> LoginRowFlow {
-    let Some(p) = profile else {
+    let Some(p) = cfg.find(&ProfileName::from(name)) else {
         return LoginRowFlow::OauthMint;
     };
     if let Some((site, region)) = p.console_login_target() {
@@ -7402,10 +7486,9 @@ fn oauth_login_target(app: &mut App, editing: Option<String>) -> Option<(String,
     }
 }
 
-/// Shared head of the two OAuth-mint rows: nothing starts while a login is in
-/// flight, a captured stash is confirmed before it is dropped, and only then
-/// does `method`'s flow begin.
-fn begin_oauth_login(app: &mut App, name: String, is_new: bool, method: LoginMethod) {
+/// The OAuth-mint head of the login row: nothing starts while a login is in
+/// flight, and a captured stash is confirmed before it is dropped.
+fn begin_oauth_login(app: &mut App, name: String, is_new: bool) {
     if login_in_flight(app, &name, is_new) {
         return;
     }
@@ -7421,18 +7504,10 @@ fn begin_oauth_login(app: &mut App, name: String, is_new: bool, method: LoginMet
             message: "replace the captured login?".to_string(),
             detail: Some("the login you already captured will be dropped".to_string()),
             choice: false,
-            on_confirm: ConfirmAction::RestartLogin(name, is_new, method),
+            on_confirm: ConfirmAction::RestartLogin(name, is_new),
         }));
     } else {
-        restart_login(app, name, is_new, method);
-    }
-}
-
-/// Run `method`'s flow for the given target, past every guard.
-fn restart_login(app: &mut App, name: String, is_new: bool, method: LoginMethod) {
-    match method {
-        LoginMethod::Browser => start_login(app, name, is_new),
-        LoginMethod::Manual => open_manual_login(app, name, is_new),
+        start_login(app, name, is_new);
     }
 }
 
@@ -7453,162 +7528,13 @@ fn login_in_flight(app: &mut App, name: &str, is_new: bool) -> bool {
     true
 }
 
-/// The worker→UI event for one `oauth_login` milestone, shared by both flows.
-fn login_event(progress: crate::oauth_login::LoginProgress<'_>) -> LoginEvent {
+/// The worker→UI event for one `oauth_login` milestone.
+fn login_event(progress: crate::oauth_login::LoginProgress) -> LoginEvent {
     use crate::oauth_login::LoginProgress;
     match progress {
-        LoginProgress::AuthorizeUrl(url) => LoginEvent::Url(url.to_string()),
-        LoginProgress::ExchangingCode => LoginEvent::Stage(LoginStage::ExchangingCode),
+        LoginProgress::ExchangingCode(door) => LoginEvent::Stage(LoginStage::ExchangingCode(door)),
         LoginProgress::Verifying => LoginEvent::Stage(LoginStage::Verifying),
     }
-}
-
-/// Start the manual (no browser) login: mint the PKCE state and open the link
-/// modal. No [`LoginSession`] yet — nothing is in flight until a code is
-/// submitted, so esc on the modal is a plain close and the top-level esc
-/// (which cancels an in-flight login) is not in play.
-fn open_manual_login(app: &mut App, name: String, is_new: bool) {
-    match crate::oauth_login::begin_manual_login() {
-        Ok(pending) => app.modals.push(Modal::ManualLogin(ManualLoginForm {
-            name,
-            is_new,
-            pending,
-            phase: ManualPhase::Link,
-            input: InputState::new(""),
-        })),
-        Err(e) => app.toast(
-            ToastKind::Danger,
-            format!("login failed\n{}", e.user_message()),
-        ),
-    }
-}
-
-/// Keys on the manual login modal. Phase decides the vocabulary: in `Link`
-/// only `c`, ⏎, and esc mean anything, so a paste that lands here by mistake
-/// changes nothing; in `Code` every printable character is data (`c` and `q`
-/// included — a paste arrives as one key event per character), esc goes back
-/// to the link, and ⏎ submits.
-fn handle_manual_login_key(app: &mut App, key: KeyEvent) {
-    enum Act {
-        None,
-        Copy(String),
-        Cancel,
-        Submit,
-    }
-    let Some(Modal::ManualLogin(form)) = app.modals.last_mut() else {
-        return;
-    };
-    let act = match form.phase {
-        ManualPhase::Link => match key.code {
-            KeyCode::Char('c' | 'C') => Act::Copy(form.pending.url().to_string()),
-            KeyCode::Enter => {
-                form.phase = ManualPhase::Code;
-                Act::None
-            }
-            KeyCode::Esc => Act::Cancel,
-            _ => Act::None,
-        },
-        ManualPhase::Code => match key.code {
-            KeyCode::Esc => {
-                form.input = InputState::new("");
-                form.phase = ManualPhase::Link;
-                Act::None
-            }
-            KeyCode::Enter => Act::Submit,
-            // The cap `parse` enforces, applied at the door so a runaway paste
-            // is not held first and refused after.
-            KeyCode::Char(_) if form.input.value.len() >= crate::oauth_login::MANUAL_CODE_MAX => {
-                Act::None
-            }
-            _ => {
-                apply_input_edit(&mut form.input, key);
-                Act::None
-            }
-        },
-    };
-    match act {
-        Act::None => {}
-        // OSC 52 lands on the LOCAL terminal's clipboard even over ssh. `Ok`
-        // proves only that the bytes left; the terminal's answer is not
-        // observable, so the toast says "sent", not "copied".
-        Act::Copy(url) => match crate::platform::copy_to_clipboard_osc52(&url) {
-            Ok(()) => app.toast(ToastKind::Info, "link sent to your clipboard"),
-            Err(e) => app.toast(
-                ToastKind::Danger,
-                format!("couldn't send the link to your clipboard\n{e}"),
-            ),
-        },
-        Act::Cancel => {
-            app.modals.pop();
-            app.toast(ToastKind::Info, "login canceled");
-        }
-        Act::Submit => submit_manual_code(app),
-    }
-}
-
-/// ⏎ in the `Code` phase: parse against the pending login's own `state`
-/// WITHOUT consuming it, so a bad paste is corrected against the same link;
-/// a good one seats the session and hands the exchange to a worker, joining
-/// the browser flow's drain/apply path from there.
-fn submit_manual_code(app: &mut App) {
-    let parsed = {
-        let Some(Modal::ManualLogin(form)) = app.modals.last_mut() else {
-            return;
-        };
-        let raw = form.input.trimmed().to_string();
-        if raw.is_empty() {
-            return;
-        }
-        form.pending.parse(&raw).map_err(|e| {
-            // The buffer is masked, so it cannot be edited by eye; and a
-            // corrected paste appended to leftover bytes would pass the shape
-            // check and burn the exchange. Clear, then say so.
-            form.input = InputState::new("");
-            e.user_message()
-        })
-    };
-    let code = match parsed {
-        Ok(code) => code,
-        Err(msg) => {
-            app.toast(
-                ToastKind::Danger,
-                format!("{msg}\ncleared, paste the whole code again"),
-            );
-            return;
-        }
-    };
-    let Some(Modal::ManualLogin(form)) = app.modals.pop() else {
-        return;
-    };
-    let ManualLoginForm {
-        name,
-        is_new,
-        pending,
-        ..
-    } = form;
-    app.login_generation += 1;
-    let generation = app.login_generation;
-    app.login = Some(LoginSession {
-        name,
-        is_new,
-        generation,
-        url: None,
-        stage: LoginStage::ExchangingCode,
-        method: LoginMethod::Manual,
-    });
-    let event_tx = app.login_event_tx.clone();
-    let result_tx = app.login_result_tx.clone();
-    spawn_worker(move || {
-        let res = pending.complete(code, |progress| {
-            let _ = event_tx.send((generation, login_event(progress)));
-        });
-        let _ = result_tx.send((
-            generation,
-            res.map(|o| LoginResult::Oauth(Box::new(o)))
-                .map_err(|e| e.user_message()),
-        ));
-    });
-    open_login_modal(app);
 }
 
 /// Kick the Alibaba console login on a worker — the same browser round-trip and
@@ -7643,6 +7569,8 @@ fn start_console_login(app: &mut App, name: String, site: ConsoleSite, region: &
         url: None,
         stage: LoginStage::WaitingBrowser,
         method: LoginMethod::Browser,
+        paste: None,
+        paste_field: None,
     });
     let event_tx = app.login_event_tx.clone();
     let result_tx = app.login_result_tx.clone();
@@ -7835,7 +7763,6 @@ fn row_committed_value(profile: Option<&Profile>, name: &ProfileName, row: Confi
         | ConfigRow::ModelOverrideAdd
         | ConfigRow::EnvAdd
         | ConfigRow::Login
-        | ConfigRow::ManualLogin
         | ConfigRow::CaptureLogin
         | ConfigRow::DeleteCreds
         | ConfigRow::ClearSessionToken
@@ -7944,7 +7871,6 @@ fn apply_model_field(models: &mut ModelSettings, field: ConfigRow, raw: &str) {
         | ConfigRow::EnvEntry(_)
         | ConfigRow::EnvAdd
         | ConfigRow::Login
-        | ConfigRow::ManualLogin
         | ConfigRow::CaptureLogin
         | ConfigRow::DeleteCreds
         | ConfigRow::ClearSessionToken
@@ -9304,9 +9230,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 Err(e) => app.toast(ToastKind::Danger, format!("log out failed\n{e}")),
             }
         }
-        ConfirmAction::RestartLogin(name, is_new, method) => {
-            restart_login(app, name, is_new, method)
-        }
+        ConfirmAction::RestartLogin(name, is_new) => start_login(app, name, is_new),
         ConfirmAction::CaptureOverMintStash(snapshot) => {
             if stash_new_form_login(app, DraftLogin::LiveLogin(snapshot)) {
                 app.toast(
@@ -9780,8 +9704,12 @@ fn drain_pricing_events(app: &mut App) {
     }
 }
 
-/// Drain the login worker: track URL/stage events, and on a result apply it
-/// (stash or overwrite) — discarding a stale result from a superseded login.
+/// Drain the login worker: track URL/stage events (the door rides the first
+/// stage bump, and only the worker's report may set it — a paste sent a moment
+/// after the browser callback landed lost), and on a result apply it (stash or
+/// overwrite) — discarding a stale result from a superseded login. A stage
+/// bump that closes the paste door closes the code field with it: a code typed
+/// after the browser callback won has no door to reach.
 fn drain_login_events(app: &mut App) {
     while let Ok((generation, event)) = app.login_event_rx.try_recv() {
         if let Some(session) = app.login.as_mut()
@@ -9789,7 +9717,15 @@ fn drain_login_events(app: &mut App) {
         {
             match event {
                 LoginEvent::Url(url) => session.url = Some(url),
-                LoginEvent::Stage(stage) => session.stage = stage,
+                LoginEvent::Stage(stage) => {
+                    if let LoginStage::ExchangingCode(door) = stage {
+                        session.method = door;
+                    }
+                    session.stage = stage;
+                    if session.open_door().is_none() {
+                        session.paste_field = None;
+                    }
+                }
             }
         }
     }

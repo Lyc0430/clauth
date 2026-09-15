@@ -241,23 +241,48 @@ fn a_two_line_toast_bolds_the_head_and_dims_the_detail() {
     );
 }
 
-#[test]
-fn login_modal_drops_the_url_and_offers_a_retry() {
-    let _home = crate::testutil::HomeSandbox::new();
-    use crate::tui::app::{LoginSession, LoginStage, Modal, Tab};
-    let mut app = App::new(AppConfig {
-        state: AppState::default(),
-        profiles: vec![],
-    });
-    app.tab = Tab::Setup;
-    app.login = Some(LoginSession {
+/// An in-flight OAuth login at the waiting stage with its paste door open, plus
+/// the receiver its worker would hold (dropping it would close the door). The
+/// links are built by hand: nothing here needs a bound listener.
+fn paste_session() -> (
+    crate::tui::app::LoginSession,
+    std::sync::mpsc::Receiver<crate::oauth_login::ManualCode>,
+) {
+    use crate::tui::app::{LoginMethod, LoginSession, LoginStage, PasteDoor};
+    let (tx, rx) = std::sync::mpsc::channel();
+    let session = LoginSession {
         name: "fresh".to_string(),
         is_new: true,
         generation: 1,
         url: Some("https://claude.com/cai/oauth/authorize?client_id=redacted".to_string()),
         stage: LoginStage::WaitingBrowser,
-        method: crate::tui::app::LoginMethod::Browser,
+        method: LoginMethod::Browser,
+        paste: Some(PasteDoor {
+            links: crate::oauth_login::LoginLinks {
+                browser_url: "https://claude.com/cai/oauth/authorize?client_id=redacted"
+                    .to_string(),
+                hosted_url: "https://claude.com/cai/oauth/authorize?redirect_uri=hosted"
+                    .to_string(),
+                state: "fixture-state".to_string(),
+            },
+            tx,
+        }),
+        paste_field: None,
+    };
+    (session, rx)
+}
+
+#[test]
+fn login_modal_drops_the_url_and_offers_a_retry() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::{Modal, Tab};
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
     });
+    app.tab = Tab::Setup;
+    let (session, _rx) = paste_session();
+    app.login = Some(session);
     app.modals.push(Modal::Login);
 
     let out = dump(&app, 80, 24);
@@ -267,7 +292,7 @@ fn login_modal_drops_the_url_and_offers_a_retry() {
     );
     assert!(
         !out.contains("oauth/authorize"),
-        "the wrapped authorize URL is no longer rendered inline:\n{out}",
+        "neither authorize URL is rendered inline:\n{out}",
     );
 }
 
@@ -677,20 +702,17 @@ fn setup_hybrid_account_reads_logged_in_on_its_oauth_pair() {
 
     let out = dump(&app, 120, 30);
     assert!(
-        out.contains("web re-login"),
-        "a stored OAuth pair reads as logged in, on the browser-mint row:\n{out}",
+        out.contains("re-login"),
+        "a stored OAuth pair reads as logged in:\n{out}",
     );
     assert!(
         out.contains("log out"),
         "a stored OAuth pair keeps the log-out row:\n{out}",
     );
     assert!(
-        out.contains("opens a browser on this machine"),
-        "the login row's hint describes the OAuth mint:\n{out}",
-    );
-    assert!(
-        out.contains("manual re-login (no browser)"),
-        "and the manual twin sits under it:\n{out}",
+        out.lines()
+            .any(|l| l.trim_matches(|c| c == '│' || c == ' ') == "└ browser OAuth login"),
+        "the login row's hint is the OAuth mint's three words, whole:\n{out}",
     );
 }
 
@@ -1816,27 +1838,113 @@ fn the_live_column_appears_monotonically_in_width() {
     }
 }
 
-// ── manual login (no browser) ────────────────────────────────────────────────
+// ── the login modal's two doors ──────────────────────────────────────────────
 
-fn manual_form(
-    input: &str,
-    phase: crate::tui::app::ManualPhase,
-) -> crate::tui::app::ManualLoginForm {
-    crate::tui::app::ManualLoginForm {
-        name: "fresh".to_string(),
-        is_new: true,
-        pending: crate::oauth_login::begin_manual_login()
-            .unwrap_or_else(|e| panic!("{}", e.user_message())),
-        phase,
-        input: crate::tui::app::InputState::new(input),
+/// The row index of the first line containing `needle`, so row ORDER can be
+/// asserted, not just presence.
+fn row_of(out: &str, needle: &str) -> usize {
+    out.lines()
+        .position(|l| l.contains(needle))
+        .unwrap_or_else(|| panic!("`{needle}` missing:\n{out}"))
+}
+
+/// The last frame row: the footer's login line.
+fn footer_of(out: &str) -> &str {
+    out.lines().last().unwrap_or("").trim()
+}
+
+/// While an OAuth login waits it offers both doors — the browser retry, the
+/// link for another device, the paste row — in that order under the one
+/// waiting text both flows share; no browser blurb, and the link itself is
+/// never drawn. Once the paste door won (the worker's `ExchangingCode(Manual)`)
+/// the rows go and the stage line says so, with no browser copy anywhere in the
+/// frame. The footer carries the name and the key hint alone, in both states.
+#[test]
+fn login_modal_offers_both_doors_while_waiting_then_only_the_stage() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::{LoginMethod, LoginStage, Modal, Tab};
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    app.tab = Tab::Setup;
+    let (session, _rx) = paste_session();
+    app.login = Some(session);
+    app.modals.push(Modal::Login);
+    let footer = format!(
+        "{} logging in 'fresh'   q back",
+        super::format::spinner_frame(app.tick_count)
+    );
+
+    let out = dump(&app, 100, 30);
+    let stage = row_of(&out, "continue in your browser");
+    let r = row_of(&out, "r  open the browser again");
+    let c = row_of(&out, "c  copy link");
+    let p = row_of(&out, "p  paste code");
+    assert!(
+        stage < r && r + 1 == c && c + 1 == p,
+        "rows in order:\n{out}"
+    );
+    assert!(
+        !out.contains("complete the login"),
+        "no browser blurb; the stage line is the whole waiting text:\n{out}"
+    );
+    assert!(
+        !out.contains("oauth/authorize"),
+        "no authorize URL is rendered:\n{out}"
+    );
+    assert_eq!(footer_of(&out), footer, "the footer: name + hint, no stage");
+
+    let session = app.login.as_mut().expect("session");
+    session.stage = LoginStage::ExchangingCode(LoginMethod::Manual);
+    session.method = LoginMethod::Manual;
+    let out = dump(&app, 100, 30);
+    assert!(
+        out.contains("logging in with the code"),
+        "the stage line names the paste exchange:\n{out}"
+    );
+    for gone in [
+        "open the browser again",
+        "copy link",
+        "paste code",
+        "continue in your browser",
+    ] {
+        assert!(
+            !out.contains(gone),
+            "`{gone}` is gone once a door landed:\n{out}"
+        );
+    }
+    assert!(
+        !out.to_lowercase().contains("browser"),
+        "no browser copy anywhere in the frame, footer included:\n{out}"
+    );
+    assert_eq!(
+        footer_of(&out),
+        footer,
+        "the footer never carries the stage"
+    );
+
+    // The browser door's later stages keep their own two texts.
+    let session = app.login.as_mut().expect("session");
+    session.stage = LoginStage::ExchangingCode(LoginMethod::Browser);
+    session.method = LoginMethod::Browser;
+    let out = dump(&app, 100, 30);
+    assert!(out.contains("exchanging the code for tokens"), "{out}");
+    session_stage(&mut app, LoginStage::Verifying);
+    let out = dump(&app, 100, 30);
+    assert!(out.contains("verifying the minted token"), "{out}");
+}
+
+fn session_stage(app: &mut App, stage: crate::tui::app::LoginStage) {
+    if let Some(s) = app.login.as_mut() {
+        s.stage = stage;
     }
 }
 
-/// A manual session reaches the progress modal with the code already in
-/// hand, so nothing about a browser may be said: not the retry line, and not
-/// the "opening your browser…" arm a session with no URL would otherwise hit.
+/// The console login has one door: `r` alone under the same waiting text, no
+/// browser blurb, and a footer that offers no paste.
 #[test]
-fn login_modal_says_nothing_about_a_browser_for_a_manual_session() {
+fn the_console_login_modal_keeps_r_alone() {
     let _home = crate::testutil::HomeSandbox::new();
     use crate::tui::app::{LoginMethod, LoginSession, LoginStage, Modal, Tab};
     let mut app = App::new(AppConfig {
@@ -1845,138 +1953,141 @@ fn login_modal_says_nothing_about_a_browser_for_a_manual_session() {
     });
     app.tab = Tab::Setup;
     app.login = Some(LoginSession {
-        name: "fresh".to_string(),
-        is_new: true,
+        name: "qwen".to_string(),
+        is_new: false,
         generation: 1,
-        url: None,
-        stage: LoginStage::ExchangingCode,
-        method: LoginMethod::Manual,
+        url: Some("https://account.alibabacloud.com/login".to_string()),
+        stage: LoginStage::WaitingBrowser,
+        method: LoginMethod::Browser,
+        paste: None,
+        paste_field: None,
     });
     app.modals.push(Modal::Login);
 
+    let out = dump(&app, 100, 30);
+    let stage = row_of(&out, "continue in your browser");
+    let r = row_of(&out, "r  open the browser again");
+    assert!(stage < r, "the stage line leads the row:\n{out}");
+    for absent in ["complete the login", "copy link", "paste code"] {
+        assert!(!out.contains(absent), "`{absent}` is not offered:\n{out}");
+    }
+    assert_eq!(
+        footer_of(&out),
+        format!(
+            "{} logging in 'qwen'   q back",
+            super::format::spinner_frame(app.tick_count)
+        ),
+        "the footer: name + hint, no stage"
+    );
+}
+
+/// The code field stands in for the `p  paste code` row: the placeholder while
+/// empty, the typed text verbatim once there is any (never a mask, never a
+/// count), the stage line reading `pasting the code`, the native caret on the
+/// value, and a footer of `↵ submit   esc back` with no parenthetical. A field
+/// left set after the door closed renders neither the row nor its stage text.
+#[test]
+fn the_code_field_shows_the_typed_text_and_the_placeholder() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::{InputState, LoginMethod, LoginStage, Modal, Tab};
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    app.tab = Tab::Setup;
+    let (session, _rx) = paste_session();
+    app.login = Some(session);
+    app.modals.push(Modal::Login);
+    let footer = format!(
+        "{} logging in 'fresh'   ↵ submit   esc back",
+        super::format::spinner_frame(app.tick_count)
+    );
+
+    session_field(&mut app, Some(InputState::new("")));
     let out = dump(&app, 80, 24);
+    let stage = row_of(&out, "pasting the code");
+    let c = row_of(&out, "c  copy link");
+    let field = row_of(&out, "✎ code (paste it here)");
     assert!(
-        out.contains("exchanging the code"),
-        "the stage line shows:\n{out}"
+        stage < c && c + 1 == field,
+        "the field is the third row:\n{out}"
     );
     assert!(
-        !out.to_lowercase().contains("browser"),
-        "no browser copy anywhere in the frame, footer included:\n{out}"
+        !out.contains("p  paste code"),
+        "the row became the field:\n{out}"
     );
-    assert!(
-        out.contains("manual login in progress"),
-        "the footer names the manual flow:\n{out}"
-    );
-}
+    assert!(!out.contains("PASTE CODE"), "no second modal:\n{out}");
+    assert_eq!(footer_of(&out), footer);
 
-/// The pasted code is a bearer-grade secret until exchanged: the code phase
-/// renders a bullet run and a count, never the bytes.
-#[test]
-fn manual_login_code_phase_never_shows_the_paste() {
-    let _home = crate::testutil::HomeSandbox::new();
-    use crate::tui::app::{ManualPhase, Modal, Tab};
-    let mut app = App::new(AppConfig {
-        state: AppState::default(),
-        profiles: vec![],
-    });
-    app.tab = Tab::Setup;
-    let form = manual_form("CANARYCODE#CANARYSTATE", ManualPhase::Code);
-    let url = form.pending.url().to_string();
-    app.modals.push(Modal::ManualLogin(form));
-
-    let out = dump(&app, 80, 24);
-    assert!(out.contains("MANUAL LOGIN"), "{out}");
-    assert!(
-        !out.contains("CANARY"),
-        "the paste never reaches the frame:\n{out}"
-    );
-    assert!(
-        out.contains("(22 chars)"),
-        "the count stands in for it:\n{out}"
-    );
-    assert!(
-        !out.contains(&url[..40]),
-        "the link belongs to the other phase:\n{out}"
-    );
-}
-
-/// The link phase fits its own rows so a short, narrow terminal loses URL
-/// characters, never the key line: at 40×12 the whole instruction survives.
-#[test]
-fn manual_login_link_phase_keeps_its_key_line_on_a_tiny_terminal() {
-    let _home = crate::testutil::HomeSandbox::new();
-    use crate::tui::app::{ManualPhase, Modal, Tab};
-    let mut app = App::new(AppConfig {
-        state: AppState::default(),
-        profiles: vec![],
-    });
-    app.tab = Tab::Setup;
-    app.modals
-        .push(Modal::ManualLogin(manual_form("", ManualPhase::Link)));
-
-    let wide = dump(&app, 120, 40);
-    assert!(wide.contains("c copy link"), "{wide}");
-    assert!(wide.contains("esc cancel"), "{wide}");
-    assert!(
-        wide.contains("claude.com/cai/oauth/authorize"),
-        "the link shows in full:\n{wide}"
-    );
-
-    let tiny = dump(&app, 40, 12);
-    let flat: String = tiny
-        .lines()
-        .map(str::trim_end)
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(flat.contains("copy link"), "the copy key survives:\n{tiny}");
-    assert!(
-        flat.contains("esc"),
-        "so does the tail of the key line:\n{tiny}"
-    );
-    assert!(flat.contains("cancel"), "{tiny}");
-    // 40×12 leaves no row for the URL at all, so none of it shows and there
-    // is nothing to mark as cut.
-    assert!(
-        !tiny.contains("authorize"),
-        "no URL row fits at this size:\n{tiny}"
-    );
-    assert!(!tiny.contains('…'), "nothing cut, nothing marked:\n{tiny}");
-}
-
-/// Between "fits in full" and "no room at all": at 40×20 the URL gets two
-/// rows but needs many more, so its head shows, its tail is gone, and the cut
-/// is marked with an ellipsis.
-#[test]
-fn manual_login_link_phase_marks_a_url_it_had_to_cut() {
-    let _home = crate::testutil::HomeSandbox::new();
-    use crate::tui::app::{ManualPhase, Modal, Tab};
-    let mut app = App::new(AppConfig {
-        state: AppState::default(),
-        profiles: vec![],
-    });
-    app.tab = Tab::Setup;
-    let form = manual_form("", ManualPhase::Link);
-    let url = form.pending.url().to_string();
-    let (_, state) = url.split_once("state=").expect("the URL carries a state");
-    let state = state.split('&').next().unwrap_or(state);
-    app.modals.push(Modal::ManualLogin(form));
-
-    let mid = dump(&app, 40, 20);
-    // The URL is chunked across rows, each wrapped in modal and pane chrome;
-    // dropping whitespace and box-drawing characters glues the chunks back so
-    // the head can be matched as one string (the URL contains neither).
-    let flat: String = mid
-        .chars()
-        .filter(|c| !c.is_whitespace() && !('\u{2500}'..='\u{259F}').contains(c))
+    session_field(&mut app, Some(InputState::new("CANARYCODE#CANARYSTATE")));
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    let out: String = crate::testutil::buffer_rows(term.backend().buffer())
+        .into_iter()
+        .map(|r| r + "\n")
         .collect();
-    assert!(mid.contains('…'), "the cut is marked:\n{mid}");
+    let field = row_of(&out, "✎ code CANARYCODE#CANARYSTATE");
     assert!(
-        flat.contains("https://claude.com/cai/oauth/authorize"),
-        "the head of the URL shows:\n{mid}"
+        !out.contains("(paste it here)") && !out.contains("•") && !out.contains("chars)"),
+        "the typed text, not a placeholder, a mask or a count:\n{out}"
     );
+    let caret = term.get_cursor_position().unwrap();
+    let field_line = out.lines().nth(field).unwrap_or("");
+    let value_col = field_line
+        .find("CANARYCODE")
+        .map(|i| field_line[..i].chars().count())
+        .unwrap_or(usize::MAX);
+    assert_eq!(
+        (usize::from(caret.x), usize::from(caret.y)),
+        (value_col + "CANARYCODE#CANARYSTATE".len(), field),
+        "the native caret sits after the typed text on the field row:\n{out}"
+    );
+    assert_eq!(footer_of(&out), footer);
+
+    // A real `code#state` is a few hundred bytes and wraps inside an 80-column
+    // modal: the caret folds onto the wrapped row, right after the tail.
+    let long = format!("{}#TAIL", "X".repeat(90));
+    session_field(&mut app, Some(InputState::new(&long)));
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    let out: String = crate::testutil::buffer_rows(term.backend().buffer())
+        .into_iter()
+        .map(|r| r + "\n")
+        .collect();
+    let tail_row = out
+        .lines()
+        .position(|l| l.contains("#TAIL"))
+        .expect("the wrapped tail renders");
+    let head_row = row_of(&out, "✎ code X");
     assert!(
-        !flat.contains(state),
-        "the tail of the URL is what was cut:\n{mid}"
+        tail_row > head_row,
+        "the value wraps past its first row:\n{out}"
     );
-    assert!(mid.contains("copy link"), "the key line survives:\n{mid}");
+    let tail_line = out.lines().nth(tail_row).unwrap_or("");
+    let tail_end = tail_line
+        .find("#TAIL")
+        .map(|i| tail_line[..i].chars().count() + "#TAIL".len())
+        .unwrap_or(usize::MAX);
+    let caret = term.get_cursor_position().unwrap();
+    assert_eq!(
+        (usize::from(caret.x), usize::from(caret.y)),
+        (tail_end, tail_row),
+        "the native caret folds onto the wrapped row, after the tail:\n{out}"
+    );
+
+    session_stage(&mut app, LoginStage::ExchangingCode(LoginMethod::Browser));
+    let out = dump(&app, 80, 24);
+    for gone in ["✎ code", "CANARY", "pasting the code"] {
+        assert!(
+            !out.contains(gone),
+            "`{gone}` never renders past the door:\n{out}"
+        );
+    }
+    assert!(out.contains("exchanging the code for tokens"), "{out}");
+}
+
+fn session_field(app: &mut App, field: Option<crate::tui::app::InputState>) {
+    if let Some(s) = app.login.as_mut() {
+        s.paste_field = field;
+    }
 }

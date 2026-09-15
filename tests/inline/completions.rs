@@ -824,22 +824,16 @@ fn the_parity_scan_still_catches_a_bare_apostrophe_beside_the_escape_idiom() {
     );
 }
 
-/// Every shell must offer `--manual` under the `login` subcommand, gated to
-/// login like the other login flags, and the `login` subcommand's own help
-/// names the manual flow so a user can find it from the completion alone.
+/// `--manual` is gone from the login surface: no shell script may mention it,
+/// and the zsh + fish login descriptions read the bare browser-OAuth wording.
 #[test]
-fn every_shell_completes_login_manual_flag() {
-    let cases = [
-        (&BASH, "--setup-token --manual"),
-        (&ZSH, "'--manual[log in without a browser"),
-        (&FISH, "__fish_seen_subcommand_from login\" -a --manual"),
-    ];
-    for (script, gated) in cases {
+fn every_shell_drops_the_manual_login_flag() {
+    for script in [&BASH, &ZSH, &FISH] {
         assert!(
-            script.contains(gated),
-            "the --manual completion must be gated to `login`, missing {gated:?}",
+            !script.contains("--manual"),
+            "the --manual flag must not appear in any completion script"
         );
     }
-    assert!(ZSH.contains("'login[log in via browser, manual code, or an API key]'"));
-    assert!(FISH.contains("-a login -d \"Log in via browser, manual code, or an API key\""));
+    assert!(ZSH.contains("'login[log in via browser OAuth or an API key]'"));
+    assert!(FISH.contains("-a login -d \"Log in via browser OAuth or an API key\""));
 }

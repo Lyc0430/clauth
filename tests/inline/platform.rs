@@ -1,4 +1,5 @@
-//! The OSC 52 clipboard escape behind the manual login's `c` key, pinned on a
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+//! The OSC 52 clipboard escape behind the login modal's `c` key, pinned on a
 //! writer so no test touches the real stdout.
 
 use super::{base64_std, write_osc52};

@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 use crate::lockorder::RankedMutex;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -880,7 +881,6 @@ fn config_rows_account_actions_tail_matches_runtime_order() {
             ConfigRow::ModelOverrideAdd,
             ConfigRow::EnvAdd,
             ConfigRow::Login,
-            ConfigRow::ManualLogin,
             ConfigRow::DeleteCreds,
             ConfigRow::Disabled,
             ConfigRow::Delete,
@@ -1048,8 +1048,8 @@ fn hybrid(name: &str, api_key: Option<&str>) -> crate::profile::Profile {
 }
 
 /// The console arm of the login-row resolver, as the `Option` the old
-/// `console_login_target` helper returned: `login_flow_for` folded it in when
-/// `config_rows` needed the decision on an already-borrowed profile.
+/// `console_login_target` helper returned before it folded into
+/// `login_row_flow`.
 fn console_login_target(
     app: &App,
     name: &crate::profile::ProfileName,
@@ -2935,7 +2935,7 @@ fn login_creds(refresh: &str) -> crate::profile::ClaudeCredentials {
     }
 }
 
-/// A completed login as `login_with` hands it back: the mint plus the account
+/// A completed login as `PendingLogin::run` hands it back: the mint plus the account
 /// uuid its `/profile` verification probe saw. `uuid` is `None` for a login whose
 /// probe failed or returned no usable identity.
 fn login_outcome(refresh: &str, uuid: Option<&str>) -> crate::oauth_login::LoginOutcome {
@@ -2975,7 +2975,8 @@ fn force_poll(app: &mut App) {
     super::poll_credentials_divergence(app);
 }
 
-/// An in-flight login session fixture at the waiting stage.
+/// An in-flight login session fixture at the waiting stage, shaped like the
+/// console login: a browser and no paste door.
 fn login_session(name: &str, is_new: bool, generation: u64) -> super::LoginSession {
     super::LoginSession {
         name: name.to_string(),
@@ -2984,7 +2985,45 @@ fn login_session(name: &str, is_new: bool, generation: u64) -> super::LoginSessi
         url: None,
         stage: super::LoginStage::WaitingBrowser,
         method: super::LoginMethod::Browser,
+        paste: None,
+        paste_field: None,
     }
+}
+
+/// The `state` every paste-door fixture below is minted with.
+const PASTE_STATE: &str = "fixture-state-7f3a";
+
+/// An in-flight OAuth login at the waiting stage with its paste door open, plus
+/// the receiver a worker would hold, so a test can see what a paste delivered.
+/// The links are built by hand: binding a listener is `begin_login`'s job and
+/// nothing here needs one.
+fn paste_session(
+    name: &str,
+    is_new: bool,
+    generation: u64,
+) -> (
+    super::LoginSession,
+    std::sync::mpsc::Receiver<crate::oauth_login::ManualCode>,
+) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let session = super::LoginSession {
+        name: name.to_string(),
+        is_new,
+        generation,
+        url: Some(format!("http://localhost:1/authorize?state={PASTE_STATE}")),
+        stage: super::LoginStage::WaitingBrowser,
+        method: super::LoginMethod::Browser,
+        paste: Some(super::PasteDoor {
+            links: crate::oauth_login::LoginLinks {
+                browser_url: format!("http://localhost:1/authorize?state={PASTE_STATE}"),
+                hosted_url: format!("https://hosted.example/authorize?state={PASTE_STATE}"),
+                state: PASTE_STATE.to_string(),
+            },
+            tx,
+        }),
+        paste_field: None,
+    };
+    (session, rx)
 }
 
 #[test]
@@ -3108,69 +3147,13 @@ fn relogin_on_a_stashed_new_form_confirms_before_replacing_the_stash() {
     assert!(
         matches!(
             app.modals.last(),
-            Some(Modal::Confirm(s)) if matches!(s.on_confirm, ConfirmAction::RestartLogin(_, true, _))
+            Some(Modal::Confirm(s)) if matches!(s.on_confirm, ConfirmAction::RestartLogin(_, true))
         ),
         "⏎ on a stashed new-form login must confirm before dropping the capture",
     );
     assert!(
         app.login.is_none(),
         "no login worker starts until the confirm is accepted",
-    );
-}
-
-/// The manual row shares the stash gate: ⏎ on a stashed new-form capture
-/// confirms first, and accepting opens the manual modal, not the browser one.
-#[test]
-fn manual_relogin_on_a_stashed_new_form_confirms_then_opens_the_manual_modal() {
-    use super::{
-        ConfigFocus, ConfigRow, ConfirmAction, DraftLogin, LoginMethod, Modal, build_draft_new,
-        handle_key, run_config_row,
-    };
-    use crate::profile::{AppConfig, AppState};
-    use crate::testutil::key;
-    use ratatui::crossterm::event::KeyCode;
-    let _home = crate::testutil::HomeSandbox::new();
-
-    let mut app = App::new(AppConfig {
-        state: AppState::default(),
-        profiles: vec![],
-    });
-    app.profile_cursor = 0; // the `+ new` form
-    let mut draft = build_draft_new();
-    draft.name = InputState::new("fresh");
-    draft.captured_login = Some(DraftLogin::Mint(Box::new(login_outcome(
-        "stashed",
-        Some("uuid-stashed"),
-    ))));
-    app.config_draft = Some(draft);
-    app.config_focus = ConfigFocus::Actions;
-
-    run_config_row(&mut app, ConfigRow::ManualLogin);
-
-    assert!(
-        matches!(
-            app.modals.last(),
-            Some(Modal::Confirm(s))
-                if matches!(s.on_confirm, ConfirmAction::RestartLogin(_, true, LoginMethod::Manual))
-        ),
-        "the confirm must carry the manual method, got {:?}",
-        app.modals.last()
-    );
-    assert!(
-        app.login.is_none(),
-        "nothing starts until the confirm is accepted"
-    );
-
-    handle_key(&mut app, key(KeyCode::Char('y')));
-    handle_key(&mut app, key(KeyCode::Enter));
-    assert!(
-        matches!(app.modals.last(), Some(Modal::ManualLogin(_))),
-        "accepting opens the manual modal, not the browser login, got {:?}",
-        app.modals.last()
-    );
-    assert!(
-        app.login.is_none(),
-        "the manual link phase has no worker in flight"
     );
 }
 
@@ -3497,7 +3480,7 @@ fn login_row_over_a_stashed_live_login_confirms_first() {
     assert!(
         matches!(
             app.modals.last(),
-            Some(Modal::Confirm(s)) if matches!(s.on_confirm, ConfirmAction::RestartLogin(_, true, _))
+            Some(Modal::Confirm(s)) if matches!(s.on_confirm, ConfirmAction::RestartLogin(_, true))
         ),
         "⏎ on `+ login` over a stashed live login must confirm before dropping it",
     );
@@ -3660,7 +3643,10 @@ fn login_stage_events_advance_the_session() {
         .send((1, LoginEvent::Url("https://example.test/auth".to_string())))
         .unwrap();
     app.login_event_tx
-        .send((1, LoginEvent::Stage(LoginStage::ExchangingCode)))
+        .send((
+            1,
+            LoginEvent::Stage(LoginStage::ExchangingCode(super::LoginMethod::Browser)),
+        ))
         .unwrap();
     // A stale generation's stage bump is ignored.
     app.login_event_tx
@@ -3671,7 +3657,10 @@ fn login_stage_events_advance_the_session() {
 
     let session = app.login.as_ref().expect("session stays live");
     assert_eq!(session.url.as_deref(), Some("https://example.test/auth"));
-    assert_eq!(session.stage, LoginStage::ExchangingCode);
+    assert_eq!(
+        session.stage,
+        LoginStage::ExchangingCode(super::LoginMethod::Browser)
+    );
 }
 
 /// `?` opens the help modal at the top and ↑↓ scrolls it, clamped both ways —
@@ -11039,380 +11028,487 @@ fn a_plain_app_lands_on_overview_with_the_first_row_selected() {
     );
 }
 
-// ── manual login (no browser) ────────────────────────────────────────────────
+// ── the login modal's paste door ─────────────────────────────────────────────
 
-/// The manual row appears exactly where the login row would run the OAuth
-/// mint: right under it on an OAuth account and on the `+ new` form, and
-/// nowhere on an api-key or Model Studio account, whose login rows run other
-/// flows that have no browser-free twin.
+/// The login modal's inline code field, as `p` opened it.
+fn paste_field(app: &App) -> super::InputState {
+    app.login
+        .as_ref()
+        .and_then(|s| s.paste_field.clone())
+        .unwrap_or_else(|| {
+            panic!(
+                "expected the code field open (login {}, modals {:?})",
+                if app.login.is_some() { "live" } else { "gone" },
+                app.modals
+            )
+        })
+}
+
+/// An app with an OAuth login in flight and its progress modal open, plus the
+/// receiver the login's worker would hold. The clipboard escape goes to a sink,
+/// never to the stdout the suite runs on.
+fn app_with_open_login_modal() -> (
+    App,
+    std::sync::mpsc::Receiver<crate::oauth_login::ManualCode>,
+) {
+    let mut app = app_with(vec![]);
+    app.tab = super::Tab::Setup;
+    app.clipboard = |link| crate::platform::write_osc52(&mut std::io::sink(), link);
+    app.login_generation = 1;
+    let (session, rx) = paste_session("fresh", true, 1);
+    app.login = Some(session);
+    app.modals.push(super::Modal::Login);
+    (app, rx)
+}
+
+/// `p` turns its own row into the code field on the session — the modal stack
+/// is untouched — and esc restores the row with the field gone, so the next
+/// `p` starts from an empty field. Only the esc after that collapses the modal.
 #[test]
-fn config_rows_manual_login_follows_the_oauth_mint() {
-    use super::{ConfigRow, build_draft_new, config_rows};
-    use crate::profile::Profile;
-    let _home = crate::testutil::HomeSandbox::new();
-    let mut app = app_with(vec![
-        Profile::new("oauth".to_string(), None, None),
-        Profile::new(
-            "deepseek".to_string(),
-            Some("https://api.deepseek.com".to_string()),
-            Some("sk-test".to_string()),
-        ),
-        Profile::new(
-            "qwen".to_string(),
-            Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic".to_string()),
-            Some("sk-sp-test".to_string()),
-        ),
-    ]);
-    app.config_draft = None;
-
-    app.profile_cursor = 0;
-    let rows = config_rows(&app);
-    let li = rows
-        .iter()
-        .position(|r| *r == ConfigRow::Login)
-        .expect("login row");
-    assert_eq!(
-        rows.get(li + 1),
-        Some(&ConfigRow::ManualLogin),
-        "an OAuth account gets the manual twin right under its login row: {rows:?}"
-    );
-    for (i, name) in [(1, "deepseek"), (2, "qwen")] {
-        app.profile_cursor = i;
-        let rows = config_rows(&app);
-        assert!(rows.contains(&ConfigRow::Login), "{name}: {rows:?}");
-        assert!(
-            !rows.contains(&ConfigRow::ManualLogin),
-            "{name}'s login row runs another flow, so no manual twin: {rows:?}"
-        );
-    }
-
-    // `+ new`: both rows while no base url is typed, neither once one is.
-    app.profile_cursor = 3;
-    app.config_draft = Some(build_draft_new());
-    let rows = config_rows(&app);
-    let li = rows
-        .iter()
-        .position(|r| *r == ConfigRow::Login)
-        .expect("login row on the new form");
-    assert_eq!(rows.get(li + 1), Some(&ConfigRow::ManualLogin), "{rows:?}");
-    app.config_draft.as_mut().expect("draft").base_url = InputState::new("https://x");
-    let rows = config_rows(&app);
-    assert!(
-        !rows.contains(&ConfigRow::Login) && !rows.contains(&ConfigRow::ManualLogin),
-        "a typed base url makes it an api account, which mints nothing: {rows:?}"
-    );
-}
-
-/// The manual modal on the stack, as the row left it.
-fn manual_form(app: &App) -> super::ManualLoginForm {
-    match app.modals.last() {
-        Some(super::Modal::ManualLogin(f)) => f.clone(),
-        other => panic!("expected the manual login modal on top, got {other:?}"),
-    }
-}
-
-/// The `state` a pending manual login expects, read off its own URL — the only
-/// honest way a test can mint a matching paste.
-fn manual_state(form: &super::ManualLoginForm) -> String {
-    let (_, query) = form.pending.url().split_once('?').expect("query");
-    crate::oauth_login::query_param(query, "state").expect("state param")
-}
-
-/// Two phases so the copy key can never eat a pasted character: in `Link`
-/// only `c`, ⏎ and esc mean anything (a stray paste changes nothing); in
-/// `Code` every printable character is data, `c` and `q` included, since a
-/// paste arrives as one key event per character.
-/// The code phase stops taking characters at `MANUAL_CODE_MAX`: the cap
-/// `parse` enforces is applied at the door, so a runaway paste is never held.
-#[test]
-fn manual_login_code_phase_stops_at_the_cap() {
-    use super::{ConfigRow, ManualPhase, Modal, enter_config_detail, handle_key, run_config_row};
-    use crate::oauth_login::MANUAL_CODE_MAX;
-    use crate::profile::Profile;
+fn p_on_the_login_modal_opens_the_paste_field_and_esc_returns_to_it() {
+    use super::{Modal, handle_key};
     use crate::testutil::key;
     use ratatui::crossterm::event::KeyCode;
     let _home = crate::testutil::HomeSandbox::new();
-    let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
-    app.tab = super::Tab::Setup;
-    app.profile_cursor = 0;
-    enter_config_detail(&mut app);
+    let (mut app, _rx) = app_with_open_login_modal();
 
-    run_config_row(&mut app, ConfigRow::ManualLogin);
-    handle_key(&mut app, key(KeyCode::Enter));
-    assert_eq!(manual_form(&app).phase, ManualPhase::Code);
+    handle_key(&mut app, key(KeyCode::Char('p')));
+    assert!(paste_field(&app).value.is_empty());
+    assert!(
+        matches!(app.modals.as_slice(), [Modal::Login]),
+        "`p` pushes no modal, got {:?}",
+        app.modals
+    );
+    for c in "abc".chars() {
+        handle_key(&mut app, key(KeyCode::Char(c)));
+    }
+    assert_eq!(paste_field(&app).value, "abc");
 
-    for _ in 0..MANUAL_CODE_MAX + 5 {
+    handle_key(&mut app, key(KeyCode::Esc));
+    let session = app
+        .login
+        .as_ref()
+        .expect("esc on the field cancels nothing");
+    assert!(
+        session.paste_field.is_none(),
+        "esc restores the `p  paste code` row"
+    );
+    assert!(
+        matches!(app.modals.as_slice(), [Modal::Login]),
+        "the modal stays, got {:?}",
+        app.modals
+    );
+    assert_eq!(app.login_generation, 1);
+
+    handle_key(&mut app, key(KeyCode::Char('p')));
+    assert!(
+        paste_field(&app).value.is_empty(),
+        "the typed bytes did not survive esc"
+    );
+    assert!(app.toasts.is_empty(), "neither key toasts");
+
+    handle_key(&mut app, key(KeyCode::Esc));
+    handle_key(&mut app, key(KeyCode::Esc));
+    assert!(
+        app.modals.is_empty(),
+        "the esc after the field closed collapses the modal, got {:?}",
+        app.modals
+    );
+    assert!(app.login.is_some(), "collapsing cancels nothing");
+}
+
+/// The field is a text input, so the login modal's own keys are data here (`c`,
+/// `q`, `p` included — a paste arrives as one key event per character), and it
+/// stops taking characters at `MANUAL_CODE_MAX`: the cap `parse` enforces is
+/// applied at the door, so a runaway paste is never held.
+#[test]
+fn the_paste_field_takes_every_character_as_data_and_stops_at_the_cap() {
+    use super::{Modal, handle_key};
+    use crate::oauth_login::MANUAL_CODE_MAX;
+    use crate::testutil::key;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let (mut app, _rx) = app_with_open_login_modal();
+    handle_key(&mut app, key(KeyCode::Char('p')));
+
+    for c in "cqp#cqp".chars() {
+        handle_key(&mut app, key(KeyCode::Char(c)));
+    }
+    assert_eq!(
+        paste_field(&app).value,
+        "cqp#cqp",
+        "every printable character is data in the field"
+    );
+    assert!(
+        matches!(app.modals.as_slice(), [Modal::Login]),
+        "`q` closed nothing, `p` opened nothing, got {:?}",
+        app.modals
+    );
+    assert!(app.toasts.is_empty(), "`c` copied nothing");
+
+    for _ in 0..MANUAL_CODE_MAX {
         handle_key(&mut app, key(KeyCode::Char('a')));
     }
     assert_eq!(
-        manual_form(&app).input.value.len(),
+        paste_field(&app).value.len(),
         MANUAL_CODE_MAX,
         "characters past the cap are dropped at the door"
     );
     assert!(
-        matches!(app.modals.last(), Some(Modal::ManualLogin(_))),
+        matches!(app.modals.as_slice(), [Modal::Login]),
         "the modal stays open"
     );
 }
 
+/// While the field is open the modal's action keys are data: `r`, `c` and `q`
+/// land in the field, and none of their actions fires — no clipboard write, no
+/// toast (a browser open toasts either way), no collapse. The fixture holds no
+/// URL, so a leaked `r` could not spawn a real browser here; the field's value
+/// is what proves it never reached that arm.
 #[test]
-fn manual_login_modal_takes_every_character_as_code_once_in_the_code_phase() {
-    use super::{ConfigRow, ManualPhase, Modal, enter_config_detail, handle_key, run_config_row};
-    use crate::profile::Profile;
+fn r_c_and_q_are_data_while_the_field_is_open() {
+    use super::{Modal, handle_key};
     use crate::testutil::key;
     use ratatui::crossterm::event::KeyCode;
     let _home = crate::testutil::HomeSandbox::new();
-    let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
-    app.tab = super::Tab::Setup;
-    app.profile_cursor = 0;
-    enter_config_detail(&mut app);
+    let (mut app, _rx) = app_with_open_login_modal();
+    static HANDED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    app.clipboard = |link| {
+        HANDED.lock().expect("handed").push(link.to_string());
+        Ok(())
+    };
+    if let Some(s) = app.login.as_mut() {
+        s.url = None;
+    }
+    handle_key(&mut app, key(KeyCode::Char('p')));
 
-    run_config_row(&mut app, ConfigRow::ManualLogin);
-    let form = manual_form(&app);
-    assert_eq!(form.phase, ManualPhase::Link);
-    assert!(
-        form.pending
-            .url()
-            .contains("redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback"),
-        "the link carries the manual redirect"
-    );
-    assert!(
-        app.login.is_none(),
-        "nothing is in flight while the link shows"
-    );
-
-    // A paste that lands in the link phase by mistake types nothing.
-    for c in "q#x".chars() {
+    for c in "rcq".chars() {
         handle_key(&mut app, key(KeyCode::Char(c)));
     }
-    let form = manual_form(&app);
-    assert_eq!(form.phase, ManualPhase::Link);
-    assert!(form.input.value.is_empty());
-
-    handle_key(&mut app, key(KeyCode::Enter));
-    assert_eq!(manual_form(&app).phase, ManualPhase::Code);
-    for c in "cqc#cq".chars() {
-        handle_key(&mut app, key(KeyCode::Char(c)));
-    }
-    assert_eq!(
-        manual_form(&app).input.value,
-        "cqc#cq",
-        "every printable character is data in the code phase"
-    );
-    assert!(app.login.is_none(), "still nothing in flight until ⏎");
-
-    handle_key(&mut app, key(KeyCode::Esc));
-    let form = manual_form(&app);
-    assert_eq!(form.phase, ManualPhase::Link, "esc steps back to the link");
-    assert!(form.input.value.is_empty(), "and clears the buffer");
-    handle_key(&mut app, key(KeyCode::Esc));
+    assert_eq!(paste_field(&app).value, "rcq");
     assert!(
-        !app.modals
-            .iter()
-            .any(|m| matches!(m, Modal::ManualLogin(_))),
-        "esc on the link cancels"
+        HANDED.lock().expect("handed").is_empty(),
+        "`c` reached the field, not the clipboard"
     );
-    assert!(app.login.is_none());
+    assert!(app.toasts.is_empty(), "no action fired");
+    assert!(
+        matches!(app.modals.as_slice(), [Modal::Login]),
+        "`q` collapsed nothing, got {:?}",
+        app.modals
+    );
+    assert!(app.login.is_some(), "the login keeps running");
 }
 
-/// A paste that fails the shape or state check is cleared, not kept: the
-/// field is masked so it cannot be edited by eye, and a corrected paste
-/// appended to leftover bytes would pass the shape check and burn the pending
-/// exchange. The modal stays in the code phase against the same link.
+/// A paste that fails the shape or state check is cleared, not kept: a
+/// corrected paste appended to leftover bytes would pass the shape check and
+/// burn the exchange. The field stays open, the toast carries the canned line
+/// (shared with the CLI) and nothing reaches the worker or the session's door.
 #[test]
-fn manual_login_bad_paste_clears_the_field_and_keeps_the_modal() {
-    use super::{ConfigRow, ManualPhase, Modal, enter_config_detail, handle_key, run_config_row};
-    use crate::profile::Profile;
+fn a_bad_paste_clears_the_field_toasts_and_keeps_the_modal() {
+    use super::{LoginMethod, LoginStage, Modal, ToastKind, handle_key};
     use crate::testutil::key;
     use ratatui::crossterm::event::KeyCode;
     let _home = crate::testutil::HomeSandbox::new();
-    let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
-    app.tab = super::Tab::Setup;
-    app.profile_cursor = 0;
-    enter_config_detail(&mut app);
-    run_config_row(&mut app, ConfigRow::ManualLogin);
-    let url_before = manual_form(&app).pending.url().to_string();
-    handle_key(&mut app, key(KeyCode::Enter));
+    let (mut app, rx) = app_with_open_login_modal();
+    handle_key(&mut app, key(KeyCode::Char('p')));
 
-    for bad in ["garbage", "abc#not-this-state"] {
+    for (bad, toast_body) in [
+        (
+            "garbage",
+            "invalid code; paste the whole string the page shows (it contains a #)\n\
+             cleared, paste the code again",
+        ),
+        (
+            "abc#not-this-state",
+            "state mismatch: code came from a different login\ncleared, paste the code again",
+        ),
+    ] {
         for c in bad.chars() {
             handle_key(&mut app, key(KeyCode::Char(c)));
         }
         handle_key(&mut app, key(KeyCode::Enter));
-        let form = manual_form(&app);
-        assert_eq!(
-            form.phase,
-            ManualPhase::Code,
-            "{bad}: stays on the code field"
+        assert!(
+            paste_field(&app).value.is_empty(),
+            "{bad}: the bad paste is cleared and the field stays open"
         );
         assert!(
-            form.input.value.is_empty(),
-            "{bad}: the bad paste is cleared"
+            matches!(app.modals.as_slice(), [Modal::Login]),
+            "{bad}: the modal stays, got {:?}",
+            app.modals
         );
-        assert_eq!(
-            form.pending.url(),
-            url_before,
-            "{bad}: the same link is still good"
-        );
-        assert!(app.login.is_none(), "{bad}: nothing was started");
-        assert!(
-            !app.modals.iter().any(|m| matches!(m, Modal::Login)),
-            "{bad}: no progress modal"
-        );
+        let toast = app
+            .toasts
+            .pop_back()
+            .unwrap_or_else(|| panic!("{bad}: no toast"));
+        assert_eq!(toast.kind, ToastKind::Danger);
+        assert_eq!(toast.body, toast_body);
+        assert!(rx.try_recv().is_err(), "{bad}: nothing reached the worker");
+        let session = app.login.as_ref().expect("the login keeps running");
+        assert_eq!(session.method, LoginMethod::Browser);
+        assert_eq!(session.stage, LoginStage::WaitingBrowser);
     }
 }
 
-/// A login already running owns the progress modal: ⏎ on the manual row then
-/// re-expands it and mints no second pending login.
+/// A good paste goes down the SESSION's own door — the one the running login's
+/// worker reads, checked against that login's `state` — and the field closes.
+/// The session is otherwise untouched: which door won is the worker's report
+/// to make, because the browser callback may already have.
 #[test]
-fn manual_login_row_defers_to_a_login_in_flight() {
-    use super::{ConfigRow, Modal, enter_config_detail, run_config_row};
-    use crate::profile::Profile;
-    let _home = crate::testutil::HomeSandbox::new();
-    let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
-    app.profile_cursor = 0;
-    enter_config_detail(&mut app);
-    app.login_generation = 1;
-    app.login = Some(login_session("acct", false, 1));
-
-    run_config_row(&mut app, ConfigRow::ManualLogin);
-    assert!(
-        !app.modals
-            .iter()
-            .any(|m| matches!(m, Modal::ManualLogin(_))),
-        "no second login while one runs"
-    );
-    assert!(
-        app.modals.iter().any(|m| matches!(m, Modal::Login)),
-        "the running login's modal is re-shown instead"
-    );
-    assert_eq!(app.login_generation, 1, "the generation is untouched");
-}
-
-/// The whole manual flow through the real keys and a real worker, against a
-/// loopback stand-in for both hosts: the pasted code reaches the exchange with
-/// the manual redirect, and the mint lands where the browser flow's would (the
-/// `+ new` draft's stash), through the unchanged drain/apply path.
-///
-/// The worker is joined EXPLICITLY while the endpoint sandbox is alive: the
-/// sandbox borrows the home sandbox, so it drops first and clears the overrides
-/// before `HomeSandbox::drop` would join the worker, and an unjoined worker
-/// would then race onto the real endpoints.
-#[test]
-fn manual_login_good_paste_exchanges_and_stashes_the_mint() {
-    use super::{
-        ConfigRow, LoginMethod, LoginStage, Modal, build_draft_new, drain_login_events, handle_key,
-        run_config_row,
-    };
+fn a_good_paste_lands_on_the_sessions_paste_door() {
+    use super::{LoginMethod, LoginStage, Modal, handle_key};
     use crate::testutil::key;
     use ratatui::crossterm::event::KeyCode;
-    let home = crate::testutil::HomeSandbox::new();
-    let (base, server) = crate::testutil::serve_endpoints_recording(3, |path, _| {
-        if path.starts_with("/v1/oauth/token") {
-            (
-                200,
-                r#"{"access_token":"at-manual","refresh_token":"rt-manual","expires_in":28800,"scope":"user:profile user:inference"}"#
-                    .to_string(),
-            )
-        } else {
-            (
-                200,
-                r#"{"account":{"uuid":"uuid-manual","has_claude_max":true},"organization":{"organization_type":"claude_max"}}"#
-                    .to_string(),
-            )
-        }
-    });
-    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let _home = crate::testutil::HomeSandbox::new();
+    let (mut app, rx) = app_with_open_login_modal();
+    handle_key(&mut app, key(KeyCode::Char('p')));
 
-    let mut app = app_with(vec![]);
-    app.tab = super::Tab::Setup;
-    app.profile_cursor = 0; // == profile_count() → the `+ new` form
-    let mut draft = build_draft_new();
-    draft.name = InputState::new("fresh");
-    app.config_draft = Some(draft);
-
-    run_config_row(&mut app, ConfigRow::ManualLogin);
-    handle_key(&mut app, key(KeyCode::Enter));
-    let state = manual_state(&manual_form(&app));
-    for c in format!("the-code#{state}").chars() {
+    for c in format!("the-code#{PASTE_STATE}").chars() {
         handle_key(&mut app, key(KeyCode::Char(c)));
     }
     handle_key(&mut app, key(KeyCode::Enter));
 
+    let code = rx.try_recv().expect("the worker's receiver got the code");
+    assert_eq!(code.as_str(), "the-code");
+    assert!(rx.try_recv().is_err(), "exactly one send");
+    let session = app.login.as_ref().expect("the login keeps running");
     assert!(
-        app.login.as_ref().is_some_and(|s| {
-            s.name == "fresh"
-                && s.is_new
-                && s.method == LoginMethod::Manual
-                && s.stage == LoginStage::ExchangingCode
-        }),
-        "⏎ on a good paste seats a manual session at the exchange stage"
+        session.paste_field.is_none(),
+        "the field closes on a good send"
     );
-    assert!(app.modals.iter().any(|m| matches!(m, Modal::Login)));
     assert!(
-        !app.modals
-            .iter()
-            .any(|m| matches!(m, Modal::ManualLogin(_)))
+        matches!(app.modals.as_slice(), [Modal::Login]),
+        "the modal stays, got {:?}",
+        app.modals
     );
-
-    crate::tui::join_test_workers();
-    drain_login_events(&mut app);
-
-    assert!(app.login.is_none(), "the session ends with the result");
-    assert!(!app.modals.iter().any(|m| matches!(m, Modal::Login)));
-    let stashed = match app
-        .config_draft
-        .as_ref()
-        .and_then(|d| d.captured_login.as_ref())
-    {
-        Some(super::DraftLogin::Mint(outcome)) => outcome,
-        other => panic!("the mint lands in the draft, as the browser flow's does: {other:?}"),
-    };
-    let oauth = stashed
-        .credentials
-        .claude_ai_oauth
-        .as_ref()
-        .expect("oauth block");
-    assert_eq!(oauth.access_token, "at-manual");
-    assert_eq!(stashed.account_uuid.as_deref(), Some("uuid-manual"));
-
-    let seen = server.join().expect("listener");
-    let (_, body) = seen
-        .iter()
-        .find(|(p, _)| p.starts_with("/v1/oauth/token"))
-        .expect("token request");
-    let body: serde_json::Value = serde_json::from_str(body).expect("json body");
-    assert_eq!(body["code"], "the-code");
     assert_eq!(
-        body["redirect_uri"],
-        crate::oauth_login::MANUAL_REDIRECT_URI
+        session.method,
+        LoginMethod::Browser,
+        "the UI never names the door"
     );
-    assert_eq!(body["state"], state);
-    drop(endpoints);
+    assert_eq!(session.stage, LoginStage::WaitingBrowser);
+    assert_eq!(app.login_generation, 1, "no second login was minted");
+    assert!(
+        app.toasts.is_empty(),
+        "a good paste says nothing; the worker's report will"
+    );
 }
 
-/// `Modal` derives `Debug` and the top modal is cloned per keystroke, so the
-/// form's own `Debug` must be what stands between the pasted code and a log
-/// line: it names the account and the phase, never the paste, the PKCE
-/// verifier, or the URL (which carries `state`).
+/// The door rides the worker's `ExchangingCode` report and nothing else: a
+/// `Manual` report flips the session's method, a `Browser` one leaves it, and
+/// both move the stage.
 #[test]
-fn manual_login_form_debug_redacts_the_paste_and_the_pending_secrets() {
-    use super::{ManualLoginForm, ManualPhase, Modal};
-    let pending =
-        crate::oauth_login::begin_manual_login().unwrap_or_else(|e| panic!("{}", e.user_message()));
-    let url = pending.url().to_string();
-    let form = ManualLoginForm {
-        name: "acct".to_string(),
-        is_new: false,
-        pending,
-        phase: ManualPhase::Code,
-        input: InputState::new("CANARY-code#CANARY-state"),
+fn the_drain_takes_the_door_from_the_workers_report() {
+    use super::{LoginEvent, LoginMethod, LoginStage, drain_login_events};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    for (door, method_after) in [
+        (LoginMethod::Browser, LoginMethod::Browser),
+        (LoginMethod::Manual, LoginMethod::Manual),
+    ] {
+        let (mut app, _rx) = app_with_open_login_modal();
+        app.login_event_tx
+            .send((1, LoginEvent::Stage(LoginStage::ExchangingCode(door))))
+            .unwrap();
+        drain_login_events(&mut app);
+        let session = app.login.as_ref().expect("session stays live");
+        assert_eq!(session.method, method_after, "{door:?}");
+        assert_eq!(session.stage, LoginStage::ExchangingCode(door), "{door:?}");
+
+        // The verify bump keeps the door the exchange named.
+        app.login_event_tx
+            .send((1, LoginEvent::Stage(LoginStage::Verifying)))
+            .unwrap();
+        drain_login_events(&mut app);
+        let session = app.login.as_ref().expect("session stays live");
+        assert_eq!(session.method, method_after, "{door:?}");
+        assert_eq!(session.stage, LoginStage::Verifying, "{door:?}");
+    }
+}
+
+/// The worker→UI mapping behind the drain: each `oauth_login` milestone lands
+/// as its own stage, the door it names included. The worker closure itself
+/// binds a listener, so this seam is the one a test can cross.
+#[test]
+fn login_event_maps_each_worker_milestone_to_its_stage() {
+    use super::{LoginEvent, LoginMethod, LoginStage, login_event};
+    use crate::oauth_login::LoginProgress;
+    for (progress, stage) in [
+        (
+            LoginProgress::ExchangingCode(LoginMethod::Manual),
+            LoginStage::ExchangingCode(LoginMethod::Manual),
+        ),
+        (
+            LoginProgress::ExchangingCode(LoginMethod::Browser),
+            LoginStage::ExchangingCode(LoginMethod::Browser),
+        ),
+        (LoginProgress::Verifying, LoginStage::Verifying),
+    ] {
+        match login_event(progress) {
+            LoginEvent::Stage(got) => assert_eq!(got, stage, "{progress:?}"),
+            LoginEvent::Url(url) => panic!("{progress:?}: a milestone is never a url ({url})"),
+        }
+    }
+}
+
+/// The field never outlives its door. The drain closes it the moment a stage
+/// bump closes the door (the browser callback won while a code was being
+/// typed), and a submit that finds the door closed (the drain a tick behind)
+/// closes it too, sending nothing.
+#[test]
+fn a_landed_door_closes_the_code_field() {
+    use super::{LoginEvent, LoginMethod, LoginStage, Modal, drain_login_events, handle_key};
+    use crate::testutil::key;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let (mut app, _rx) = app_with_open_login_modal();
+    handle_key(&mut app, key(KeyCode::Char('p')));
+    handle_key(&mut app, key(KeyCode::Char('a')));
+    app.login_event_tx
+        .send((
+            1,
+            LoginEvent::Stage(LoginStage::ExchangingCode(LoginMethod::Browser)),
+        ))
+        .unwrap();
+    drain_login_events(&mut app);
+    let session = app.login.as_ref().expect("session stays live");
+    assert!(
+        session.paste_field.is_none(),
+        "the field goes with its door"
+    );
+    assert_eq!(
+        session.stage,
+        LoginStage::ExchangingCode(LoginMethod::Browser)
+    );
+    assert!(
+        matches!(app.modals.as_slice(), [Modal::Login]),
+        "the modal stays for the stage line, got {:?}",
+        app.modals
+    );
+
+    let (mut app, rx) = app_with_open_login_modal();
+    handle_key(&mut app, key(KeyCode::Char('p')));
+    for c in format!("the-code#{PASTE_STATE}").chars() {
+        handle_key(&mut app, key(KeyCode::Char(c)));
+    }
+    if let Some(s) = app.login.as_mut() {
+        s.stage = LoginStage::ExchangingCode(LoginMethod::Browser);
+    }
+    handle_key(&mut app, key(KeyCode::Enter));
+    assert!(rx.try_recv().is_err(), "nothing is sent into a closed door");
+    let session = app.login.as_ref().expect("session stays live");
+    assert!(session.paste_field.is_none(), "the submit closes the field");
+    assert!(
+        app.toasts.is_empty(),
+        "and says nothing: the drain's stage line will"
+    );
+}
+
+/// `c` hands the hosted link to the clipboard writer and says so; the writer
+/// here records what it was handed, and the escape's bytes are pinned on a
+/// writer in `platform`'s own tests.
+#[test]
+fn c_on_the_login_modal_sends_the_link_and_toasts() {
+    use super::{Modal, ToastKind, handle_key};
+    use crate::testutil::key;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let (mut app, _rx) = app_with_open_login_modal();
+    static HANDED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    app.clipboard = |link| {
+        HANDED.lock().expect("handed").push(link.to_string());
+        Ok(())
     };
-    let dbg = format!("{form:?}");
-    assert!(dbg.contains("acct") && dbg.contains("Code"), "{dbg}");
-    assert!(!dbg.contains("CANARY"), "{dbg}");
-    assert!(!dbg.contains(&url), "{dbg}");
-    assert!(!dbg.contains("code_challenge"), "{dbg}");
-    let modal = format!("{:?}", Modal::ManualLogin(form));
-    assert!(!modal.contains("CANARY"), "{modal}");
+
+    handle_key(&mut app, key(KeyCode::Char('c')));
+    assert_eq!(
+        *HANDED.lock().expect("handed"),
+        vec![format!(
+            "https://hosted.example/authorize?state={PASTE_STATE}"
+        )],
+        "the hosted link, whole, and only it"
+    );
+    let toast = app.toasts.pop_back().expect("`c` toasts");
+    assert_eq!(toast.kind, ToastKind::Info);
+    assert_eq!(toast.body, "link copied to clipboard");
+    assert!(
+        matches!(app.modals.as_slice(), [Modal::Login]),
+        "`c` opens no modal, got {:?}",
+        app.modals
+    );
+
+    // A writer that cannot reach the terminal is named, not swallowed.
+    app.clipboard = |_| Err(std::io::Error::other("stdout is closed"));
+    handle_key(&mut app, key(KeyCode::Char('c')));
+    let toast = app.toasts.pop_back().expect("a failed `c` toasts too");
+    assert_eq!(toast.kind, ToastKind::Danger);
+    assert_eq!(
+        toast.body,
+        "couldn't copy the link to clipboard\nstdout is closed"
+    );
+}
+
+/// The paste door is what `c` and `p` answer to. A session without one (the
+/// console login's shape) and a session already exchanging a code (a door
+/// landed) leave both keys inert: no field, no toast.
+#[test]
+fn c_and_p_are_inert_without_an_open_paste_door() {
+    use super::{LoginMethod, LoginStage, Modal, handle_key};
+    use crate::testutil::key;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut console = app_with(vec![]);
+    console.login_generation = 1;
+    let mut session = login_session("qwen", false, 1);
+    session.url = Some("https://console.example/login".to_string());
+    console.login = Some(session);
+    console.modals.push(Modal::Login);
+
+    let (mut landed, _rx) = app_with_open_login_modal();
+    if let Some(s) = landed.login.as_mut() {
+        s.stage = LoginStage::ExchangingCode(LoginMethod::Browser);
+    }
+
+    for (label, app) in [("console", &mut console), ("landed", &mut landed)] {
+        for c in ['c', 'p'] {
+            handle_key(app, key(KeyCode::Char(c)));
+            assert!(
+                matches!(app.modals.as_slice(), [Modal::Login]),
+                "{label}: `{c}` pushed nothing, got {:?}",
+                app.modals
+            );
+            assert!(app.toasts.is_empty(), "{label}: `{c}` toasted nothing");
+        }
+        let session = app.login.as_ref().expect("the login keeps running");
+        assert!(
+            session.paste_field.is_none(),
+            "{label}: `p` opened no field"
+        );
+    }
+}
+
+/// The `+ new` form runs name to create with one login row and nothing beside
+/// it: the exact runtime sequence, like the OAuth account's tail above.
+#[test]
+fn config_rows_on_the_new_form_carry_one_login_row() {
+    use super::{ConfigRow, build_draft_new, config_rows};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![]);
+    app.profile_cursor = 0; // == profile_count() → the `+ new` form
+    app.config_draft = Some(build_draft_new());
+    app.unsaved_live_login = false;
+
+    let rows = config_rows(&app);
+    assert_eq!(
+        rows,
+        [
+            ConfigRow::Name,
+            ConfigRow::BaseUrl,
+            ConfigRow::Model,
+            ConfigRow::Login,
+            ConfigRow::Create,
+        ],
+        "{rows:?}"
+    );
 }

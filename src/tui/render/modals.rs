@@ -11,8 +11,8 @@ use crate::profile::DivergenceChoice;
 
 use super::super::app::{
     ActionMenuState, App, ConfirmAction, ConfirmState, DivergenceAction, DivergenceForm,
-    DivergenceTargetForm, EnvCollisionChoice, EnvCollisionForm, InputState, LoginStage, Modal,
-    NamePromptForm, PresetPickerForm, Tab,
+    DivergenceTargetForm, EnvCollisionChoice, EnvCollisionForm, InputState, LoginMethod,
+    LoginStage, Modal, NamePromptForm, PresetPickerForm, Tab,
 };
 use super::super::theme;
 use super::chain::reason_marker;
@@ -34,26 +34,33 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, modal: &Modal) 
         Modal::Help => draw_help(frame, area, app),
         Modal::ActionMenu(state) => draw_action_menu(frame, area, state),
         Modal::EnvCollision(form) => draw_env_collision(frame, area, form),
-        Modal::ManualLogin(form) => draw_manual_login(frame, area, form),
         Modal::Login => draw_login_progress(frame, area, app),
     }
 }
 
-/// In-flight login progress. Renders live from `App::login` (the URL and the
-/// stage land async), so the modal variant carries no state of its own. For a
-/// browser login the browser opens on its own and the modal offers an `r`
-/// retry instead of a pasteable URL, since a wrapped ~440-char authorize link
-/// isn't clickable and clips in compact mode; the manual login modal is where
-/// that link is shown on purpose. A manual session arrives here with the code
-/// already in hand, so it gets the stage line and no browser copy at all.
+/// In-flight login progress. Renders live from `App::login` (the stage, the
+/// console login's URL and the code field land async), so the modal variant
+/// carries no state of its own. An OAuth login waits on two doors at once —
+/// the browser this machine opened, or the hosted link on any other device —
+/// so while it waits the modal offers `r`, `c` and `p`, and `p`'s own row
+/// becomes the code field once opened. The link itself is never rendered: a
+/// wrapped ~440-char authorize URL isn't clickable and clips in compact mode,
+/// and `c` hands it over whole. Once a door delivered a code the stage line is
+/// the whole story, whichever door it was.
 fn draw_login_progress(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let Some(session) = app.login.as_ref() else {
         return; // login ended this frame; the modal pops on the next drain
     };
-    let stage = match session.stage {
-        LoginStage::WaitingBrowser => "waiting for the browser login",
-        LoginStage::ExchangingCode => "exchanging the code for tokens",
-        LoginStage::Verifying => "verifying the minted token",
+    // One waiting text for both flows. The paste door's later stages read as
+    // one act; the browser door's keep their two.
+    let stage = match (session.stage, session.method) {
+        (LoginStage::WaitingBrowser, _) if session.paste_field.is_some() => "pasting the code",
+        (LoginStage::WaitingBrowser, _) => "continue in your browser",
+        (LoginStage::ExchangingCode(_) | LoginStage::Verifying, LoginMethod::Manual) => {
+            "logging in with the code"
+        }
+        (LoginStage::ExchangingCode(_), LoginMethod::Browser) => "exchanging the code for tokens",
+        (LoginStage::Verifying, LoginMethod::Browser) => "verifying the minted token",
     };
     let mut lines: Vec<Line<'_>> = vec![
         Line::from(Span::styled(
@@ -70,169 +77,54 @@ fn draw_login_progress(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ]),
         Line::from(""),
     ];
-    match (session.method, &session.url) {
-        // Nothing to do in a browser and no link to re-open: the stage line
-        // is the whole story. (A manual session never carries a URL, and the
-        // `None` arm below is browser copy it must not fall into.)
-        (crate::tui::app::LoginMethod::Manual, _) => {
-            lines.pop();
+    let key_row = |key: &'static str, what: &'static str| {
+        Line::from(vec![
+            Span::styled(key, theme::accent().bold()),
+            Span::styled(what, theme::dim()),
+        ])
+    };
+    let mut caret = None;
+    if session.open_door().is_some() {
+        lines.push(key_row("r", "  open the browser again"));
+        lines.push(key_row("c", "  copy link"));
+        match session.paste_field.as_ref() {
+            Some(field) => {
+                // The caret sits after the edit gutter (2), the label (4) and
+                // its space (1), then the cells before `InputState::cursor`.
+                caret = Some((lines.len(), 2 + 4 + 1 + head_cols(field)));
+                lines.push(code_field_row(field));
+            }
+            None => lines.push(key_row("p", "  paste code")),
         }
-        // The URL is known once the worker announced it, so the retry is live.
-        (crate::tui::app::LoginMethod::Browser, Some(_)) => {
-            lines.push(Line::from(Span::styled(
-                "complete the login in your browser",
+    } else if session.stage == LoginStage::WaitingBrowser {
+        // The console login: one browser, whose URL its worker announces —
+        // the retry is live once it has.
+        match session.url {
+            Some(_) => lines.push(key_row("r", "  open the browser again")),
+            None => lines.push(Line::from(Span::styled(
+                "opening your browser…",
                 theme::dim(),
-            )));
-            lines.push(Line::from(""));
-            lines.push(Line::from(vec![
-                Span::styled("r", theme::accent().bold()),
-                Span::styled("  open the browser again", theme::dim()),
-            ]));
+            ))),
         }
-        (crate::tui::app::LoginMethod::Browser, None) => lines.push(Line::from(Span::styled(
-            "opening your browser…",
-            theme::dim(),
-        ))),
-    }
-    draw_modal(frame, area, "LOGIN", lines);
-}
-
-/// The manual (no browser) login, one draw per phase.
-fn draw_manual_login(frame: &mut Frame<'_>, area: Rect, form: &crate::tui::app::ManualLoginForm) {
-    match form.phase {
-        crate::tui::app::ManualPhase::Link => draw_manual_link(frame, area, form),
-        crate::tui::app::ManualPhase::Code => draw_manual_code(frame, area, form),
-    }
-}
-
-const MANUAL_LOGIN_TITLE: &str = "MANUAL LOGIN";
-
-/// The link phase. The authorize URL is ~440 chars and wraps on any terminal,
-/// so this modal fits its own rows instead of letting [`draw_modal`] clip the
-/// tail (which would eat the key line first on a short terminal): the key
-/// line is reserved whole, the blurb kept only if it fits, and the URL gets
-/// whatever rows remain, cut with an `…`. `c` puts the full link on the local
-/// clipboard through OSC 52, which is the intended way off the screen.
-fn draw_manual_link(frame: &mut Frame<'_>, area: Rect, form: &crate::tui::app::ManualLoginForm) {
-    // The width `draw_modal_scrolled` will settle on once the URL forces the
-    // modal to the terminal's edge: `area.width - 4` outer, minus 6 chrome.
-    let inner_w = (area.width.saturating_sub(10) as usize).max(1);
-    let mut budget = area.height.saturating_sub(8) as usize;
-
-    // One row when it fits, else one row per key: `chunk_line` splits by
-    // character and would break a key name in half.
-    let keys = [
-        ("c", " copy link"),
-        ("⏎", " enter code"),
-        ("esc", " cancel"),
-    ];
-    let one_row = Line::from(
-        keys.iter()
-            .enumerate()
-            .flat_map(|(i, (k, what))| {
-                let sep = if i == 0 { "" } else { " · " };
-                [
-                    Span::styled(sep, theme::dim()),
-                    Span::styled(*k, theme::accent().bold()),
-                    Span::styled(*what, theme::dim()),
-                ]
-            })
-            .collect::<Vec<_>>(),
-    );
-    let key_rows: Vec<Line<'static>> = if one_row.width() <= inner_w {
-        vec![one_row]
     } else {
-        keys.iter()
-            .map(|(k, what)| {
-                Line::from(vec![
-                    Span::styled(*k, theme::accent().bold()),
-                    Span::styled(*what, theme::dim()),
-                ])
-            })
-            .collect()
-    };
-    budget = budget.saturating_sub(key_rows.len());
-
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let blurb_rows = chunk_line(
-        Line::from(Span::styled(
-            format!(
-                "logging in '{}': open this link on any device, sign in as the account you want, and it will show you a code. Press enter to paste the code.",
-                form.name
-            ),
-            theme::dim(),
-        )),
-        inner_w,
-    );
-    // Blurb + the blank under it, only if the URL still gets a row: the blurb,
-    // its blank, one URL row, and the blank before the key line.
-    if blurb_rows.len() + 3 <= budget {
-        budget -= blurb_rows.len() + 1;
-        lines.extend(blurb_rows);
-        lines.push(Line::from(""));
+        lines.pop();
     }
-
-    // URL rows: everything left but the blank that separates them from the
-    // key line. Cut by characters (the URL is ASCII) so `chunk_line` never
-    // has to split what does not fit.
-    let url_rows = budget.saturating_sub(1);
-    if url_rows > 0 {
-        let capacity = url_rows * inner_w;
-        let url = form.pending.url();
-        let shown: String = if url.chars().count() > capacity {
-            url.chars()
-                .take(capacity.saturating_sub(1))
-                .chain(std::iter::once('…'))
-                .collect()
-        } else {
-            url.to_string()
-        };
-        lines.extend(chunk_line(
-            Line::from(Span::styled(shown, theme::body())),
-            inner_w,
-        ));
-        lines.push(Line::from(""));
-    }
-    lines.extend(key_rows);
-    draw_modal(frame, area, MANUAL_LOGIN_TITLE, lines);
+    draw_modal_scrolled(frame, area, "LOGIN", lines, 0, caret);
 }
 
-/// The code phase: one masked field. The pasted value is a bearer-grade
-/// secret until exchanged, so the frame shows a bullet run and a count, never
-/// the bytes, and no terminal cursor is placed (the paste is append-only).
-fn draw_manual_code(frame: &mut Frame<'_>, area: Rect, form: &crate::tui::app::ManualLoginForm) {
-    let n = form.input.value.chars().count();
-    let masked = if n == 0 {
-        Span::styled("(paste it here)", theme::dim())
-    } else {
-        Span::styled(
-            format!("{}  ({n} chars)", "•".repeat(n.min(24))),
-            Style::default()
-                .fg(theme::text_color())
-                .bg(theme::bg_sunken()),
+/// The login modal's code field, in place of the `p  paste code` row: an edit
+/// gutter, the `code` label, then the typed text verbatim, or the placeholder
+/// while there is none.
+fn code_field_row(field: &InputState) -> Line<'static> {
+    if field.value.is_empty() {
+        labelled_line(
+            "code",
+            Span::styled("(paste it here)", theme::faint()),
+            true,
         )
-    };
-    let lines = vec![
-        Line::from(Span::styled(
-            "paste the code the page showed you",
-            theme::dim(),
-        )),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled(format!("{} ", theme::edit_glyph()), theme::accent().bold()),
-            Span::styled("code", theme::label()),
-            Span::raw(" "),
-            masked,
-        ]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("⏎", theme::accent().bold()),
-            Span::styled(" submit · ", theme::dim()),
-            Span::styled("esc", theme::accent().bold()),
-            Span::styled(" back to the link", theme::dim()),
-        ]),
-    ];
-    draw_modal(frame, area, MANUAL_LOGIN_TITLE, lines);
+    } else {
+        labelled_input("code", field, true)
+    }
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
@@ -256,12 +148,16 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 /// tail. On any terminal wide enough for the content nothing splits and the
 /// modal renders exactly as before.
 fn draw_modal(frame: &mut Frame<'_>, area: Rect, title: &str, lines: Vec<Line<'_>>) {
-    draw_modal_scrolled(frame, area, title, lines, 0);
+    draw_modal_scrolled(frame, area, title, lines, 0, None);
 }
 
 /// [`draw_modal`] with the content scrolled to start at row `scroll`, returning
 /// the largest offset the content allows so a caller holding the offset in state
 /// can clamp its key handler against it (the render pass owns the viewport).
+/// `caret` names a text field's caret as `(line index, cell offset)` over the
+/// lines as handed in: the native terminal cursor lands on that cell after the
+/// chunking below folded the line into rows, or nowhere when the row scrolled
+/// out of the viewport.
 ///
 /// A terminal too short for the whole modal used to drop the tail with nothing
 /// on screen saying so. The rows now go through the shared scrolled-lines
@@ -276,16 +172,22 @@ fn draw_modal_scrolled(
     title: &str,
     lines: Vec<Line<'_>>,
     scroll: u16,
+    caret: Option<(usize, usize)>,
 ) -> u16 {
     let content_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
     let w = (content_w + 6)
         .max(title.chars().count() as u16 + 4)
         .min(area.width.saturating_sub(4));
     let inner_w = (w.saturating_sub(6) as usize).max(1);
-    let lines: Vec<Line<'static>> = lines
-        .into_iter()
-        .flat_map(|l| chunk_line(l, inner_w))
-        .collect();
+    let mut caret_row = None;
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    for (i, line) in lines.into_iter().enumerate() {
+        if caret.is_some_and(|(at, _)| at == i) {
+            caret_row = Some(rows.len());
+        }
+        rows.extend(chunk_line(line, inner_w));
+    }
+    let lines = rows;
     let h = (lines.len() as u16 + 4).min(area.height.saturating_sub(4));
 
     let rect = centered(area, w, h);
@@ -304,6 +206,20 @@ fn draw_modal_scrolled(
     };
     let scroll = scroll.min(max_scroll) as usize;
     draw_scrolled_lines(frame, inner, lines, (scroll, scroll + viewport));
+    if let (Some((_, cell)), Some(row)) = (caret, caret_row) {
+        // A caret right after a row's last cell stays on that row, in the
+        // right padding, rather than folding onto a row the chunking never
+        // made: a content-sized modal is exactly as wide as its widest line,
+        // so the end of a full field is the common case, not an edge.
+        let fold = cell.saturating_sub(1) / inner_w;
+        let row = row + fold;
+        if (scroll..scroll + viewport).contains(&row) {
+            frame.set_cursor_position((
+                inner.x.saturating_add((cell - fold * inner_w) as u16),
+                inner.y.saturating_add((row - scroll) as u16),
+            ));
+        }
+    }
     max_scroll
 }
 
@@ -883,6 +799,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         title,
         lines,
         app.help_scroll,
+        None,
     ));
 }
 
@@ -989,8 +906,6 @@ fn glyph_row(mark: Span<'static>, desc: &str) -> Line<'static> {
 fn labelled_input(label: &str, input: &InputState, focused: bool) -> Line<'static> {
     // When focused the native terminal cursor owns the caret — no block highlight.
     // Unfocused fields still render with plain text styling (no BG_SUNKEN tint).
-    // A focused field carries the `✎` edit-mode gutter glyph (same as form rows);
-    // the 2-col gutter is accounted for in the caller's cursor-x math.
     let value_style = if focused {
         Style::default()
             .fg(theme::text_color())
@@ -998,6 +913,17 @@ fn labelled_input(label: &str, input: &InputState, focused: bool) -> Line<'stati
     } else {
         Style::default().fg(theme::text_color())
     };
+    labelled_line(
+        label,
+        Span::styled(input.value.clone(), value_style),
+        focused,
+    )
+}
+
+/// A modal form row: the gutter, the label, one space, then `value`. A focused
+/// row carries the `✎` edit-mode gutter glyph (same as form rows); the 2-col
+/// gutter is accounted for in the caller's cursor-x math.
+fn labelled_line(label: &str, value: Span<'static>, focused: bool) -> Line<'static> {
     let gutter = if focused {
         Span::styled(format!("{} ", theme::edit_glyph()), theme::accent().bold())
     } else {
@@ -1007,7 +933,7 @@ fn labelled_input(label: &str, input: &InputState, focused: bool) -> Line<'stati
         gutter,
         Span::styled(label.to_string(), theme::label()),
         Span::raw(" "),
-        Span::styled(input.value.clone(), value_style),
+        value,
     ])
 }
 

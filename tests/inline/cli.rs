@@ -3053,117 +3053,156 @@ fn cli_delete_refuses_while_a_rotation_holds_the_lock() {
     );
 }
 
-// ── login --manual: the browser-free OAuth login ─────────────────────────────
+// ── login paste door: the piped reader and the raw-mode key loop ─────────────
 
-#[test]
-fn login_manual_flag_parses_bare_and_composes_with_model() {
-    let a = login(&["login", "acme", "--manual"]);
-    assert!(a.manual);
-    assert!(!a.is_api_mode());
-    assert!(!a.setup_token);
-    assert!(!login(&["login", "acme"]).manual, "off unless asked");
-    assert_eq!(
-        login(&["login", "acme", "--manual", "--model", "opus"])
-            .model
-            .as_deref(),
-        Some("opus")
-    );
-}
-
-/// `--manual` is an OAuth login; the api-key pair and the setup-token sidecar
-/// are different credentials, so each combination is a contradiction.
-#[test]
-fn login_manual_excludes_api_mode_and_setup_token() {
-    for extra in [
-        &["--base-url", "https://x"][..],
-        &["--api-key", "k"][..],
-        &["--setup-token"][..],
-    ] {
-        let mut args = vec!["login", "acme", "--manual"];
-        args.extend_from_slice(extra);
-        let err = parse(&args).expect_err("must be refused");
-        assert!(
-            err.to_string().contains("cannot be used with"),
-            "{extra:?} must read as a conflict, got: {err}"
-        );
-        assert_eq!(err.exit_code(), 2);
-    }
-}
-
-/// The piped-stdin reader behind `--manual`: a driver writes one line and may
-/// close stdin without a newline; nothing longer than the cap is ever held.
+/// The piped-stdin reader behind the paste door: a driver writes one line and
+/// may close stdin without a newline; an EOF or a blank line is `Ok(None)`
+/// (the browser door keeps waiting), and nothing longer than the cap is held.
 #[test]
 fn read_manual_code_from_accepts_one_bounded_line() {
     use std::io::Cursor;
     let ok = |s: &str| super::read_manual_code_from(Cursor::new(s.as_bytes().to_vec()));
-    assert_eq!(ok("abc#st\n").expect("newline-terminated").trim(), "abc#st");
-    assert_eq!(ok("abc#st").expect("eof-terminated").trim(), "abc#st");
-    assert!(
-        ok("abc#st\nsecond line\n").expect("first line only").trim() == "abc#st",
+    let line = |s: &str| ok(s).expect("must read").map(|l| l.trim().to_string());
+    assert_eq!(line("abc#st\n").as_deref(), Some("abc#st"));
+    assert_eq!(
+        line("abc#st").as_deref(),
+        Some("abc#st"),
+        "a line ended by EOF passes"
+    );
+    assert_eq!(
+        line("abc#st\nsecond line\n").as_deref(),
+        Some("abc#st"),
         "only the first line is the code"
     );
-    let err = ok("").expect_err("immediate eof");
-    assert!(err.to_string().contains("no code on stdin"), "{err}");
-    let err = ok("   \n").expect_err("blank line");
-    assert!(err.to_string().contains("no code on stdin"), "{err}");
+    assert!(ok("").expect("immediate eof").is_none(), "EOF is Ok(None)");
+    assert!(
+        ok("   \n").expect("blank line").is_none(),
+        "a blank line is Ok(None)"
+    );
     // The cap is judged on the code, not the line: exactly the cap passes
     // with a `\n`, a CRLF, or EOF behind it, and one byte more is refused
     // however the line ends.
     let exact = "a".repeat(crate::oauth_login::MANUAL_CODE_MAX);
     for tail in ["\n", "\r\n", ""] {
         let got = ok(&format!("{exact}{tail}")).unwrap_or_else(|e| panic!("{tail:?}: {e}"));
-        assert_eq!(got.trim_end_matches(['\r', '\n']), exact, "{tail:?}");
+        assert_eq!(
+            got.as_deref().map(|s| s.trim_end_matches(['\r', '\n'])),
+            Some(exact.as_str()),
+            "{tail:?}"
+        );
     }
     let long = "a".repeat(crate::oauth_login::MANUAL_CODE_MAX + 1);
     for tail in ["\n", "\r\n", ""] {
         let err = ok(&format!("{long}{tail}")).expect_err("one over the cap");
-        assert!(err.to_string().contains("longer"), "{tail:?}: {err}");
+        assert_eq!(
+            err.to_string(),
+            crate::oauth_login::ManualCodeError::TooLong.message(),
+            "{tail:?}: the canned message, never the input"
+        );
         assert!(!err.to_string().contains("aaaa"), "never echoes the input");
     }
 }
 
-/// `--manual` on an Alibaba Model Studio profile is refused before anything
-/// runs: the profile's login is its console session, so the flag has no flow
-/// to select. The refusal sits ahead of `confirm_reauth`, which is what lets
-/// this drive `cmd_login` in-process: no TTY prompt, no browser, no network.
+/// The raw-mode paste loop's pure step: which keystrokes edit, submit, or
+/// cancel, and that a non-`Press` event (Windows delivers release events too)
+/// changes nothing.
 #[test]
-fn cmd_login_manual_refuses_an_alibaba_profile_before_any_flow() {
-    let _home = crate::testutil::HomeSandbox::new();
-    let mut config = crate::profile::AppConfig {
-        state: crate::profile::AppState::default(),
-        profiles: Vec::new(),
-    };
-    crate::actions::create_blank_profile(
-        &mut config,
-        "ali".to_string(),
-        Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic".to_string()),
-        Some("sk-sp-test".to_string()),
-        None,
-    )
-    .expect("create profile");
+fn feed_paste_key_decides_append_cap_backspace_submit_and_cancel() {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
+    let mut buf = String::new();
+    assert!(matches!(
+        super::feed_paste_key(&mut buf, crate::testutil::key(KeyCode::Char('a'))),
+        super::PasteKey::Continue
+    ));
+    assert_eq!(buf, "a");
+    super::feed_paste_key(&mut buf, crate::testutil::key(KeyCode::Char('#')));
+    assert_eq!(buf, "a#");
+    assert!(matches!(
+        super::feed_paste_key(&mut buf, crate::testutil::key(KeyCode::Backspace)),
+        super::PasteKey::Continue
+    ));
+    assert_eq!(buf, "a");
+    assert!(matches!(
+        super::feed_paste_key(&mut buf, crate::testutil::key(KeyCode::Enter)),
+        super::PasteKey::Submit
+    ));
+    assert!(matches!(
+        super::feed_paste_key(&mut buf, crate::testutil::key(KeyCode::Esc)),
+        super::PasteKey::Cancel
+    ));
+    assert!(matches!(
+        super::feed_paste_key(
+            &mut buf,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+        ),
+        super::PasteKey::Cancel
+    ));
+    // A non-Press event is a no-op.
+    let before = buf.clone();
+    assert!(matches!(
+        super::feed_paste_key(
+            &mut buf,
+            KeyEvent::new_with_kind(
+                KeyCode::Char('x'),
+                KeyModifiers::NONE,
+                KeyEventKind::Release
+            )
+        ),
+        super::PasteKey::Continue
+    ));
+    assert_eq!(buf, before, "a Release must not edit the buffer");
+    // A Char at the cap is dropped, never echoed: the buffer stays at the cap.
+    let mut full = "a".repeat(crate::oauth_login::MANUAL_CODE_MAX);
+    assert!(matches!(
+        super::feed_paste_key(&mut full, crate::testutil::key(KeyCode::Char('b'))),
+        super::PasteKey::Continue
+    ));
     assert_eq!(
-        crate::profile::load_config()
-            .expect("reload")
-            .find(&crate::profile::ProfileName::from("ali"))
-            .and_then(|p| p.provider),
-        Some(crate::providers::Provider::Alibaba),
-        "the seed must read back as an Alibaba profile"
+        full.len(),
+        crate::oauth_login::MANUAL_CODE_MAX,
+        "cap is exact"
     );
+    super::feed_paste_key(&mut full, crate::testutil::key(KeyCode::Backspace));
+    assert_eq!(full.len(), crate::oauth_login::MANUAL_CODE_MAX - 1);
+}
 
-    let args = login(&["login", "ali", "--manual"]);
-    let err = cmd_login(args).expect_err("--manual on an Alibaba profile must be refused");
-    let msg = err.to_string();
-    assert!(msg.contains("--manual"), "{msg}");
-    assert!(msg.contains("Alibaba"), "{msg}");
-    assert!(msg.contains("clauth login ali"), "names the repair:\n{msg}");
+/// The paste loop's other exit, decided between keystrokes off the progress
+/// channel: a landed door ends the prompt, and so does a worker that returned
+/// with none (the channel disconnects), or the prompt would outlive the login
+/// and its error would print as `login canceled`. A verify bump cannot arrive
+/// before the door it follows, and an empty channel keeps the prompt.
+#[test]
+fn the_paste_prompt_ends_on_a_landed_door_or_a_finished_worker() {
+    use crate::oauth_login::{LoginMethod, LoginProgress};
+    use std::sync::mpsc::TryRecvError;
+    for door in [LoginMethod::Browser, LoginMethod::Manual] {
+        assert!(
+            super::worker_done(Ok(LoginProgress::ExchangingCode(door))),
+            "{door:?}: a landed door ends the prompt"
+        );
+    }
+    assert!(
+        super::worker_done(Err(TryRecvError::Disconnected)),
+        "a worker that gave up ends the prompt"
+    );
+    assert!(
+        !super::worker_done(Ok(LoginProgress::Verifying)),
+        "a verify bump keeps it"
+    );
+    assert!(
+        !super::worker_done(Err(TryRecvError::Empty)),
+        "an empty channel keeps it"
+    );
+}
 
-    let reloaded = crate::profile::load_config().expect("reload");
-    let p = reloaded
-        .find(&crate::profile::ProfileName::from("ali"))
-        .expect("profile survives");
+/// `--manual` is gone: an argv naming it is now an unknown-flag refusal, like
+/// any other flag that never existed.
+#[test]
+fn login_rejects_the_removed_manual_flag() {
     assert_eq!(
-        p.api_key.as_deref(),
-        Some("sk-sp-test"),
-        "nothing was overwritten"
+        parse_exit_code(&["login", "acme", "--manual"]),
+        2,
+        "a removed flag must be a usage error, not silently ignored"
     );
 }

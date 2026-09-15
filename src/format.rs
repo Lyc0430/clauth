@@ -75,11 +75,11 @@ pub(crate) enum Retry {
     /// connection and retry` gives two different and incompatible reasons to
     /// retry, one of which is wrong).
     Stated,
-    /// There is nothing left to retry in-process: `login_with` has no retry
-    /// path around its code exchange, so whatever the status, the only action
-    /// available is running `clauth login` again. Stated as the ABSENCE of a
-    /// retry loop rather than as a fact about the code or the listener, because
-    /// this correctly stops being true the moment someone adds one.
+    /// There is nothing left to retry in-process: `PendingLogin::run` has no
+    /// retry path around its code exchange, so whatever the status, the only
+    /// action available is running `clauth login` again. Stated as the ABSENCE
+    /// of a retry loop rather than as a fact about the code or the listener,
+    /// because this correctly stops being true the moment someone adds one.
     Restart,
 }
 
