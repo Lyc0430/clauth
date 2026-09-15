@@ -2,7 +2,7 @@
 
 An ordered chain of accounts clauth hops down when the active one runs out of headroom. Opt-in: an account outside the chain is never switched to or away from, and an empty chain means clauth never switches on its own.
 
-Edit the chain on the Fallback tab, or as `fallback_chain` in `profiles.toml`.
+Edit the chain on the Fallback tab, as `fallback_chain` in `profiles.toml`, or over the REST API (the `--listen` route table on the [Daemon](Daemon) page).
 
 ## The decision
 
