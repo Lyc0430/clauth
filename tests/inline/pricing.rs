@@ -3289,17 +3289,67 @@ fn peak_state_before_effective_at_is_none() {
 }
 
 #[test]
-fn peak_state_dedupes_windows_across_a_providers_keys() {
-    // Two of the provider's models carry the same schedule: one window set,
-    // one flip answer. The store fixture gives deepseek one windowed id, so
-    // the observable is the single-window values answering — a duplicate
-    // window from a second key could not change `peak` or `next_flip`.
-    let t = provider_store_table();
-    let s = t
-        .peak_state_source("deepseek", at("2026-09-14 07:00"))
-        .expect("answers");
-    assert!(s.peak);
-    assert_eq!(s.next_flip, Some((false, 3 * 3600)));
+fn peak_state_walks_every_key_of_a_provider() {
+    // A provider whose two keys carry DIFFERENT windows, the second key's
+    // active at the sampled hour: any walk that stops at the first window
+    // (or the first key) misses part of the provider's schedule and reads
+    // off-peak at 12:30. `peak`/`next_flip` are `any()`-semantics over the
+    // collected set, so dedupe of identical windows is unobservable through
+    // the answer by construction — differing windows are what pins the walk.
+    let noon_window = PricedModel {
+        id: "deepseek-v4-flash".to_owned(),
+        prices: vec![
+            entry(0.5, 1.0),
+            PriceEntry {
+                input: 1.0,
+                output: 2.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+                constraint: Some(Constraint::TimeWindow {
+                    start: "12:00".to_owned(),
+                    end: "14:00".to_owned(),
+                }),
+                window_only: false,
+            },
+        ],
+        effective_at: None,
+    };
+    let t = PriceTable {
+        store: vec![
+            StoreKey {
+                source: "deepseek".to_owned(),
+                id: "deepseek-v4-pro".to_owned(),
+                rows: vec![dated_row(
+                    "2026-01-01",
+                    "2026-01-01",
+                    false,
+                    Some(two_window_model()),
+                )],
+            },
+            StoreKey {
+                source: "deepseek".to_owned(),
+                id: "deepseek-v4-flash".to_owned(),
+                rows: vec![dated_row(
+                    "2026-01-01",
+                    "2026-01-01",
+                    false,
+                    Some(noon_window),
+                )],
+            },
+        ],
+        ..deepseek_store(two_window_model())
+    };
+    // 07:00 sits inside the FIRST key's window; 12:30 inside only the
+    // SECOND's — both hours peak, either key alone reads the other off-peak.
+    for (hour, label) in [
+        ("2026-09-14 07:00", "first key"),
+        ("2026-09-14 12:30", "second key"),
+    ] {
+        let s = t
+            .peak_state_source("deepseek", at(hour))
+            .expect("both keys' windows answer");
+        assert!(s.peak, "{label}'s window is active at {hour}");
+    }
 }
 
 #[test]

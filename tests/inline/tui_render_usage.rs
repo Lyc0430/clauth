@@ -2336,7 +2336,7 @@ fn peak_state_for_is_provider_bound() {
     // (The profile above pins nothing already — `blank_profile` — and the
     // provider path answered, which is the unpinned fleet's exact shape.)
 
-    // A store key the provider does not own: flat, no indicator.
+    // The provider's own key whose winning row is flat: no indicator.
     let flat_table = crate::pricing::PriceTable::store_key_table(
         "deepseek",
         crate::pricing::PricedModel {

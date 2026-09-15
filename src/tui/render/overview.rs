@@ -357,10 +357,11 @@ fn overview_header(widths: &OverviewWidths, deepseek: bool) -> Line<'static> {
     Line::from(spans)
 }
 
-/// Whether the profile's pinned models price at a peak window right now,
-/// sampled off the price table's own constraints (the same schedule cost
-/// pricing and the Usage tab's `pricing` row use). Flat-rate and OAuth
-/// profiles answer `false` — the marker column stays as it was.
+/// Whether the profile's PROVIDER is on peak-rate hours right now, sampled off
+/// the price table's store rows (the same schedule the Usage tab's `pricing`
+/// row uses). Profiles with no store-backed provider (flat-rate, OAuth,
+/// generic endpoints, OpenRouter) answer `false` — the marker column stays as
+/// it was.
 fn peak_live(app: &App, profile: &Profile) -> bool {
     app.peak_state_for(profile).is_some_and(|s| s.peak)
 }
@@ -459,8 +460,8 @@ fn render_overview_row(
         spans.push(Span::styled("!", hue(theme::danger())));
         spans.push(Span::raw(" "));
     } else if peak_live(app, profile) {
-        // Peak-rate marker: while the row's pinned models price at a peak
-        // window it takes the marker slot IN PLACE OF the active `●` — the
+        // Peak-rate marker: while the row's provider is on peak hours it
+        // takes the marker slot IN PLACE OF the active `●` — the
         // account is paying the surcharged rate right now, which outranks
         // naming which account a bare `claude` authenticates as. The pricing
         // row on the Usage tab names the schedule and the flip countdown.

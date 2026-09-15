@@ -73,9 +73,9 @@ struct HeaderState {
     kick_block: Option<KickBlock>,
     /// Config-derived diagnostic flags driving the `└` fix hints.
     diag: DiagFlags,
-    /// The shown profile's peak-rate state, sampled now off the price table's
-    /// own window constraints. `None` = flat rates or no pinned model prices —
-    /// no `pricing` row renders at all.
+    /// The shown profile's peak-rate state, sampled now off the provider's
+    /// own price-store rows. `None` = no store-backed provider or flat rates
+    /// — no `pricing` row renders at all.
     peak: Option<crate::pricing::PeakState>,
     /// The shown profile's auto-start queue slot, resolved before the Config
     /// guard (rank order) like the chain card used to; `None` when the queue
