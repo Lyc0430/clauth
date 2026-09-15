@@ -17,15 +17,17 @@
 //!     needs one paired with control; see [`devices`], [`pairing`], and the
 //!     table in [`routes`].
 //!   * **Operations.** The health check, the status feed, the OpenAPI document,
-//!     the account switch (control devices only), and the pairing redemption.
+//!     the account switch and the fallback-chain edits (order, per-member
+//!     threshold, wrap-off; control devices only), and the pairing redemption.
 //!     The switch goes through the same action the MCP tool uses, so anything
 //!     needing human eyes is refused here too.
 //!   * **Thread per connection**, capped and time-bounded. Connections persist
 //!     across requests and serve pipelined ones in order; see [`http`] for the
 //!     framing rules that makes safe. No async runtime.
 
+pub(crate) mod chain;
 pub(crate) mod devices;
-mod http;
+pub(crate) mod http;
 pub(crate) mod pairing;
 pub(crate) mod panes;
 pub(crate) mod routes;

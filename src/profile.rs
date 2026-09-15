@@ -718,7 +718,7 @@ pub(crate) struct AppState {
     /// [`AppState::switch_off_when_budget_spent`] — see that field for why the
     /// two are separate.
     ///
-    /// The on-disk key stays `switch_off_when_spent`: it is also a `status.json` field
+    /// The on-disk key stays `wrap_off`: it is also a `status.json` field
     /// (schema 1, `wiki/Daemon.md`), so renaming it would break a published read
     /// contract and every existing profiles.toml. The Rust name says what it
     /// does; the serde name is the compatibility surface. Don't "align" them.

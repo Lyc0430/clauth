@@ -1550,3 +1550,109 @@ pub(crate) fn schema_agrees_with_type<T: ToSchema>(value: &serde_json::Value) {
     components.schemas = schemas.into_iter().collect();
     schema_agrees(value, &T::schema(), &components);
 }
+
+// ── daemon-route test harness ─────────────────────────────────────────────────
+//
+// The request/context helpers every daemon-route test module shares: the
+// control-device bearer constants, the profile seeders, the request builder,
+// and the router call. Defined once here rather than copied per
+// `tests/inline/*.rs` so a `Request` field or device-seeding change lands in
+// one place. Every consumer is a `#![cfg(unix)]` test module, so the whole
+// harness is unix-gated too: on the windows cross-lint it would otherwise read
+// as dead code under `-D warnings`.
+
+#[cfg(unix)]
+mod route_harness {
+    use std::net::SocketAddr;
+
+    use crate::daemon::api::devices::{self, Tier};
+    use crate::daemon::api::http::{Request, Response};
+    use crate::daemon::api::routes::{ApiContext, handle};
+    use crate::profile::{ClaudeCredentials, ConfigHandle, OAuthToken, Profile, save_profile};
+
+    /// The bearer of the control device every context below pairs.
+    pub(crate) const TOKEN: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    /// The device [`TOKEN`] authenticates as.
+    pub(crate) const DEVICE: &str = "test";
+    /// The bearer of a second device, which the tests that need one pair.
+    pub(crate) const OTHER_TOKEN: &str =
+        "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+
+    pub(crate) fn creds(access: &str) -> ClaudeCredentials {
+        ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: access.to_string(),
+                refresh_token: Some(format!("{access}-refresh")),
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
+            }),
+        }
+    }
+
+    pub(crate) fn stored_profile(name: &str) -> Profile {
+        let mut p = Profile::new(name.to_string(), None, None);
+        p.credentials = Some(creds(name));
+        save_profile(&p).expect("save profile");
+        p
+    }
+
+    /// A context over `config`, with [`TOKEN`] paired as the control device
+    /// [`DEVICE`].
+    pub(crate) fn ctx_with(config: ConfigHandle) -> std::sync::Arc<ApiContext> {
+        seed_device(DEVICE, Tier::Control, TOKEN);
+        let status_path = crate::profile::clauth_dir()
+            .expect("clauth dir")
+            .join("status.json");
+        ApiContext::new(
+            config,
+            status_path,
+            None,
+            crate::daemon::api::panes::absent_probe(),
+        )
+    }
+
+    /// A request as the HTTP layer would hand it to the router.
+    pub(crate) fn req(method: &str, path: &str, bearer: Option<&str>, body: &str) -> Request {
+        let (path, query) = path.split_once('?').unwrap_or((path, ""));
+        Request {
+            method: method.to_string(),
+            path: path.to_string(),
+            query: query.to_string(),
+            bearer: bearer.map(str::to_string),
+            if_none_match: None,
+            body: body.as_bytes().to_vec(),
+            // Routing does not depend on this; the connection loop owns it.
+            keep_alive: true,
+        }
+    }
+
+    pub(crate) fn peer() -> SocketAddr {
+        SocketAddr::from(([192, 0, 2, 7], 50_000))
+    }
+
+    /// The router as most of these tests drive it: one fixed peer, the answer
+    /// alone. A test about which device the answer went to calls [`handle`].
+    pub(crate) fn call(ctx: &ApiContext, req: &Request) -> Response {
+        handle(ctx, req, peer()).response
+    }
+
+    pub(crate) fn seed_device(name: &str, tier: Tier, token: &str) {
+        devices::seed_for_tests(name, tier, token).expect("seed a device");
+    }
+
+    pub(crate) fn body_json(resp: &Response) -> serde_json::Value {
+        serde_json::from_slice(&resp.body).expect("response body is json")
+    }
+
+    /// Write a feed body to the context's `status.json`, for the tests that
+    /// stage a stale feed before driving a republish.
+    pub(crate) fn write_feed(ctx: &ApiContext, body: &str) {
+        std::fs::write(&ctx.status_path, body).expect("write status.json");
+    }
+}
+
+#[cfg(unix)]
+pub(crate) use route_harness::*;

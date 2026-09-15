@@ -19,7 +19,7 @@ use ratatui::widgets::Paragraph;
 
 use super::super::app::{
     App, ChainItemKind, FALLBACK_ROWS, FallbackFocus, FallbackRow, InputState, chain_candidates,
-    chain_items, parse_max_spend, parse_threshold, parse_weekly_override,
+    chain_items, parse_max_spend, parse_weekly_override,
 };
 use super::super::theme;
 use super::format::{ResetFmt, fixed_split, relative_age, reset_pill, reset_resume};
@@ -32,8 +32,8 @@ use super::panes::{
     wrap_words,
 };
 use crate::fallback::{
-    BlockedReason, DEFAULT_THRESHOLD, blocked_reason, health_blocked_reason, soonest_resume,
-    spend_is_uncapped, spend_room, threshold_for, uncapped_spend_fix,
+    BlockedReason, DEFAULT_THRESHOLD, blocked_reason, health_blocked_reason, parse_threshold,
+    soonest_resume, spend_is_uncapped, spend_room, threshold_for, uncapped_spend_fix,
 };
 use crate::profile::AppConfig;
 use crate::usage::{humanize_duration, switch_grade_kick_lifts};

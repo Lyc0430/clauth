@@ -17,7 +17,8 @@ fn bootstrap_busy(flag: &Arc<AtomicBool>, activity: &ActivityStore) -> bool {
     flag.load(Ordering::SeqCst) || any_busy(activity)
 }
 
-use super::{InputState, parse_threshold};
+use super::InputState;
+use crate::fallback::parse_threshold;
 
 #[test]
 fn delete_word_removes_run_left_of_caret() {
@@ -6045,6 +6046,13 @@ fn focused_account_types_the_hybrid_on_its_credential() {
 fn app_with_unlinked_profiles(profiles: Vec<crate::profile::Profile>) -> App {
     use crate::profile::{AppConfig, AppState};
     let names: Vec<_> = profiles.iter().map(|p| p.name.clone()).collect();
+    // The chain-edit actions confirm the roster and the chain off disk before
+    // persisting, so the fixture's state is on disk as well as in memory.
+    let registered: Vec<&str> = names.iter().map(|n| n.as_str()).collect();
+    crate::testutil::register_names(&registered);
+    let mut on_disk = crate::profile::load_app_state().expect("load the fixture state");
+    on_disk.fallback_chain = names.clone();
+    crate::profile::save_app_state(&on_disk).expect("persist the fixture chain");
     App::new(AppConfig {
         state: AppState {
             profiles: names.clone(),
@@ -6206,6 +6214,60 @@ fn fallback_threshold_plus_minus_still_nudge_both_ways() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn reorder_chain_member_keeps_the_cursor_when_the_save_fails() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
+    ]);
+    app.chain_cursor = 0;
+
+    // Fail the whole-state save the reorder leg performs; `set_chain_order`
+    // re-reads fresh state and saves into ~/.clauth, which 0o500 refuses.
+    let restore = crate::profile::clauth_dir().expect("clauth dir");
+    std::fs::set_permissions(&restore, std::fs::Permissions::from_mode(0o500))
+        .expect("chmod clauth dir read-only");
+
+    super::reorder_chain_member(&mut app, 1);
+
+    std::fs::set_permissions(&restore, std::fs::Permissions::from_mode(0o700))
+        .expect("restore clauth dir perms");
+
+    assert_eq!(
+        app.chain_cursor, 0,
+        "the cursor stays on the member when the reorder never landed"
+    );
+}
+
+#[test]
+fn write_threshold_silently_noops_for_a_vanished_member() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
+    ]);
+    app.chain_cursor = 0;
+
+    // Drop "a" from disk after the in-memory app was built: the daemon/TUI
+    // reload window, posed for the threshold leg.
+    let a = crate::profile::ProfileName::from("a");
+    let mut state = crate::profile::load_app_state().expect("read before");
+    state.profiles.retain(|n| n.as_str() != a.as_str());
+    state.fallback_chain.retain(|n| n.as_str() != a.as_str());
+    crate::profile::save_app_state(&state).expect("drop a from disk");
+
+    super::write_threshold(&mut app, 90.0);
+
+    assert!(
+        app.toasts.is_empty(),
+        "a vanished member is the baseline's silent no-op, not a wire-code toast"
+    );
+}
+
 // ── preferred / last_resort mutual exclusion ────────────────────────────────
 //
 // The two flags are contradictory ("come home here" vs "park here to the end"),
@@ -6315,7 +6377,7 @@ fn preferred_is_exclusive_across_the_chain() {
 fn toggle_preferred_rolls_back_both_flags_when_the_save_fails() {
     use std::os::unix::fs::PermissionsExt;
 
-    let home = crate::testutil::HomeSandbox::new();
+    let _home = crate::testutil::HomeSandbox::new();
     let mut a = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     a.last_resort = true;
     let mut app = app_with_unlinked_profiles(vec![
@@ -6325,16 +6387,17 @@ fn toggle_preferred_rolls_back_both_flags_when_the_save_fails() {
     app.chain_cursor = 0;
 
     // Block the very first write: `save_profile` does `mkdir_700` under
-    // `~/.clauth/profiles`, which fails once the home dir refuses new children.
-    let restore = home.home().to_path_buf();
+    // `~/.clauth/profiles`, which fails once `~/.clauth` (created by the
+    // fixture's roster save) refuses new children.
+    let restore = crate::profile::clauth_dir().expect("clauth dir");
     std::fs::set_permissions(&restore, std::fs::Permissions::from_mode(0o500))
-        .expect("chmod home read-only");
+        .expect("chmod clauth dir read-only");
 
     super::toggle_preferred(&mut app);
 
     // Restore before any assertion so a failure still lets the sandbox clean up.
     std::fs::set_permissions(&restore, std::fs::Permissions::from_mode(0o700))
-        .expect("restore home perms");
+        .expect("restore clauth dir perms");
 
     let cfg = app.config();
     let a = cfg

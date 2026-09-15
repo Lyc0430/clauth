@@ -26,6 +26,7 @@ use crate::logline::logline;
 use crate::oauth;
 use crate::profile::ConfigHandle;
 
+use super::chain;
 use super::devices::{self, Device, Tier};
 pub(crate) use super::http::ErrorBody;
 use super::http::{Request, Response, flatten_control_chars, sanitize_for_log};
@@ -113,6 +114,24 @@ pub(crate) static ROUTES: &[Route] = &[
     },
     Route {
         method: "POST",
+        path: "/chain/order",
+        access: Access::Control,
+        handler: chain::order,
+    },
+    Route {
+        method: "POST",
+        path: "/chain/threshold",
+        access: Access::Control,
+        handler: chain::threshold,
+    },
+    Route {
+        method: "POST",
+        path: "/chain/wrap-off",
+        access: Access::Control,
+        handler: chain::wrap_off,
+    },
+    Route {
+        method: "POST",
         path: "/pair",
         access: Access::None,
         handler: pair,
@@ -141,7 +160,7 @@ pub(crate) struct Caller<'a> {
 
 impl Caller<'_> {
     /// The device's name as it may appear in a log line.
-    fn device_for_log(&self) -> String {
+    pub(crate) fn device_for_log(&self) -> String {
         self.device
             .map_or_else(|| "-".to_string(), |device| sanitize_for_log(&device.name))
     }
@@ -190,6 +209,28 @@ impl ApiContext {
             herdr_probe,
         })
     }
+}
+
+/// Republish the feed now rather than leaving it to the next scheduler tick: a
+/// snapshot cloned out of the config mutex plus the live signals, written
+/// before the answer so every `GET /api/v1/status?wait=` reader wakes on the
+/// edit. The one copy `switch` and the chain routes share.
+pub(crate) fn republish(ctx: &ApiContext) {
+    let live = ctx.live.as_ref().map(crate::daemon::LiveStores::snapshot);
+    let snapshot = {
+        #[allow(
+            clippy::expect_used,
+            reason = "config mutex poisoning is unrecoverable"
+        )]
+        let cfg = ctx.config.lock().expect("config mutex poisoned");
+        cfg.clone()
+    };
+    crate::daemon::write_status_feed(
+        &snapshot,
+        live.as_ref()
+            .map(crate::daemon::LiveSnapshot::signals)
+            .as_ref(),
+    );
 }
 
 /// The reason every failed pairing redemption carries, whatever failed.
@@ -593,27 +634,7 @@ fn switch(ctx: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
                 "clauth api: device '{}' switched to '{active}'",
                 caller.device_for_log()
             );
-            // Republish NOW rather than leaving it to the next scheduler tick.
-            // Every `GET /api/v1/status?wait=` is parked on this file's content, and
-            // this is the daemon's own switch, so there is no other owner to
-            // defer to. Cloned out of the mutex first: `write_status_feed`
-            // stats and reads every profile's caches, which has no business
-            // running under the config lock.
-            let live = ctx.live.as_ref().map(crate::daemon::LiveStores::snapshot);
-            let snapshot = {
-                #[allow(
-                    clippy::expect_used,
-                    reason = "config mutex poisoning is unrecoverable"
-                )]
-                let cfg = ctx.config.lock().expect("config mutex poisoned");
-                cfg.clone()
-            };
-            crate::daemon::write_status_feed(
-                &snapshot,
-                live.as_ref()
-                    .map(crate::daemon::LiveSnapshot::signals)
-                    .as_ref(),
-            );
+            republish(ctx);
             Response::serialize(
                 200,
                 &SwitchOk {
@@ -753,7 +774,7 @@ fn pair(_: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
 /// endpoint cannot ship undocumented.
 #[derive(utoipa::OpenApi)]
 #[openapi(
-    paths(health, status, switch, pair, openapi_document, panes::panes),
+    paths(health, status, switch, chain::order, chain::threshold, chain::wrap_off, pair, openapi_document, panes::panes),
     modifiers(&BearerScheme)
 )]
 struct ApiDoc;

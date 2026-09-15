@@ -21,11 +21,12 @@ use anyhow::Result;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::actions::{
-    CaptureSnapshot, EnvKeyCollision, capture_into_profile, capture_snapshot, classify_env_key,
-    clear_profile_api_key, clear_profile_credentials, create_blank_profile,
-    create_profile_from_login, delete_profile, duplicate_profile, edit_profile_endpoint,
-    edit_profile_env, edit_profile_model, edit_profile_preset, find_matching_oauth_profile,
-    overwrite_captured_profile, rename_profile, reorder_profile, rotation_guard_for_mutation,
+    CaptureSnapshot, ChainEditRefusal, ChainRefusal, EnvKeyCollision, capture_into_profile,
+    capture_snapshot, classify_env_key, clear_profile_api_key, clear_profile_credentials,
+    create_blank_profile, create_profile_from_login, delete_profile, duplicate_profile,
+    edit_profile_endpoint, edit_profile_env, edit_profile_model, edit_profile_preset,
+    find_matching_oauth_profile, overwrite_captured_profile, rename_profile, reorder_profile,
+    rotation_guard_for_mutation, set_chain_order, set_member_threshold, set_wrap_off,
     snapshot_is_empty, switch_off, switch_profile, validate_profile_name,
 };
 use crate::claude::{
@@ -34,7 +35,10 @@ use crate::claude::{
     force_snapshot_active_credentials, is_first_login, link_profile_credentials,
     live_credentials_are_shell, read_claude_credentials, snapshot_active_credentials,
 };
-use crate::fallback::{DEFAULT_THRESHOLD, SwitchAction, auto_switch_if_needed, threshold_for};
+use crate::fallback::{
+    DEFAULT_THRESHOLD, MAX_THRESHOLD, MIN_THRESHOLD, SwitchAction, auto_switch_if_needed,
+    parse_threshold, threshold_for,
+};
 use crate::format::{format_pct, format_threshold_tokens};
 use crate::lock::with_state_lock;
 use crate::lockorder::{RankedGuard, RankedMutex};
@@ -5045,8 +5049,8 @@ fn cycle_divergence_default(app: &mut App) {
 fn toggle_wrap_off(app: &mut App) {
     {
         let mut cfg = app.config();
-        cfg.state.switch_off_when_spent = !cfg.state.switch_off_when_spent;
-        let _ = save_app_state(&cfg.state);
+        let next = !cfg.state.switch_off_when_spent;
+        let _ = set_wrap_off(&mut cfg, next);
     }
     app.last_reload_fp = reload_fingerprint();
 }
@@ -5598,15 +5602,26 @@ fn reorder_chain_member(app: &mut App, delta: i32) {
         return;
     };
     let target = pos as i32 + delta;
-    {
+    let landed = {
         let mut cfg = app.config();
         if target < 0 || target as usize >= cfg.state.fallback_chain.len() {
             return;
         }
-        cfg.state.fallback_chain.swap(pos, target as usize);
-        let _ = save_app_state(&cfg.state);
+        let mut order = cfg.state.fallback_chain.clone();
+        order.swap(pos, target as usize);
+        let moved = order[target as usize].clone();
+        set_chain_order(&mut cfg, &order)
+            .ok()
+            .and_then(|saved| saved.iter().position(|n| n == &moved))
+    };
+    // The cursor follows the member only when the reorder landed: a failed save
+    // (a held state flock, a disk error) leaves the chain and the selection
+    // where they were, so the next keypress still acts on the same member. The
+    // saved order may have dropped an unresolvable entry, so the member's new
+    // slot is looked up, never assumed.
+    if let Some(slot) = landed {
+        app.chain_cursor = slot;
     }
-    app.chain_cursor = target as usize;
 }
 
 /// ⏎/space on a member detail row: threshold opens inline editor; remove arms
@@ -5676,14 +5691,6 @@ fn commit_threshold_edit(app: &mut App) {
     };
     write_threshold(app, value);
     app.fallback_threshold_draft = None;
-}
-
-/// A typed threshold is valid only as a number in `0..=100`. Shared by the
-/// commit path and the detail card's inline Invalid-input check.
-pub(crate) fn parse_threshold(raw: &str) -> Option<f64> {
-    raw.parse::<f64>()
-        .ok()
-        .filter(|v| (0.0..=100.0).contains(v))
 }
 
 /// Keystrokes while the `weekly at` override field is open: ⏎ saves, ⎋ discards.
@@ -5843,23 +5850,28 @@ fn write_threshold(app: &mut App, value: f64) {
         let Some(name) = cfg.state.fallback_chain.get(pos).cloned() else {
             return;
         };
-        match cfg.find_mut(&name) {
-            Some(profile) => {
-                profile.fallback_threshold = Some(value);
-                save_profile(profile).err()
-            }
-            None => None,
-        }
+        set_member_threshold(&mut cfg, &name, value).err()
     };
-    if let Some(e) = save_err {
-        app.toast(ToastKind::Danger, format!("save failed\n{e}"));
+    let Some(e) = save_err else {
+        return;
+    };
+    // A member whose roster row vanished inside the reload window is the
+    // baseline's silent no-op: the account has already left, so there is
+    // nothing to save and no wire code belongs on an operator toast.
+    if let Some(ChainEditRefusal {
+        code: ChainRefusal::ProfileNotFound,
+        ..
+    }) = e.downcast_ref::<ChainEditRefusal>()
+    {
+        return;
     }
+    app.toast(ToastKind::Danger, format!("save failed\n{e}"));
 }
 
 /// Step the threshold by `delta`, clamped to 0..=100, and persist.
 fn adjust_threshold(app: &mut App, delta: f64) {
     if let Some(current) = selected_threshold(app) {
-        write_threshold(app, (current + delta).clamp(0.0, 100.0));
+        write_threshold(app, (current + delta).clamp(MIN_THRESHOLD, MAX_THRESHOLD));
     }
 }
 

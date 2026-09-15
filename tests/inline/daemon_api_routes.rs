@@ -14,37 +14,12 @@
 use super::*;
 
 use crate::profile::{
-    AppConfig, AppState, ClaudeCredentials, ConfigHandle, DivergenceChoice, OAuthToken, Profile,
-    save_app_state, save_profile,
+    AppConfig, AppState, ConfigHandle, DivergenceChoice, save_app_state, save_profile,
 };
-use crate::testutil::HomeSandbox;
-
-/// The bearer of the control device every context below pairs.
-const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-/// The device [`TOKEN`] authenticates as.
-const DEVICE: &str = "test";
-/// The bearer of a second device, which the tests that need one pair.
-const OTHER_TOKEN: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
-
-fn creds(access: &str) -> ClaudeCredentials {
-    ClaudeCredentials {
-        claude_ai_oauth: Some(OAuthToken {
-            access_token: access.to_string(),
-            refresh_token: Some(format!("{access}-refresh")),
-            expires_at: None,
-            scopes: None,
-            subscription_type: None,
-            ..crate::profile::OAuthToken::default_extra()
-        }),
-    }
-}
-
-fn stored_profile(name: &str) -> Profile {
-    let mut p = Profile::new(name.to_string(), None, None);
-    p.credentials = Some(creds(name));
-    save_profile(&p).expect("save profile");
-    p
-}
+use crate::testutil::{
+    DEVICE, HomeSandbox, OTHER_TOKEN, TOKEN, body_json, call, ctx_with, peer, req, seed_device,
+    stored_profile, write_feed,
+};
 
 /// Two profiles, the first active, both with usable stored credentials.
 fn seeded_config() -> ConfigHandle {
@@ -65,16 +40,6 @@ fn seeded_config() -> ConfigHandle {
     }))
 }
 
-/// A context over `config`, with [`TOKEN`] paired as the control device
-/// [`DEVICE`].
-fn ctx_with(config: ConfigHandle) -> std::sync::Arc<ApiContext> {
-    seed_device(DEVICE, Tier::Control, TOKEN);
-    let status_path = crate::profile::clauth_dir()
-        .expect("clauth dir")
-        .join("status.json");
-    ApiContext::new(config, status_path, None, panes::absent_probe())
-}
-
 /// The same context a running daemon builds: one that can see the scheduler's
 /// in-memory stores.
 fn ctx_with_live(
@@ -86,35 +51,6 @@ fn ctx_with_live(
         .expect("clauth dir")
         .join("status.json");
     ApiContext::new(config, status_path, Some(live), panes::absent_probe())
-}
-
-/// A request as the HTTP layer would hand it to the router.
-fn req(method: &str, path: &str, bearer: Option<&str>, body: &str) -> Request {
-    let (path, query) = path.split_once('?').unwrap_or((path, ""));
-    Request {
-        method: method.to_string(),
-        path: path.to_string(),
-        query: query.to_string(),
-        bearer: bearer.map(str::to_string),
-        if_none_match: None,
-        body: body.as_bytes().to_vec(),
-        // Routing does not depend on this; the connection loop owns it.
-        keep_alive: true,
-    }
-}
-
-fn peer() -> SocketAddr {
-    SocketAddr::from(([192, 0, 2, 7], 50_000))
-}
-
-/// The router as most of these tests drive it: one fixed peer, the answer
-/// alone. A test about which device the answer went to calls [`handle`].
-fn call(ctx: &ApiContext, req: &Request) -> Response {
-    handle(ctx, req, peer()).response
-}
-
-fn seed_device(name: &str, tier: Tier, token: &str) {
-    devices::seed_for_tests(name, tier, token).expect("seed a device");
 }
 
 fn route_path(route: &Route) -> String {
@@ -129,10 +65,6 @@ fn req_tagged(path: &str, bearer: Option<&str>, etag: &str) -> Request {
     }
 }
 
-fn body_json(resp: &Response) -> serde_json::Value {
-    serde_json::from_slice(&resp.body).expect("response body is json")
-}
-
 // ------------------------------------------------- status: waiting
 
 /// A status feed body. `generated_at` is the field the daemon moves every tick
@@ -141,10 +73,6 @@ fn feed(active: &str, generated_at: &str) -> String {
     format!(
         r#"{{"schema":1,"generated_at":"{generated_at}","active_profile":"{active}","pending_switch":null,"wrap_off":false,"refresh_interval_ms":120000,"profiles":[]}}"#
     )
-}
-
-fn write_feed(ctx: &ApiContext, body: &str) {
-    std::fs::write(&ctx.status_path, body).expect("write status.json");
 }
 
 /// The tag the daemon would hand out for what is on disk right now.
@@ -405,6 +333,9 @@ fn the_route_table_is_exactly_this() {
             ("GET", "/openapi.json", Access::View),
             ("HEAD", "/openapi.json", Access::View),
             ("POST", "/switch", Access::Control),
+            ("POST", "/chain/order", Access::Control),
+            ("POST", "/chain/threshold", Access::Control),
+            ("POST", "/chain/wrap-off", Access::Control),
             ("POST", "/pair", Access::None),
             ("GET", "/panes", Access::View),
             ("HEAD", "/panes", Access::View),
@@ -867,6 +798,21 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
     let mut driven = std::collections::HashSet::new();
     let mut produced = std::collections::HashSet::new();
 
+    // A three-member chain plus one stored profile outside it, for the chain
+    // mutation routes. Seeded before any arm so the chain routes can be driven
+    // with the same fixture the rest of the test shares.
+    {
+        let mut cfg = config.lock().expect("config");
+        let gamma = stored_profile("gamma");
+        let delta = stored_profile("delta");
+        cfg.profiles.push(gamma);
+        cfg.profiles.push(delta);
+        cfg.state.profiles.push("gamma".into());
+        cfg.state.profiles.push("delta".into());
+        cfg.state.fallback_chain = vec!["alpha".into(), "beta".into(), "gamma".into()];
+        save_app_state(&cfg.state).expect("save chain");
+    }
+
     // The switch_failed 500, posed the way the switch-failure route tests pose
     // it: a diverged-looking live slot and the Discard default reach the link
     // publish, and a directory at the live credentials path fails it. Driven
@@ -964,6 +910,64 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         &mut produced,
     );
 
+    // Chain mutation success answers.
+    let order_ok = call(
+        &ctx,
+        &req(
+            "POST",
+            "/api/v1/chain/order",
+            Some(TOKEN),
+            r#"{"members":["BETA","alpha","gamma"]}"#,
+        ),
+    );
+    check_answer(
+        &doc,
+        "POST",
+        "/chain/order",
+        200,
+        &order_ok,
+        &mut driven,
+        &mut produced,
+    );
+    let threshold_ok = call(
+        &ctx,
+        &req(
+            "POST",
+            "/api/v1/chain/threshold",
+            Some(TOKEN),
+            r#"{"profile":"alpha","threshold":90}"#,
+        ),
+    );
+    check_answer(
+        &doc,
+        "POST",
+        "/chain/threshold",
+        200,
+        &threshold_ok,
+        &mut driven,
+        &mut produced,
+    );
+    for wrap in [true, false] {
+        let wrap_ok = call(
+            &ctx,
+            &req(
+                "POST",
+                "/api/v1/chain/wrap-off",
+                Some(TOKEN),
+                &serde_json::to_string(&serde_json::json!({"wrap_off": wrap})).expect("wrap body"),
+            ),
+        );
+        check_answer(
+            &doc,
+            "POST",
+            "/chain/wrap-off",
+            200,
+            &wrap_ok,
+            &mut driven,
+            &mut produced,
+        );
+    }
+
     let code = pairing::begin(
         &devices::DeviceName::parse("phone").expect("device name"),
         Tier::View,
@@ -1029,6 +1033,9 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         ("GET", "/openapi.json"),
         ("GET", "/panes"),
         ("POST", "/switch"),
+        ("POST", "/chain/order"),
+        ("POST", "/chain/threshold"),
+        ("POST", "/chain/wrap-off"),
     ] {
         let resp = call(&ctx, &req(method, &format!("{API_PREFIX}{path}"), None, ""));
         check_answer(&doc, method, path, 401, &resp, &mut driven, &mut produced);
@@ -1052,6 +1059,22 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         &mut driven,
         &mut produced,
     );
+    for (path, body) in [
+        ("/chain/order", r#"{"members":["alpha","beta","gamma"]}"#),
+        ("/chain/threshold", r#"{"profile":"alpha","threshold":90}"#),
+        ("/chain/wrap-off", r#"{"wrap_off":true}"#),
+    ] {
+        let resp = call(
+            &ctx,
+            &req(
+                "POST",
+                &format!("{API_PREFIX}{path}"),
+                Some(OTHER_TOKEN),
+                body,
+            ),
+        );
+        check_answer(&doc, "POST", path, 403, &resp, &mut driven, &mut produced);
+    }
     let wall_token = "b".repeat(64);
     seed_device("wall", Tier::Unknown("readonly".to_string()), &wall_token);
     for (method, path) in [
@@ -1060,6 +1083,9 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         ("GET", "/openapi.json"),
         ("GET", "/panes"),
         ("POST", "/switch"),
+        ("POST", "/chain/order"),
+        ("POST", "/chain/threshold"),
+        ("POST", "/chain/wrap-off"),
     ] {
         let body = if method == "POST" {
             r#"{"profile":"beta"}"#
@@ -1133,6 +1159,117 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         &mut produced,
     );
 
+    // The chain error answers: a malformed body, a non-permutation order, an
+    // unknown threshold target, a non-member, and an out-of-band threshold.
+    let order_bad = call(&ctx, &req("POST", "/api/v1/chain/order", Some(TOKEN), "{}"));
+    check_answer(
+        &doc,
+        "POST",
+        "/chain/order",
+        400,
+        &order_bad,
+        &mut driven,
+        &mut produced,
+    );
+    let order_invalid = call(
+        &ctx,
+        &req(
+            "POST",
+            "/api/v1/chain/order",
+            Some(TOKEN),
+            r#"{"members":["alpha","beta"]}"#,
+        ),
+    );
+    check_answer(
+        &doc,
+        "POST",
+        "/chain/order",
+        400,
+        &order_invalid,
+        &mut driven,
+        &mut produced,
+    );
+    let threshold_bad = call(
+        &ctx,
+        &req("POST", "/api/v1/chain/threshold", Some(TOKEN), "{}"),
+    );
+    check_answer(
+        &doc,
+        "POST",
+        "/chain/threshold",
+        400,
+        &threshold_bad,
+        &mut driven,
+        &mut produced,
+    );
+    let threshold_range = call(
+        &ctx,
+        &req(
+            "POST",
+            "/api/v1/chain/threshold",
+            Some(TOKEN),
+            r#"{"profile":"alpha","threshold":1e309}"#,
+        ),
+    );
+    check_answer(
+        &doc,
+        "POST",
+        "/chain/threshold",
+        400,
+        &threshold_range,
+        &mut driven,
+        &mut produced,
+    );
+    let threshold_unknown = call(
+        &ctx,
+        &req(
+            "POST",
+            "/api/v1/chain/threshold",
+            Some(TOKEN),
+            r#"{"profile":"ghost","threshold":90}"#,
+        ),
+    );
+    check_answer(
+        &doc,
+        "POST",
+        "/chain/threshold",
+        404,
+        &threshold_unknown,
+        &mut driven,
+        &mut produced,
+    );
+    let threshold_not_member = call(
+        &ctx,
+        &req(
+            "POST",
+            "/api/v1/chain/threshold",
+            Some(TOKEN),
+            r#"{"profile":"delta","threshold":90}"#,
+        ),
+    );
+    check_answer(
+        &doc,
+        "POST",
+        "/chain/threshold",
+        409,
+        &threshold_not_member,
+        &mut driven,
+        &mut produced,
+    );
+    let wrap_bad = call(
+        &ctx,
+        &req("POST", "/api/v1/chain/wrap-off", Some(TOKEN), "{}"),
+    );
+    check_answer(
+        &doc,
+        "POST",
+        "/chain/wrap-off",
+        400,
+        &wrap_bad,
+        &mut driven,
+        &mut produced,
+    );
+
     // HEAD routes like GET at the router and arrive bodyless on the wire, the
     // serve loop's strip the router never sees.
     for path in ["/health", "/status", "/openapi.json"] {
@@ -1170,6 +1307,17 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         &mut driven,
         &mut produced,
     );
+    for (path, body) in [
+        ("/chain/order", r#"{"members":["alpha","beta","gamma"]}"#),
+        ("/chain/threshold", r#"{"profile":"alpha","threshold":90}"#),
+        ("/chain/wrap-off", r#"{"wrap_off":true}"#),
+    ] {
+        let resp = call(
+            &ctx,
+            &req("POST", &format!("{API_PREFIX}{path}"), Some(TOKEN), body),
+        );
+        check_answer(&doc, "POST", path, 503, &resp, &mut driven, &mut produced);
+    }
     let pair_locked = call(&ctx, &req("POST", "/api/v1/pair", None, &pair_body2));
     check_answer(
         &doc,
@@ -1222,6 +1370,40 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         &mut produced,
     );
 
+    // The same gate held for the chain routes answers their own 409 code.
+    let chain_in_flight = {
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::sync::Arc::clone(&ctx);
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let _gate = holder.switch_gate.lock().expect("gate");
+                held_tx.send(()).expect("signal held");
+                let _ = release_rx.recv();
+            });
+            held_rx.recv().expect("gate taken");
+            let mut answers = Vec::new();
+            for (path, body) in [
+                ("/chain/order", r#"{"members":["alpha","beta","gamma"]}"#),
+                ("/chain/threshold", r#"{"profile":"alpha","threshold":90}"#),
+                ("/chain/wrap-off", r#"{"wrap_off":true}"#),
+            ] {
+                answers.push((
+                    path,
+                    call(
+                        &ctx,
+                        &req("POST", &format!("{API_PREFIX}{path}"), Some(TOKEN), body),
+                    ),
+                ));
+            }
+            let _ = release_tx.send(());
+            answers
+        })
+    };
+    for (path, resp) in chain_in_flight {
+        check_answer(&doc, "POST", path, 409, &resp, &mut driven, &mut produced);
+    }
+
     // A refused switch (a disabled target) answers 409.
     {
         let mut cfg = config.lock().expect("config");
@@ -1250,6 +1432,62 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         &mut produced,
     );
 
+    // A chain edit that fails on disk answers the route's own 500 edit_failed,
+    // distinct from the router's device-list `internal` driven below. order and
+    // wrap-off save whole state into ~/.clauth; threshold writes the member dir.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
+        std::fs::set_permissions(&clauth_dir, std::fs::Permissions::from_mode(0o500))
+            .expect("chmod clauth dir read-only");
+        let answers: Vec<(&str, Response)> = [
+            ("/chain/order", r#"{"members":["beta","alpha","gamma"]}"#),
+            ("/chain/wrap-off", r#"{"wrap_off":true}"#),
+        ]
+        .into_iter()
+        .map(|(path, body)| {
+            (
+                path,
+                call(
+                    &ctx,
+                    &req("POST", &format!("{API_PREFIX}{path}"), Some(TOKEN), body),
+                ),
+            )
+        })
+        .collect();
+        // Restore before any assertion so a red still lets the sandbox clean up.
+        std::fs::set_permissions(&clauth_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("restore clauth dir perms");
+        for (path, resp) in answers {
+            check_answer(&doc, "POST", path, 500, &resp, &mut driven, &mut produced);
+        }
+
+        let beta_dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("beta"))
+            .expect("beta dir");
+        std::fs::set_permissions(&beta_dir, std::fs::Permissions::from_mode(0o500))
+            .expect("chmod beta dir read-only");
+        let resp = call(
+            &ctx,
+            &req(
+                "POST",
+                "/api/v1/chain/threshold",
+                Some(TOKEN),
+                r#"{"profile":"beta","threshold":90}"#,
+            ),
+        );
+        std::fs::set_permissions(&beta_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("restore beta dir perms");
+        check_answer(
+            &doc,
+            "POST",
+            "/chain/threshold",
+            500,
+            &resp,
+            &mut driven,
+            &mut produced,
+        );
+    }
+
     // An unreadable device list refuses every authenticated route with 500, and
     // the pairing redemption hits the same store when it mints the device.
     std::fs::write(
@@ -1265,6 +1503,9 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         ("GET", "/openapi.json"),
         ("GET", "/panes"),
         ("POST", "/switch"),
+        ("POST", "/chain/order"),
+        ("POST", "/chain/threshold"),
+        ("POST", "/chain/wrap-off"),
     ] {
         let body = if method == "POST" {
             r#"{"profile":"beta"}"#

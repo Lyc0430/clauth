@@ -46,6 +46,22 @@ pub(crate) fn threshold_for(profile: &Profile) -> f64 {
     profile.fallback_threshold.unwrap_or(DEFAULT_THRESHOLD)
 }
 
+/// The one band a fallback threshold may hold: finite, 0..=100. The TUI's
+/// text parser ([`parse_threshold`]) and the chain-edit action
+/// (`actions::set_member_threshold`) both read it, so the two surfaces cannot
+/// drift on the range.
+pub(crate) const MIN_THRESHOLD: f64 = 0.0;
+pub(crate) const MAX_THRESHOLD: f64 = 100.0;
+
+pub(crate) fn threshold_in_range(value: f64) -> bool {
+    value.is_finite() && (MIN_THRESHOLD..=MAX_THRESHOLD).contains(&value)
+}
+
+/// Parse a typed threshold, valid only inside [`threshold_in_range`].
+pub(crate) fn parse_threshold(raw: &str) -> Option<f64> {
+    raw.parse::<f64>().ok().filter(|v| threshold_in_range(*v))
+}
+
 /// Live 5h window for `profile`, or `None` when there's no snapshot yet or its
 /// window isn't currently live (`five_hour_live`) — a lapsed or windowless
 /// snapshot means the account has headroom again whatever its last-known

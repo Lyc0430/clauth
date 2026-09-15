@@ -3,7 +3,7 @@
 //! Each function takes already-validated inputs from the TUI layer and applies
 //! the change under the cross-process state lock.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
@@ -20,7 +20,8 @@ use crate::oauth;
 use crate::out::{out, outln};
 use crate::profile::{
     AccountId, AppConfig, ClaudeCredentials, ConfigHandle, ConsoleCredential, DivergenceChoice,
-    ModelSettings, Profile, ProfileName, load_app_state, profile_dir, save_app_state, save_profile,
+    ModelSettings, Profile, ProfileName, load_app_state, load_profile, profile_dir, save_app_state,
+    save_profile,
 };
 use crate::providers::Provider;
 use crate::runtime::RotationGuard;
@@ -89,6 +90,58 @@ impl std::fmt::Display for DeepRefusal {
 }
 
 impl std::error::Error for DeepRefusal {}
+
+/// The closed set of refusals a chain-edit action can raise. An enum rather
+/// than a wire string so the route's match is exhaustive: a fifth refusal added
+/// here does not compile until its answer arm exists, instead of silently
+/// folding into the router's 500.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChainRefusal {
+    OrderInvalid,
+    ProfileNotFound,
+    NotAMember,
+    BadRequest,
+}
+
+impl ChainRefusal {
+    /// The fixed wire code the route answers with for this refusal.
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            ChainRefusal::OrderInvalid => "chain_order_invalid",
+            ChainRefusal::ProfileNotFound => "profile_not_found",
+            ChainRefusal::NotAMember => "not_a_member",
+            ChainRefusal::BadRequest => "bad_request",
+        }
+    }
+}
+
+/// An authored refusal raised by a chain-edit action, carrying the fixed error
+/// code the route answers with and, for the refusals that name a profile, the
+/// sentence. Kept downcastable so the route maps validation failures to their
+/// own codes instead of folding them into the open anyhow chain — the body is
+/// the surface a remote reader sees, so the open chain never leaves the log.
+#[derive(Debug)]
+pub(crate) struct ChainEditRefusal {
+    pub(crate) code: ChainRefusal,
+    pub(crate) reason: Option<String>,
+}
+
+impl ChainEditRefusal {
+    pub(crate) fn new(code: ChainRefusal, reason: Option<String>) -> Self {
+        Self { code, reason }
+    }
+}
+
+impl std::fmt::Display for ChainEditRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.reason {
+            Some(reason) => f.write_str(reason),
+            None => f.write_str(self.code.code()),
+        }
+    }
+}
+
+impl std::error::Error for ChainEditRefusal {}
 
 fn ensure_switch_target_ok(config: &AppConfig, name: &ProfileName) -> Result<()> {
     // Fresh membership, not just the in-memory list: a caller can hold a config
@@ -1724,6 +1777,129 @@ pub(crate) fn reorder_profile(config: &mut AppConfig, from: usize, to: usize) ->
         let name = config.state.profiles.remove(from);
         config.state.profiles.insert(to, name);
         save_app_state(&config.state)
+    })
+}
+
+fn validate_chain_order(current: &[ProfileName], members: &[ProfileName]) -> Result<()> {
+    let mut seen = HashSet::new();
+    for member in members {
+        if !seen.insert(member) {
+            bail!(ChainEditRefusal::new(
+                ChainRefusal::OrderInvalid,
+                Some(format!("duplicate chain member '{member}'")),
+            ));
+        }
+        if !current.contains(member) {
+            bail!(ChainEditRefusal::new(
+                ChainRefusal::OrderInvalid,
+                Some(format!("extra chain member '{member}'")),
+            ));
+        }
+    }
+    for member in current {
+        if !members.contains(member) {
+            bail!(ChainEditRefusal::new(
+                ChainRefusal::OrderInvalid,
+                Some(format!("missing chain member '{member}'")),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Resolve a name list against the on-disk roster, case-insensitively, dropping
+/// every entry no profile carries. A hand-edited or legacy `fallback_chain`
+/// entry is tolerated (pruned only on remove) but must not make the chain
+/// un-sendable: reordering drops it the same way `remove` prunes it.
+fn resolve_chain(chain: &[ProfileName], roster: &[ProfileName]) -> Vec<ProfileName> {
+    chain
+        .iter()
+        .filter_map(|entry| {
+            roster
+                .iter()
+                .find(|n| n.as_str().eq_ignore_ascii_case(entry.as_str()))
+                .cloned()
+        })
+        .collect()
+}
+
+/// Reorder the fallback chain to `members`, which must be a permutation of the
+/// current chain. Shared by the Fallback tab's move rows and `POST
+/// /api/v1/chain/order`; the permutation is validated here so the two surfaces
+/// cannot drift on what a valid order is.
+pub(crate) fn set_chain_order(
+    config: &mut AppConfig,
+    members: &[ProfileName],
+) -> Result<Vec<ProfileName>> {
+    with_state_lock(|_held| {
+        // Same fresh-state rule as `finish_switch`: only the chain is this
+        // leg's change, so read the current profiles.toml and change that one
+        // field — never re-serialize a possibly-stale in-memory copy. The
+        // saved order is what the caller answers with: a member the fresh
+        // roster no longer carries drops out of it here.
+        let mut state = load_app_state()?;
+        let current = resolve_chain(&state.fallback_chain, &state.profiles);
+        let resolved = resolve_chain(members, &state.profiles);
+        validate_chain_order(&current, &resolved)?;
+        state.fallback_chain = resolved.clone();
+        save_app_state(&state)?;
+        config.state.fallback_chain = resolved.clone();
+        Ok(resolved)
+    })
+}
+
+/// Set one chain member's fallback threshold. Shared by the Fallback tab's
+/// threshold editor and `POST /api/v1/chain/threshold`; the range check lives
+/// in `fallback::threshold_in_range` so the TUI parser and this action agree on
+/// the one band.
+pub(crate) fn set_member_threshold(
+    config: &mut AppConfig,
+    name: &ProfileName,
+    value: f64,
+) -> Result<()> {
+    if !crate::fallback::threshold_in_range(value) {
+        bail!(ChainEditRefusal::new(ChainRefusal::BadRequest, None));
+    }
+    with_state_lock(|_held| {
+        // Fresh roster AND fresh chain off disk, not the in-memory copies: the
+        // daemon's config can lag a concurrent CLI/TUI edit, and `save_profile`
+        // would recreate the profile file for a member that is gone, or write
+        // a threshold on one the chain just dropped.
+        let fresh = load_app_state()?;
+        if !fresh.profiles.iter().any(|n| n == name) {
+            bail!(ChainEditRefusal::new(ChainRefusal::ProfileNotFound, None));
+        }
+        if !fresh.fallback_chain.iter().any(|n| n == name) {
+            bail!(ChainEditRefusal::new(
+                ChainRefusal::NotAMember,
+                Some(format!(
+                    "'{name}' is not in the fallback chain; add it on the Fallback tab first"
+                )),
+            ));
+        }
+        // Same fresh-state rule as `set_chain_order`: re-read the profile off
+        // disk so a concurrent edit to another field is not rewound, change
+        // only this leg's field, then mirror it into the in-memory profile.
+        let mut fresh = load_profile(name)?;
+        fresh.fallback_threshold = Some(value);
+        save_profile(&fresh)?;
+        if let Some(profile) = config.find_mut(name) {
+            profile.fallback_threshold = Some(value);
+        }
+        Ok(())
+    })
+}
+
+/// Set the chain-global wrap-off behaviour. Shared by the Config tab's toggle
+/// and `POST /api/v1/chain/wrap-off`; the on-disk key stays `wrap_off` (see
+/// `AppState::switch_off_when_spent`).
+pub(crate) fn set_wrap_off(config: &mut AppConfig, on: bool) -> Result<()> {
+    with_state_lock(|_held| {
+        let mut state = load_app_state()?;
+        state.switch_off_when_spent = on;
+        save_app_state(&state)?;
+        config.state.switch_off_when_spent = on;
+        Ok(())
     })
 }
 
