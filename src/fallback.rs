@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 
-use crate::actions::{switch_off, switch_profile};
+use crate::actions::{switch_off_locked, switch_profile_locked};
 use crate::lock::with_state_lock;
 use crate::profile::{AppConfig, Profile, ProfileName};
 use crate::usage::{
@@ -44,6 +44,22 @@ pub(crate) const DEFAULT_THRESHOLD: f64 = 95.0;
 
 pub(crate) fn threshold_for(profile: &Profile) -> f64 {
     profile.fallback_threshold.unwrap_or(DEFAULT_THRESHOLD)
+}
+
+/// The one band a fallback threshold may hold: finite, 0..=100. The TUI's
+/// text parser ([`parse_threshold`]) and the chain-edit action
+/// (`actions::set_member_threshold`) both read it, so the two surfaces cannot
+/// drift on the range.
+pub(crate) const MIN_THRESHOLD: f64 = 0.0;
+pub(crate) const MAX_THRESHOLD: f64 = 100.0;
+
+pub(crate) fn threshold_in_range(value: f64) -> bool {
+    value.is_finite() && (MIN_THRESHOLD..=MAX_THRESHOLD).contains(&value)
+}
+
+/// Parse a typed threshold, valid only inside [`threshold_in_range`].
+pub(crate) fn parse_threshold(raw: &str) -> Option<f64> {
+    raw.parse::<f64>().ok().filter(|v| threshold_in_range(*v))
 }
 
 /// Live 5h window for `profile`, or `None` when there's no snapshot yet or its
@@ -1645,6 +1661,89 @@ pub(crate) fn find_recovered_member(
     None
 }
 
+// ── test-only decision/dispatch rendezvous ───────────────────────────────────
+//
+// `auto_switch_if_needed`'s decision and dispatch must share one state-flock
+// hold; this seam is what makes that falsifiable. A test arms it with the
+// action it expects the automatic actor to decide; when the actor reaches the
+// decision/dispatch boundary with exactly that decision in hand it reports and
+// parks until the controller releases it — under whatever locks the production
+// path holds at that point. Scheduling only: the decision, the dispatch fns,
+// and every persisted value are the real ones. Fires at most once per arming
+// and only on an exact action match, so every unarmed caller passes through
+// untouched.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct AutoDecisionDone {
+    pub(crate) action: SwitchAction,
+}
+
+#[cfg(test)]
+struct AutoDecisionRendezvous {
+    action: SwitchAction,
+    reached: std::sync::mpsc::Sender<AutoDecisionDone>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+static AUTO_DECISION_RENDEZVOUS: std::sync::Mutex<Option<AutoDecisionRendezvous>> =
+    std::sync::Mutex::new(None);
+
+/// Arm the rendezvous for `action`: the next matching decision reports on
+/// `reached` and parks until a send on `release`. One rendezvous at a time;
+/// tests arming one hold a `HomeSandbox`, which serializes them.
+#[cfg(test)]
+pub(crate) fn install_auto_decision_rendezvous(
+    action: SwitchAction,
+) -> (
+    std::sync::mpsc::Receiver<AutoDecisionDone>,
+    std::sync::mpsc::Sender<()>,
+) {
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let mut slot = AUTO_DECISION_RENDEZVOUS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    assert!(
+        slot.is_none(),
+        "only one auto-decision rendezvous may be armed"
+    );
+    *slot = Some(AutoDecisionRendezvous {
+        action,
+        reached: reached_tx,
+        release: release_rx,
+    });
+    (reached_rx, release_tx)
+}
+
+/// The boundary's park: report the decision, then hold the actor here until
+/// the controller releases the dispatch.
+#[cfg(test)]
+fn auto_decision_rendezvous(action: &SwitchAction) {
+    let rendezvous = {
+        let mut slot = AUTO_DECISION_RENDEZVOUS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match slot.as_ref() {
+            Some(hook) if &hook.action == action => slot.take(),
+            _ => None,
+        }
+    };
+    let Some(rendezvous) = rendezvous else {
+        return;
+    };
+    rendezvous
+        .reached
+        .send(AutoDecisionDone {
+            action: action.clone(),
+        })
+        .expect("rendezvous controller stays alive until the boundary is reached");
+    rendezvous
+        .release
+        .recv()
+        .expect("rendezvous controller releases the dispatch");
+}
+
 /// If the active profile is a chain member past its threshold, switch to the
 /// next viable member — or, in wrap-off mode when the whole chain is spent and
 /// no sink exists, turn off all accounts. Returns the action taken, or None.
@@ -1652,63 +1751,94 @@ pub(crate) fn find_recovered_member(
 /// `active_burn_pct_per_hour` is the caller's in-memory burn rate for the
 /// active profile (ignored unless burn-aware mode is on) — same contract as
 /// [`next_target`], which this forwards it to.
+///
+/// Takes the shared [`crate::profile::ConfigHandle`] and runs the decision
+/// AND its dispatch inside ONE state-flock hold — the guard-then-flock shape
+/// the daemon's tick drain uses — so an explicit switch (CLI/TUI/MCP) that
+/// starts after the decision cannot complete before the dispatch and then be
+/// overwritten by the already-made decision; it waits out the transaction and
+/// lands last. The config guard is acquired first (Config ranks outer of the
+/// state flock in [`crate::lockorder`]); the dispatch goes through the
+/// `_locked` cores over that same guard — the guard-taking wrappers would
+/// re-lock a mutex this call already holds — and the guard is dropped before
+/// the feed republish below, so that sweep runs under no config guard. A
+/// caller holding a guard across this call self-deadlocks.
 pub(crate) fn auto_switch_if_needed(
-    config: &mut AppConfig,
+    config: &crate::profile::ConfigHandle,
     active_burn_pct_per_hour: Option<f64>,
 ) -> Result<Option<SwitchAction>> {
-    with_state_lock(|_held| {
-        let Some(active_name) = config.state.active_profile.as_ref() else {
-            return Ok(None);
+    #[allow(
+        clippy::expect_used,
+        reason = "config mutex poisoning is unrecoverable"
+    )]
+    let mut guard = config.lock().expect("config mutex poisoned");
+    let (action, changed) = with_state_lock(|_held| {
+        let config = &mut *guard;
+        let Some(action) = decide_auto_switch(config, active_burn_pct_per_hour) else {
+            return Ok((None, false));
         };
-        if !config.state.fallback_chain.iter().any(|n| n == active_name) {
-            return Ok(None);
-        }
-        let Some(active) = config.find(active_name) else {
-            return Ok(None);
-        };
-        // AUTH-4 parity with the scheduler-side walk: an auth-broken active's
-        // usage is frozen-stale (its fetches can't succeed), so exhaustion
-        // cannot be a precondition for leaving it. A canceled active is the same
-        // shape — a dead account whose cached window reads as idle headroom while
-        // every request 403s — so it also bypasses the exhaustion gate.
-        let weekly_pct = config.state.weekly_switch_threshold_pct();
-        if !config.is_auth_broken(active_name)
-            && !is_canceled(active)
-            && !is_exhausted_active(
-                active,
-                config.state.burn_aware_switching,
-                config.state.refresh_interval_ms,
-                active_burn_pct_per_hour,
-                weekly_blocked(active, weekly_pct),
-                config.state.burn_switch_floor_pct(),
-                config.state.burn_horizon_cap_ms(),
-            )
-        {
-            // Scoped active trigger (parity with `next_auto_switch_target`):
-            // a per-model weekly line crossed on an otherwise-healthy active
-            // (its `check_scoped` gate on) hops ONLY onto a clear member —
-            // hopping between equally model-blocked members buys nothing.
-            // Parity with the scheduler walk: a pinned sink stays parked.
-            if !active.last_resort
-                && scoped_weekly_blocked(active, weekly_pct)
-                && let Some(target) = fully_clear_target(config, weekly_pct)
-            {
-                switch_profile(config, &ProfileName::from(target.clone()))?;
-                return Ok(Some(SwitchAction::To(target)));
+        #[cfg(test)]
+        auto_decision_rendezvous(&action);
+        let changed = match &action {
+            SwitchAction::To(target) => {
+                switch_profile_locked(config, &ProfileName::from(target.clone()))?
             }
-            return Ok(None);
-        }
-
-        let Some(action) = next_target(config, active_burn_pct_per_hour) else {
-            return Ok(None);
+            SwitchAction::Off => switch_off_locked(config)?,
         };
+        Ok((Some(action), changed))
+    })?;
+    drop(guard);
+    if changed {
+        crate::daemon::publish_status(config);
+    }
+    Ok(action)
+}
 
-        match &action {
-            SwitchAction::To(target) => switch_profile(config, &ProfileName::from(target.clone()))?,
-            SwitchAction::Off => switch_off(config)?,
+/// [`auto_switch_if_needed`]'s decision half: which [`SwitchAction`] the
+/// active profile's state calls for, or `None` to stay put. Read-only over
+/// the config — the caller holds the config guard and the state flock, and
+/// dispatches the returned action under that same hold.
+fn decide_auto_switch(
+    config: &AppConfig,
+    active_burn_pct_per_hour: Option<f64>,
+) -> Option<SwitchAction> {
+    let active_name = config.state.active_profile.as_ref()?;
+    if !config.state.fallback_chain.iter().any(|n| n == active_name) {
+        return None;
+    }
+    let active = config.find(active_name)?;
+    // AUTH-4 parity with the scheduler-side walk: an auth-broken active's
+    // usage is frozen-stale (its fetches can't succeed), so exhaustion
+    // cannot be a precondition for leaving it. A canceled active is the same
+    // shape — a dead account whose cached window reads as idle headroom while
+    // every request 403s — so it also bypasses the exhaustion gate.
+    let weekly_pct = config.state.weekly_switch_threshold_pct();
+    if !config.is_auth_broken(active_name)
+        && !is_canceled(active)
+        && !is_exhausted_active(
+            active,
+            config.state.burn_aware_switching,
+            config.state.refresh_interval_ms,
+            active_burn_pct_per_hour,
+            weekly_blocked(active, weekly_pct),
+            config.state.burn_switch_floor_pct(),
+            config.state.burn_horizon_cap_ms(),
+        )
+    {
+        // Scoped active trigger (parity with `next_auto_switch_target`):
+        // a per-model weekly line crossed on an otherwise-healthy active
+        // (its `check_scoped` gate on) hops ONLY onto a clear member —
+        // hopping between equally model-blocked members buys nothing.
+        // Parity with the scheduler walk: a pinned sink stays parked.
+        if !active.last_resort
+            && scoped_weekly_blocked(active, weekly_pct)
+            && let Some(target) = fully_clear_target(config, weekly_pct)
+        {
+            return Some(SwitchAction::To(target));
         }
-        Ok(Some(action))
-    })
+        return None;
+    }
+    next_target(config, active_burn_pct_per_hour)
 }
 
 #[cfg(test)]

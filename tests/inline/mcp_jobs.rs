@@ -263,12 +263,12 @@ fn a_stale_claimed_spelling_does_not_block_the_claim() {
 }
 
 /// A running job file is written by the server that spawned it and read by a
-/// possibly newer one PLUS the separate `mcp-await-job` hook process, so every
-/// field added after the first release has to default. Pinned against the real
-/// bytes an older server wrote, not a hand-built `JobRecord`: a struct literal
-/// would compile against whatever the fields are today and prove nothing about
-/// the wire. `read` swallows a parse failure as `None`, which reaches the caller
-/// as `unknown job_id` on a job that is running fine.
+/// possibly newer one, so every field added after the first release has to
+/// default. Pinned against the real bytes an older server wrote, not a
+/// hand-built `JobRecord`: a struct literal would compile against whatever the
+/// fields are today and prove nothing about the wire. `read` swallows a parse
+/// failure as `None`, which reaches the caller as `unknown job_id` on a job that
+/// is running fine.
 #[test]
 fn a_job_file_from_an_older_server_still_parses() {
     let _home = HomeSandbox::new();

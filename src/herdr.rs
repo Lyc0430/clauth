@@ -19,6 +19,7 @@ use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::out::{errln, out, outln};
@@ -450,6 +451,46 @@ pub(crate) fn bounded_output(bin: &str, args: &[&str], envs: &[(&str, &OsStr)]) 
     }
     let child = cmd.spawn().ok()?;
     run_bounded(child, PROBE_TIMEOUT)
+}
+
+/// `herdr pane list`'s JSON envelope, trimmed to the fields the pane reporter
+/// and the TUI's knob push read. Unknown fields are ignored on purpose: herdr
+/// adds fields between releases.
+#[derive(Deserialize)]
+struct PaneListEnvelope {
+    result: PaneListResult,
+}
+
+#[derive(Deserialize)]
+struct PaneListResult {
+    panes: Vec<HerdrPane>,
+}
+
+/// One `panes[]` entry of `herdr pane list`.
+#[derive(Deserialize)]
+pub(crate) struct HerdrPane {
+    pub(crate) pane_id: String,
+    pub(crate) workspace_id: String,
+    pub(crate) tab_id: String,
+    pub(crate) terminal_title_stripped: Option<String>,
+    pub(crate) agent: Option<String>,
+    pub(crate) agent_status: String,
+    pub(crate) cwd: Option<String>,
+    pub(crate) focused: bool,
+    pub(crate) tokens: Option<HerdrTokens>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct HerdrTokens {
+    pub(crate) clauth: Option<String>,
+}
+
+/// `herdr pane list`'s `result.panes`, or `None` when the stdout is not the
+/// envelope. The caller checks the call succeeded first.
+pub(crate) fn parse_pane_list(stdout: &[u8]) -> Option<Vec<HerdrPane>> {
+    serde_json::from_slice::<PaneListEnvelope>(stdout)
+        .ok()
+        .map(|envelope| envelope.result.panes)
 }
 
 fn version_command(bin: &str) -> Option<String> {

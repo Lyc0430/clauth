@@ -182,42 +182,6 @@ fn a_silent_run_reads_never_and_a_finished_one_reads_nothing() {
     assert_eq!(last_output_cell(row_for(&rows, "d-fin-0")), "-");
 }
 
-/// A record written before the liveness fields existed knows nothing about its
-/// own output, and must not be reported as a run that has said nothing.
-///
-/// Driven through real bytes an older server wrote rather than a `RunningSpec`
-/// built here: a spec compiles against whatever the fields are today and proves
-/// nothing about what is on disk.
-#[test]
-fn a_pre_liveness_record_reports_no_output_figure_at_all() {
-    let _home = HomeSandbox::new();
-    let dir = crate::mcp::jobs::jobs_dir().unwrap();
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(
-        dir.join("d-legacy-0.json"),
-        format!(
-            r#"{{"job_id":"d-legacy-0","profile":"work","state":"running","started_at":{}}}"#,
-            NOW - 30_000
-        ),
-    )
-    .unwrap();
-
-    let rows = rows(NOW);
-    let legacy = row_for(&rows, "d-legacy-0");
-
-    assert_eq!(legacy.phase.label(), "running");
-    assert_eq!(
-        last_output_cell(legacy),
-        "-",
-        "unrecorded is not the same fact as `has said nothing`"
-    );
-    assert_eq!(
-        kill_cell(legacy),
-        "-",
-        "that server recorded no deadline to count down to"
-    );
-}
-
 /// Both deadlines render where both exist, and an absent one is clauth knowing
 /// there is none rather than a zero countdown.
 #[test]

@@ -21,12 +21,13 @@ use anyhow::Result;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::actions::{
-    CaptureSnapshot, EnvKeyCollision, capture_into_profile, capture_snapshot, classify_env_key,
-    clear_profile_api_key, clear_profile_credentials, create_blank_profile,
-    create_profile_from_login, delete_profile, duplicate_profile, edit_profile_endpoint,
-    edit_profile_env, edit_profile_model, edit_profile_preset, find_matching_oauth_profile,
-    overwrite_captured_profile, rename_profile, reorder_profile, rotation_guard_for_mutation,
-    switch_off, switch_profile, validate_profile_name,
+    CaptureSnapshot, ChainEditRefusal, ChainRefusal, EnvKeyCollision, capture_into_profile,
+    capture_snapshot, classify_env_key, clear_profile_api_key, clear_profile_credentials,
+    create_blank_profile, create_profile_from_login, delete_profile, duplicate_profile,
+    edit_profile_endpoint, edit_profile_env, edit_profile_model, edit_profile_preset,
+    find_matching_oauth_profile, overwrite_captured_profile, rename_profile, reorder_profile,
+    rotation_guard_for_mutation, set_chain_order, set_member_threshold, set_wrap_off,
+    snapshot_is_empty, switch_off, switch_profile, validate_profile_name,
 };
 use crate::claude::{
     LinkState, adopt_first_login, classify_credentials_link, claude_settings_env_keys,
@@ -34,28 +35,34 @@ use crate::claude::{
     force_snapshot_active_credentials, is_first_login, link_profile_credentials,
     live_credentials_are_shell, read_claude_credentials, snapshot_active_credentials,
 };
-use crate::fallback::{DEFAULT_THRESHOLD, SwitchAction, auto_switch_if_needed, threshold_for};
-use crate::format::format_pct;
+use crate::fallback::{
+    DEFAULT_THRESHOLD, MAX_THRESHOLD, MIN_THRESHOLD, SwitchAction, auto_switch_if_needed,
+    parse_threshold, threshold_for,
+};
+use crate::format::{format_pct, format_threshold_tokens};
 use crate::lock::with_state_lock;
 use crate::lockorder::{RankedGuard, RankedMutex};
 use crate::oauth;
 use crate::profile::{
     AppConfig, ClockFormat, ConfigHandle, ConsoleSite, DivergenceChoice, HerdrSettings,
-    MAX_REFRESH_INTERVAL_MS, MAX_WEEKLY_SWITCH_PCT, MIN_REFRESH_INTERVAL_MS, MIN_WEEKLY_SWITCH_PCT,
-    ModelSettings, PopupWidth, Profile, ProfileName, ReloadFingerprint, ResetDisplay, ThemeName,
-    load_config, reload_fingerprint, save_app_state, save_profile,
+    MAX_CONTEXT_NUDGE_TOKENS, MAX_REFRESH_INTERVAL_MS, MAX_WEEKLY_SWITCH_PCT,
+    MIN_CONTEXT_NUDGE_TOKENS, MIN_REFRESH_INTERVAL_MS, MIN_WEEKLY_SWITCH_PCT, ModelSettings,
+    PopupWidth, Profile, ProfileName, ReloadFingerprint, ResetDisplay, ThemeName, load_config,
+    reload_fingerprint, save_app_state, save_profile,
 };
+use crate::profile_cache::{USAGE_CACHE_FILE, load_profile_cache, profile_cache_mtime_ms};
+use crate::profile_json::{stale_after_ms, usage_cache_file};
 use crate::status::{self, Incident, StatusEvent};
 use crate::tui::theme;
 use crate::update::{self, UpdateEvent};
 use crate::usage::{
-    ActivityStore, FetchStatus, KickBlocks, LastFetchedAt, NextRefreshPerProfile, OpResult,
-    OpResultReceiver, OpResultSender, PendingSwitch, PendingSwitchOff, PollStreaks,
+    ActivityStore, FetchLeg, FetchStatus, KickBlocks, LastFetchedAt, NextRefreshPerProfile,
+    OpResult, OpResultReceiver, OpResultSender, PendingSwitch, PendingSwitchOff, PollStreaks,
     ProfileActivity, RefetchQueue, StartupReceiver, StartupSender, StartupSignal, StatusStore,
-    SuppressedGenericStore, ThirdPartyList, ThirdPartyStatusStore, ThirdPartyUsageStore, TokenList,
-    UsageInfo, UsageStore, any_busy, bootstrap_fetch, bootstrap_third_party, clear_activity,
-    collect_oauth_seed_names, collect_third_party_entries, collect_tokens, is_idle, mark_activity,
-    now_ms, spawn_refresher, switch_gate_in_flight,
+    SuppressedAuthExpiredStore, ThirdPartyList, ThirdPartyStatusStore, ThirdPartyUsageStore,
+    TokenList, UsageInfo, UsageStore, any_busy, bootstrap_fetch, bootstrap_third_party,
+    clear_activity, collect_oauth_seed_names, collect_third_party_entries, collect_tokens, is_idle,
+    mark_activity, now_ms, spawn_refresher, switch_gate_in_flight, windows_maxed,
 };
 
 // ── Shared input field ────────────────────────────────────────────────────────
@@ -236,6 +243,11 @@ pub(crate) enum ConfigRow {
     /// Browser OAuth login: mint fresh tokens into this account (or, on the
     /// `+ new` form, create the account from the login). Async — runs on a worker.
     Login,
+    /// `+ new`-form only: stash the live login Claude Code is using now into
+    /// the draft, like [`ConfigRow::Login`] stashes its mint; `create account`
+    /// commits it. Renders only while the live login is real and unowned
+    /// (`App::unsaved_live_login`).
+    CaptureLogin,
     /// Drop this account's stored OAuth credentials, keeping the profile shell.
     DeleteCreds,
     /// CLA-SPLIT escape hatch: delete this account's `session-token.json`, so
@@ -322,6 +334,12 @@ pub(crate) enum GlobalConfigRow {
     /// Global refresh interval; space cycles presets in-place, ⏎ opens the
     /// custom-value editor (10–3600 s).
     RefreshInterval,
+    /// Context-window nudge threshold in tokens
+    /// (`AppState.context_nudge_threshold_tokens`, default off): at or past it,
+    /// the context hook tells a running session once per value. Space cycles
+    /// off → 300k → 400k → 600k → 900k → off; ⏎ opens the custom-value editor
+    /// (50k-2M tokens, trailing `k` allowed).
+    ContextNudge,
     /// Default action when CC overwrites the credentials symlink. ⏎/space cycles.
     DivergenceDefault,
     /// Opt-in burn-aware auto-switch (`AppState.burn_aware_switching`, issue #8
@@ -405,12 +423,14 @@ pub(crate) struct ConfigDraft {
     /// `+ model override` reveal state. Draft-scoped: a fresh draft starts
     /// collapsed (set overrides still render; unset ones hide behind the chip).
     pub(crate) overrides_expanded: bool,
-    /// A `+ new`-form browser login, held in memory until `create account`
-    /// consumes it (capture-then-commit). Carries the probed account uuid
-    /// alongside the mint so the anchor is seeded under the name the create
-    /// actually commits — the draft's name is still editable until then. Dropped
-    /// with the draft; never set on an existing account's draft.
-    pub(crate) captured_login: Option<Box<crate::oauth_login::LoginOutcome>>,
+    /// A `+ new`-form login stash, held in memory until `create account`
+    /// consumes it (capture-then-commit): the browser mint `+ login` produced,
+    /// or the live login `+ capture current login` snapshotted. Carries the
+    /// probed account uuid alongside the credentials so the anchor is seeded
+    /// under the name the create actually commits — the draft's name is still
+    /// editable until then. Dropped with the draft; never set on an existing
+    /// account's draft.
+    pub(crate) captured_login: Option<DraftLogin>,
 }
 
 impl ConfigDraft {
@@ -435,6 +455,7 @@ impl ConfigDraft {
             | ConfigRow::EnvEntry(_)
             | ConfigRow::EnvAdd
             | ConfigRow::Login
+            | ConfigRow::CaptureLogin
             | ConfigRow::DeleteCreds
             | ConfigRow::ClearSessionToken
             | ConfigRow::Disabled
@@ -461,6 +482,7 @@ impl ConfigDraft {
             | ConfigRow::EnvEntry(_)
             | ConfigRow::EnvAdd
             | ConfigRow::Login
+            | ConfigRow::CaptureLogin
             | ConfigRow::DeleteCreds
             | ConfigRow::ClearSessionToken
             | ConfigRow::Disabled
@@ -468,6 +490,16 @@ impl ConfigDraft {
             | ConfigRow::Create => return None,
         })
     }
+}
+
+/// What a `+ new` draft's stash holds: the browser mint `+ login` finished
+/// with, or the live login `+ capture current login` snapshotted off
+/// `~/.claude/.credentials.json`. One slot — the second stash source replaces
+/// the first, gated on a confirm.
+#[derive(Debug, Clone)]
+pub(crate) enum DraftLogin {
+    Mint(Box<crate::oauth_login::LoginOutcome>),
+    LiveLogin(Box<CaptureSnapshot>),
 }
 
 #[derive(Debug, Clone)]
@@ -518,6 +550,9 @@ pub(crate) enum ConfirmAction {
     /// row), so re-running would silently replace it. Confirm first, then
     /// re-dispatch `start_login`. `bool` = `is_new`, carried to the restart.
     RestartLogin(String, bool),
+    /// Setup `+ new` draft: `+ capture current login` pressed while a browser
+    /// mint is already stashed. Confirm, then stash the snapshot in its place.
+    CaptureOverMintStash(Box<CaptureSnapshot>),
     /// Delete row on a profile with a live `clauth start` session: the unforced
     /// guard in `delete_profile` refuses this, so confirm the deauth risk here
     /// and re-run the delete with `force`.
@@ -931,8 +966,9 @@ pub(crate) enum Modal {
     ActionMenu(ActionMenuState),
     /// Custom env key collides with an existing source; overwrite/keep/cancel.
     EnvCollision(EnvCollisionForm),
-    /// In-flight browser login progress; renders live from [`App::login`].
-    /// esc/q collapse it to the footer indicator — the login keeps running.
+    /// In-flight login progress; renders live from [`App::login`], the inline
+    /// code field ([`LoginSession::paste_field`]) included. esc/q collapse it
+    /// to the footer indicator — the login keeps running.
     Login,
 }
 
@@ -1472,45 +1508,84 @@ pub(crate) enum MainItemKind {
 
 // ── Login session ─────────────────────────────────────────────────────────────
 
-/// An in-flight browser OAuth login. The worker blocks up to 180s in
-/// `oauth_login::login_with`; the UI stays live and applies the result in
-/// `on_tick`. `generation` discards a stale result from a login the user
-/// superseded (esc-cancel or a fresh login start).
+/// An in-flight login. The worker blocks up to the login bound in
+/// `oauth_login` for the first door — the browser callback or a pasted code —
+/// while the UI stays live and applies the result in `on_tick`. `generation`
+/// discards a stale result from a login the user superseded (esc-cancel or a
+/// fresh login start).
 pub(crate) struct LoginSession {
     pub(crate) name: String,
     /// true → the mint lands in the `+ new` draft (capture-then-commit);
     /// false → re-login an existing profile in place (overwrite).
     pub(crate) is_new: bool,
     pub(crate) generation: u64,
-    /// The authorize URL once the worker announces it; shown in the login modal.
+    /// The URL `r` re-opens: an OAuth login's browser link, known at start; the
+    /// console login's page, once its worker announces it.
     pub(crate) url: Option<String>,
     /// Live milestone for the modal's stage line.
     pub(crate) stage: LoginStage,
+    /// The door that delivered the code, as the worker reported it; `Browser`
+    /// until then. The modal's stage copy follows it, so it is never set
+    /// from the UI's own paste: the browser callback may have won first.
+    pub(crate) method: LoginMethod,
+    /// An OAuth login's paste door. `None` for the console login, which has no
+    /// hosted link and no code to paste, so `c` and `p` are inert there.
+    pub(crate) paste: Option<PasteDoor>,
+    /// The login modal's inline code field, open (`Some`) from `p` until esc,
+    /// a good submit, or the door closing. It lives here, not on the modal, so
+    /// it dies with the session and never outlives the door it feeds. The
+    /// typed bytes are a bearer-grade secret until exchanged: `LoginSession`
+    /// derives no `Debug`, so they cannot ride a `{:?}`.
+    pub(crate) paste_field: Option<InputState>,
 }
+
+/// The paste half of an OAuth login: the links `c` copies and a paste is
+/// checked against, and the sender a parsed code goes down to the worker.
+pub(crate) struct PasteDoor {
+    pub(crate) links: crate::oauth_login::LoginLinks,
+    pub(crate) tx: std::sync::mpsc::Sender<crate::oauth_login::ManualCode>,
+}
+
+impl LoginSession {
+    /// The paste door while it can still win: the login is waiting on its
+    /// first code. Once a door delivered one there is nothing to race, and the
+    /// console login never had a door. Every `c`/`p` affordance gates on this.
+    pub(crate) fn open_door(&self) -> Option<&PasteDoor> {
+        match self.stage {
+            LoginStage::WaitingBrowser => self.paste.as_ref(),
+            LoginStage::ExchangingCode(_) | LoginStage::Verifying => None,
+        }
+    }
+}
+
+// Re-exported so the render code and the tests keep addressing it as this
+// module's type: the CLI's login reports the same two doors off the same enum.
+pub(crate) use crate::oauth_login::LoginMethod;
 
 /// Where an in-flight login currently sits, mapped from
 /// [`crate::oauth_login::LoginProgress`] worker events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LoginStage {
-    /// Waiting for the user to finish the browser round-trip.
+    /// Waiting for the first door: the browser round-trip, or a pasted code.
     WaitingBrowser,
-    /// Callback landed; exchanging the code for tokens.
-    ExchangingCode,
+    /// A code landed through this door; exchanging it for tokens.
+    ExchangingCode(LoginMethod),
     /// Tokens minted; verifying them against the API.
     Verifying,
 }
 
-/// Worker→UI login channel payload: the announced URL or a stage bump.
+/// Worker→UI login channel payload: the console login's announced URL, or a
+/// stage bump (the first of which names the door that delivered the code).
 pub(crate) enum LoginEvent {
     Url(String),
     Stage(LoginStage),
 }
 
-/// What a finished login worker produced. Both flows are a browser round-trip
-/// announced through the same [`LoginEvent`] channel and drawn by the same
-/// modal, and they diverge only at apply time: an Anthropic login replaces the
-/// profile's credentials, an Alibaba console login replaces its usage session
-/// and touches nothing else.
+/// What a finished login worker produced. Both flows (the two-door OAuth
+/// login, the Alibaba console) report through the same [`LoginEvent`] channel
+/// and are drawn by the same modal, and they diverge only at apply time: an
+/// Anthropic login replaces the profile's credentials, an Alibaba console login
+/// replaces its usage session and touches nothing else.
 ///
 /// The drain routes on this payload rather than on anything recorded in
 /// [`LoginSession`], so a session and its result cannot disagree about which
@@ -1616,6 +1691,9 @@ pub(crate) struct App {
     /// `Some` while the refresh-interval custom-value field is open (⏎ opens,
     /// owns keyboard). Space/`+`/`-` still cycle the presets when `None`.
     pub(crate) refresh_interval_draft: Option<InputState>,
+    /// In-flight custom value for the Config tab's context-nudge editor
+    /// (`None` = not editing). Same lifecycle as `refresh_interval_draft`.
+    pub(crate) context_nudge_draft: Option<InputState>,
     /// In-flight custom value for the Config tab's weekly-threshold editor
     /// (`None` = not editing). Same lifecycle as `refresh_interval_draft`.
     pub(crate) weekly_threshold_draft: Option<InputState>,
@@ -1629,8 +1707,13 @@ pub(crate) struct App {
     /// Join handle for the update check thread; joined on TUI exit for clean shutdown.
     pub(crate) update_handle: Option<JoinHandle<()>>,
 
-    /// In-flight browser OAuth login (Setup tab); `None` when idle.
+    /// In-flight login worker of any method (Setup tab); `None` when idle.
     pub(crate) login: Option<LoginSession>,
+    /// What the login modal's `c` hands the hosted link to: OSC 52 on the
+    /// terminal's stdout. Replaceable so a test keeps the escape off the
+    /// terminal running the suite, which would take the fixture's link onto
+    /// its clipboard.
+    pub(crate) clipboard: fn(&str) -> std::io::Result<()>,
     /// Monotonic login id; bumped on each start so a superseded worker's result
     /// is discarded when it lands.
     pub(crate) login_generation: u64,
@@ -1703,6 +1786,14 @@ pub(crate) struct App {
     pub(crate) pricing_refresh: std::sync::mpsc::Sender<()>,
 
     pub(crate) last_reload_fp: ReloadFingerprint,
+    /// The live credentials hold a login no profile owns (a login at all, and
+    /// `find_matching_oauth_profile` misses) — the condition the `+ new`
+    /// form's `+ capture current login` row renders on. Recomputed on
+    /// construct, on entering the Setup tab, on config reload (external
+    /// changes), and at every in-TUI mutation that pins `last_reload_fp`
+    /// forward instead of reloading (switch, capture, create, delete, login,
+    /// logout).
+    pub(crate) unsaved_live_login: bool,
     /// Origin of the ambient-animation phase clock; read through [`App::anim_ms`].
     pub(crate) started_at: Instant,
     /// Pinned animation phase for render tests that must sample a specific point
@@ -1761,8 +1852,17 @@ pub(crate) struct App {
     /// file itself belongs to the scheduler's fetch path (`apply_outcome`),
     /// which may be running in another process, so this side is read-only.
     pub(crate) history_cache: HashMap<String, Vec<(u64, UsageInfo)>>,
-    /// Last-known mtime per profile history file, for cache invalidation.
-    pub(crate) history_mtimes: HashMap<String, std::time::SystemTime>,
+    /// Last-seen content fingerprint (byte length, tail hash) per profile
+    /// history file, for cache invalidation.
+    pub(crate) history_fp: HashMap<String, (u64, u64)>,
+
+    /// Cached parsed wallet series per profile from wallet_history.jsonl —
+    /// the balance readings the wallet-burn rate replays. Same discipline as
+    /// [`Self::history_cache`]: the third-party fetch leg is the only writer,
+    /// this side is read-only and re-reads on a fingerprint change.
+    pub(crate) wallet_cache: HashMap<String, Vec<crate::usage::WalletSample>>,
+    /// Last-seen content fingerprint per profile wallet-history file.
+    wallet_fp: HashMap<String, (u64, u64)>,
 
     /// Cached long-lived-token status per profile, keyed by name (absent when a
     /// profile has no sidecar). Read by the Overview render for the `⊘` danger
@@ -1867,6 +1967,29 @@ impl WorkerHandles {
     }
 }
 
+/// A cheap content fingerprint of a series log: its byte length folded with a
+/// hash of its last 256 bytes. The re-read gates key on this instead of the
+/// mtime, because NTFS quantizes file times on windows — an append can land
+/// with a byte-identical `LastWriteTime` (measured 2026-09-13: 4/10 real-box
+/// runs) — and the writer is whichever process holds the fetch lease, so the
+/// mtime is the wrong signal. `None` when the file cannot be read, which
+/// skips the re-read exactly like the old unreadable-mtime path did.
+fn series_fingerprint(path: &std::path::Path) -> Option<(u64, u64)> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    use std::hash::Hasher;
+    use std::io::{Read, Seek, SeekFrom};
+    // Clamped to the file's own start: End(-256) on a file under 256 bytes
+    // seeks before position 0 and errors (measured: EINVAL), which would read
+    // as "unreadable" and silently skip the re-read.
+    file.seek(SeekFrom::Start(len.saturating_sub(256))).ok()?;
+    let mut tail = Vec::with_capacity(256);
+    file.read_to_end(&mut tail).ok()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&tail, &mut hasher);
+    Some((len, hasher.finish()))
+}
+
 impl App {
     pub(crate) fn new(config: AppConfig) -> Self {
         let usage_store: UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
@@ -1894,18 +2017,40 @@ impl App {
         let refresh_interval = Arc::new(AtomicU64::new(config.state.refresh_interval_ms));
 
         let mut history_cache: HashMap<String, Vec<(u64, UsageInfo)>> = HashMap::new();
-        let mut history_mtimes: HashMap<String, std::time::SystemTime> = HashMap::new();
+        let mut history_fp: HashMap<String, (u64, u64)> = HashMap::new();
         for profile in &config.profiles {
             let name = &profile.name;
             let data = crate::profile::load_usage_history(name);
             if !data.is_empty() {
                 if let Ok(path) = crate::profile::profile_history_path(name)
-                    && let Ok(meta) = std::fs::metadata(&path)
-                    && let Ok(mtime) = meta.modified()
+                    && let Some(fp) = series_fingerprint(&path)
                 {
-                    history_mtimes.insert(name.to_string(), mtime);
+                    history_fp.insert(name.to_string(), fp);
                 }
                 history_cache.insert(name.to_string(), data);
+            }
+        }
+
+        // The wallet series mirrors it: same read-only discipline, same
+        // fingerprint invalidation, only the file and the type differ — and
+        // only third-party profiles carry one, so the loop stats no OAuth
+        // profile's absent file.
+        let mut wallet_cache: HashMap<String, Vec<crate::usage::WalletSample>> = HashMap::new();
+        let mut wallet_fp: HashMap<String, (u64, u64)> = HashMap::new();
+        for profile in config
+            .profiles
+            .iter()
+            .filter(|p| p.usage_cache_is_third_party())
+        {
+            let name = &profile.name;
+            let data = crate::profile::load_wallet_history(name);
+            if !data.is_empty() {
+                if let Ok(path) = crate::profile::profile_wallet_history_path(name)
+                    && let Some(fp) = series_fingerprint(&path)
+                {
+                    wallet_fp.insert(name.to_string(), fp);
+                }
+                wallet_cache.insert(name.to_string(), data);
             }
         }
 
@@ -1972,7 +2117,7 @@ impl App {
                 .collect::<Vec<_>>(),
         );
 
-        Self {
+        let mut app = Self {
             config: Arc::new(RankedMutex::new(config)),
             usage_store,
             usage_status,
@@ -2011,6 +2156,7 @@ impl App {
             fallback_weekly_draft: None,
             global_config_cursor: 0,
             refresh_interval_draft: None,
+            context_nudge_draft: None,
             weekly_threshold_draft: None,
             config_draft: None,
             chain_cursor: 0,
@@ -2019,6 +2165,7 @@ impl App {
             update_results,
             update_handle,
             login: None,
+            clipboard: crate::platform::copy_to_clipboard_osc52,
             login_generation: 0,
             login_event_rx,
             login_event_tx,
@@ -2046,6 +2193,7 @@ impl App {
             pricing_events,
             pricing_refresh,
             last_reload_fp: reload_fingerprint(),
+            unsaved_live_login: false,
             started_at: Instant::now(),
             #[cfg(test)]
             anim_phase_ms: None,
@@ -2065,11 +2213,15 @@ impl App {
             tab_activity: [None; Tab::ALL.len()],
             bell_fired: HashMap::new(),
             history_cache,
-            history_mtimes,
+            history_fp,
+            wallet_cache,
+            wallet_fp,
             session_tokens,
             live_sessions,
             last_live_sessions_refresh: Some(Instant::now()),
-        }
+        };
+        app.refresh_unsaved_live_login();
+        app
     }
 
     /// herdr-mode landing, applied at construction (before the first paint):
@@ -2175,6 +2327,7 @@ impl App {
             );
             bootstrap_third_party(
                 &h.third_party_usage_store,
+                &h.usage_store,
                 &h.third_party_status,
                 &h.last_fetched,
                 &third_party,
@@ -2194,24 +2347,25 @@ impl App {
             // past). The first tick re-marks (idempotent); each worker flips itself
             // to Fetching when its request fires and clears on landing.
             let now = now_ms();
-            let due_now: Vec<String> = match h.last_fetched.lock() {
+            let due_now: Vec<crate::usage::LegKey> = match h.last_fetched.lock() {
                 Ok(lf) => snapshot
                     .iter()
-                    .map(|e| e.name.to_string())
-                    .chain(third_party.iter().map(|e| e.name.to_string()))
-                    .filter(|n| {
-                        lf.get(n)
-                            .is_none_or(|t| t.as_millis().saturating_add(interval_ms) <= now)
+                    .map(|e| FetchLeg::OAuth.key(e.name.clone()))
+                    .chain(
+                        third_party
+                            .iter()
+                            .map(|e| FetchLeg::ThirdParty.key(e.name.clone())),
+                    )
+                    .filter(|key| {
+                        lf.get(key).is_none_or(|stamp| {
+                            stamp.as_millis().saturating_add(interval_ms) <= now
+                        })
                     })
                     .collect(),
                 Err(_) => Vec::new(),
             };
-            for name in &due_now {
-                mark_activity(
-                    &h.activity,
-                    &ProfileName::from(name.clone()),
-                    ProfileActivity::Queued,
-                );
+            for key in &due_now {
+                crate::usage::mark_fetch_activity(&h.activity, key, ProfileActivity::Queued);
             }
         });
     }
@@ -2243,6 +2397,34 @@ impl App {
         .flatten()
     }
 
+    /// The funded wallet's burn rate for `profile`, computed from the
+    /// in-memory `wallet_cache` — never touches disk. The wallet twin of
+    /// [`Self::active_burn_rate`]: the Usage tab's balance row and the
+    /// overview drains line read it here, so neither render pass reads
+    /// `wallet_history.jsonl` while holding the config guard.
+    pub(crate) fn wallet_rate_for(&self, profile: &Profile) -> Option<crate::usage::WalletRate> {
+        let stats = profile.third_party_usage.as_ref()?;
+        crate::usage::funded_wallet_rate(
+            self.wallet_cache
+                .get(profile.name.as_str())
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]),
+            &stats.rows,
+        )
+    }
+
+    /// The profile's peak-rate state off the live price table, sampled now:
+    /// the recognized provider's own store rows — peak/off-peak is a property
+    /// of the provider, never of the pinned models. `None` when no table is
+    /// loaded or the profile has no store-backed provider (OAuth, generic
+    /// endpoints, OpenRouter) — the Usage tab's `pricing` row and the
+    /// overview's `▲` marker then do not render.
+    pub(crate) fn peak_state_for(&self, profile: &Profile) -> Option<crate::pricing::PeakState> {
+        self.price_table
+            .as_ref()
+            .and_then(|t| t.peak_state_for_profile(profile.provider, now_ms() as i64 / 1000))
+    }
+
     /// UI-thread tail of bootstrap: rebuilds token snapshot, starts scheduler,
     /// applies usage, runs startup auto-switch. No HTTP.
     fn finish_bootstrap(&mut self) {
@@ -2258,13 +2440,13 @@ impl App {
         if !self.fetch_lease.acquire() {
             return;
         }
+        // Run the startup one-shot on Fresh data only. A Cached seed's numbers
+        // are unverified — stale in either direction — so switching on them
+        // risks acting on a window the account no longer has. Stale profiles
+        // are due on the scheduler's first tick, which fetches then
+        // auto-switches off the corrected numbers.
         let switched = {
-            let mut cfg = self.config();
-            // Run the startup one-shot on Fresh data only. A Cached seed's numbers
-            // are unverified — stale in either direction — so switching on them
-            // risks acting on a window the account no longer has. Stale profiles
-            // are due on the scheduler's first tick, which fetches then
-            // auto-switches off the corrected numbers.
+            let cfg = self.config();
             let active_profile = cfg.state.active_profile.as_ref().and_then(|n| cfg.find(n));
             let active_fresh =
                 active_profile.is_some_and(|p| p.fetch_status == Some(FetchStatus::Fresh));
@@ -2275,7 +2457,8 @@ impl App {
                     let usage = p.usage.as_ref()?;
                     self.active_burn_rate(&p.name, usage)
                 });
-                auto_switch_if_needed(&mut cfg, rate).ok().flatten()
+                drop(cfg);
+                auto_switch_if_needed(&self.config, rate).ok().flatten()
             } else {
                 None
             }
@@ -2310,10 +2493,11 @@ impl App {
     /// Bundle scheduler `Arc`s and launch the background refresher.
     fn start_scheduler(&self) {
         let h = WorkerHandles::from_app(self);
-        // Session-scoped suppressed-generic set: rebuilt fresh each TUI launch,
+        // Session-scoped suppressed-auth-expired set: rebuilt fresh each TUI launch,
         // dropped on exit. Purely scheduler-internal — the App never touches it
         // (manual refresh clears suppression via the shared forced queue).
-        let suppressed_generic: SuppressedGenericStore = Arc::new(RankedMutex::new(HashMap::new()));
+        let suppressed_auth_expired: SuppressedAuthExpiredStore =
+            Arc::new(RankedMutex::new(HashMap::new()));
         spawn_refresher(
             h.config,
             h.usage_tokens,
@@ -2332,7 +2516,7 @@ impl App {
             h.third_party_tokens,
             h.third_party_usage_store,
             h.third_party_status,
-            suppressed_generic,
+            suppressed_auth_expired,
             h.shutting_down,
             // Single-fetcher lease (#27): the TUI competes for `usage-fetch.lock`
             // like any instance, standing its refresher down while another holds
@@ -2347,12 +2531,16 @@ impl App {
         // Third-party stores BEFORE OAuth stores: ranks 270/280 < 300/350.
         let bells;
         let history_names;
+        let wallet_names;
         {
             let third_party_map = self.third_party_usage_store.lock().ok();
             let third_party_status_map = self.third_party_status.lock().ok();
             let info_map = self.usage_store.lock().ok();
             let status_map = self.usage_status.lock().ok();
             let mut cfg = self.config();
+            let now = now_ms();
+            let interval_ms = cfg.state.refresh_interval_ms;
+            let refresh_spent_accounts = cfg.state.refresh_spent_accounts;
             for p in &mut cfg.profiles {
                 if let Some(s) = info_map.as_ref() {
                     p.usage = s.get(p.name.as_str()).cloned();
@@ -2370,6 +2558,51 @@ impl App {
                 {
                     p.third_party_usage = s.get(p.name.as_str()).cloned();
                 }
+                // A third-party member's bars are its usage snapshot. The
+                // scheduler writes the snapshot and mirrors its derived window
+                // into the usage store as two separate acquisitions, so an
+                // apply landing between them still owes this account a figure:
+                // derive it off the snapshot. The `is_none` guard keeps that a
+                // fallback — the store's own entry, whichever leg wrote it,
+                // always wins.
+                if p.usage.is_none()
+                    && let Some(stats) = p.third_party_usage.as_ref()
+                {
+                    p.usage = stats.to_usage_info();
+                }
+
+                // #74 degraded cue: cache age past the derived threshold reads
+                // stale, independent of fetch_status. Same threshold, same
+                // maxed-window exemption, and same age source as
+                // `status.json`'s `age_stale` arm — the exemption reads the
+                // DISK cache (`load_profile_cache`), never the live store,
+                // because the two can diverge on a spent account the
+                // scheduler dropped from its due set: reading the store there
+                // would publish the exact disagreement the exemption exists
+                // to prevent. OAuth goes through the one age contract
+                // (`oauth_age`), the same one `status.json` and the MCP payloads
+                // read; third-party figures keep the cache mtime.
+                let oauth_usage = if p.usage_cache_is_third_party() {
+                    None
+                } else {
+                    load_profile_cache::<UsageInfo>(&p.name, USAGE_CACHE_FILE)
+                };
+                let spent_skipped = !refresh_spent_accounts
+                    && oauth_usage
+                        .as_ref()
+                        .is_some_and(|u| windows_maxed(u, (now / 1000) as i64));
+                let past_threshold = if p.usage_cache_is_third_party() {
+                    profile_cache_mtime_ms(&p.name, usage_cache_file(p))
+                        .is_some_and(|at| now.saturating_sub(at) > stale_after_ms(interval_ms))
+                } else {
+                    crate::profile_json::oauth_age(oauth_usage.as_ref(), now).is_stale(
+                        stale_after_ms(interval_ms),
+                        oauth_usage
+                            .as_ref()
+                            .is_some_and(crate::profile_json::publishes_a_live_window),
+                    )
+                };
+                p.usage_stale = !spent_skipped && past_threshold;
             }
 
             bells = cfg
@@ -2391,6 +2624,14 @@ impl App {
                 .profiles
                 .iter()
                 .filter(|p| p.usage.is_some())
+                .map(|p| p.name.to_string())
+                .collect::<Vec<_>>();
+            // Only third-party profiles carry a wallet series, so the refresh
+            // walk below stats no OAuth profile's absent file.
+            wallet_names = cfg
+                .profiles
+                .iter()
+                .filter(|p| p.usage_cache_is_third_party())
                 .map(|p| p.name.to_string())
                 .collect::<Vec<_>>();
         }
@@ -2421,19 +2662,47 @@ impl App {
 
         // Re-read any history log that changed on disk. The file is written by
         // whichever process holds the fetch lease — this one or a headless
-        // daemon — so an mtime bump is the only signal that new samples landed.
+        // daemon — so its CONTENT is the only reliable signal that new samples
+        // landed: NTFS quantizes file times on windows and a rapid append can
+        // land with a byte-identical mtime (measured 2026-09-13: 4/10 real-box
+        // runs), so an mtime gate silently serves a stale series there.
         for name in &history_names {
             if let Ok(path) = crate::profile::profile_history_path(&ProfileName::from(name.clone()))
-                && let Ok(mtime) = path.metadata().and_then(|m| m.modified())
-                && self.history_mtimes.get(name) != Some(&mtime)
+                && let Some(fp) = series_fingerprint(&path)
+                && self.history_fp.get(name) != Some(&fp)
             {
                 self.history_cache.insert(
                     name.clone(),
                     crate::profile::load_usage_history(&ProfileName::from(name.clone())),
                 );
-                self.history_mtimes.insert(name.clone(), mtime);
+                self.history_fp.insert(name.clone(), fp);
             }
         }
+        // The wallet series re-reads the same way.
+        for name in &wallet_names {
+            if let Ok(path) =
+                crate::profile::profile_wallet_history_path(&ProfileName::from(name.clone()))
+                && let Some(fp) = series_fingerprint(&path)
+                && self.wallet_fp.get(name) != Some(&fp)
+            {
+                self.wallet_cache.insert(
+                    name.clone(),
+                    crate::profile::load_wallet_history(&ProfileName::from(name.clone())),
+                );
+                self.wallet_fp.insert(name.clone(), fp);
+            }
+        }
+    }
+
+    /// Refresh `unsaved_live_login` off the live credentials + current config.
+    /// Flips come from the live file moving (a login minted elsewhere), the
+    /// profile set changing, or a switch swapping the live file — every site
+    /// that can produce one calls this (see the field's list).
+    pub(crate) fn refresh_unsaved_live_login(&mut self) {
+        self.unsaved_live_login = capture_snapshot().is_ok_and(|snap| {
+            !snapshot_is_empty(&snap)
+                && find_matching_oauth_profile(&self.config(), snap.credentials.as_ref()).is_none()
+        });
     }
 
     /// Reload config if state mtime changed. Returns true on reload.
@@ -2468,6 +2737,7 @@ impl App {
                     .expect("third_party_tokens mutex poisoned") = third_party;
             }
             self.session_tokens = collect_session_tokens(&names);
+            self.refresh_unsaved_live_login();
             true
         } else {
             false
@@ -2519,12 +2789,18 @@ impl App {
     /// `/profile` TTL so the next fetch re-pulls plan/tier — set for an explicit
     /// single-profile refresh, cleared for the bulk refresh-all.
     fn enqueue_refetch(&self, name: &ProfileName, refresh_plan: bool) {
-        // Light a pending spinner immediately so the UI reflects the keypress.
-        // Only when idle — don't clobber an in-flight switch/refresh marker. The
-        // next tick's worker flips Queued→Fetching when its request fires; a name
-        // no leg owns is cleared by the tick's orphan sweep.
-        if is_idle(&self.activity, name) {
-            mark_activity(&self.activity, name, ProfileActivity::Queued);
+        // Light the selected cache leg immediately. Account-scoped refresh/switch
+        // work stays untouched and outranks this marker in the render helper.
+        let leg = {
+            let config = self.config();
+            config.find(name).map(crate::usage::FetchLeg::for_profile)
+        };
+        if let Some(leg) = leg {
+            crate::usage::mark_fetch_activity(
+                &self.activity,
+                &leg.key(name.clone()),
+                ProfileActivity::Queued,
+            );
         }
         if refresh_plan {
             crate::usage::expire_profile_ttl(name);
@@ -2743,6 +3019,12 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
     // Same for the Config-tab refresh-interval custom-value editor.
     if app.tab == Tab::Config && app.refresh_interval_draft.is_some() {
         handle_refresh_interval_edit_key(app, key);
+        return;
+    }
+
+    // Same for the Config-tab context-nudge custom-value editor.
+    if app.tab == Tab::Config && app.context_nudge_draft.is_some() {
+        handle_context_nudge_edit_key(app, key);
         return;
     }
 
@@ -3045,6 +3327,10 @@ fn switch_tab(app: &mut App, tab: Tab) {
         Tab::Setup => {
             app.config_focus = ConfigFocus::Profiles;
             app.config_action_cursor = 0;
+            // The `+ new` form's capture row renders off this flag, and a
+            // login may have been minted (or saved) elsewhere since the last
+            // Setup visit.
+            app.refresh_unsaved_live_login();
         }
         Tab::Fallback => {
             app.chain_cursor = chain_cursor_for_profile(app);
@@ -3057,6 +3343,7 @@ fn switch_tab(app: &mut App, tab: Tab) {
         Tab::Config => {
             app.global_config_cursor = 0;
             app.refresh_interval_draft = None;
+            app.context_nudge_draft = None;
             app.weekly_threshold_draft = None;
         }
         Tab::Status => {
@@ -3396,24 +3683,18 @@ fn push_herdr_knob_change() {
     });
 }
 
-/// `bin pane list` → pane ids, parsed leniently: an unknown payload shape (a
-/// herdr release moving a field) reads as no panes rather than a wrong one.
-/// Bounded at `crate::herdr::PROBE_TIMEOUT` — a hung herdr delays the push
-/// worker, never the key handling.
+/// `bin pane list` → pane ids, parsed by the one typed parser the pane
+/// reporter shares: an unknown payload shape (a herdr release moving a field)
+/// reads as no panes rather than a wrong one. Bounded at
+/// `crate::herdr::PROBE_TIMEOUT` — a hung herdr delays the push worker, never
+/// the key handling.
 fn herdr_pane_ids(bin: &str) -> Option<Vec<String>> {
     let out = crate::herdr::bounded_output(bin, &["pane", "list"], &[])?;
     if !out.status.success() {
         return None;
     }
-    let root: serde_json::Value =
-        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).ok()?;
-    let panes = root.get("result")?.get("panes")?.as_array()?;
-    Some(
-        panes
-            .iter()
-            .filter_map(|pane| pane.get("pane_id")?.as_str().map(str::to_string))
-            .collect(),
-    )
+    crate::herdr::parse_pane_list(&out.stdout)
+        .map(|panes| panes.into_iter().map(|pane| pane.pane_id).collect())
 }
 
 /// Re-run `report-profile.sh` for one pane with the pane id set and the
@@ -4304,15 +4585,13 @@ fn finalize_switch(app: &mut App, name: &ProfileName) {
         prompt_divergence(app, active.to_string(), "switching");
         return;
     }
-    let result = {
-        let mut cfg = app.config();
-        switch_profile(&mut cfg, name)
-    };
+    let result = switch_profile(&app.config, name);
     clear_activity(&app.activity, name);
     match result {
         Ok(()) => {
             app.refresh_tokens();
             app.last_reload_fp = reload_fingerprint();
+            app.refresh_unsaved_live_login();
             app.toast(ToastKind::Success, format!("switched to '{name}'"));
         }
         Err(e) => app.toast(ToastKind::Danger, format!("switch failed\n{e}")),
@@ -4330,14 +4609,12 @@ fn perform_switch_off(app: &mut App) {
         prompt_divergence(app, active.to_string(), "switching off");
         return;
     }
-    let result = {
-        let mut cfg = app.config();
-        switch_off(&mut cfg)
-    };
+    let result = switch_off(&app.config);
     match result {
         Ok(()) => {
             app.refresh_tokens();
             app.last_reload_fp = reload_fingerprint();
+            app.refresh_unsaved_live_login();
             app.toast(
                 ToastKind::Warning,
                 "all accounts spent\nswitched off to halt usage".to_string(),
@@ -4359,11 +4636,7 @@ fn capture_live_or_toast(app: &mut App) -> Option<CaptureSnapshot> {
             return None;
         }
     };
-    let has_oauth = snapshot
-        .credentials
-        .as_ref()
-        .is_some_and(|c| c.claude_ai_oauth.is_some());
-    if !has_oauth && snapshot.base_url.is_none() && snapshot.api_key.is_none() {
+    if snapshot_is_empty(&snapshot) {
         // The Keychain caveat only makes sense on macOS, where a live login can
         // hide in the Keychain clauth doesn't read; elsewhere it's noise.
         let msg = if cfg!(target_os = "macos") {
@@ -4399,6 +4672,32 @@ fn begin_capture(app: &mut App, from_divergence: bool) {
         input: InputState::new(""),
         from_divergence,
     }));
+}
+
+/// Land a login stash in the live `+ new` draft (`+ login`'s finished mint, or
+/// `+ capture current login`'s snapshot) and park the cursor on `create
+/// account`, the one step left. Returns `false` when the form was closed in
+/// between, so the caller can warn about the dropped round-trip.
+fn stash_new_form_login(app: &mut App, stash: DraftLogin) -> bool {
+    let stashed = match app
+        .config_draft
+        .as_mut()
+        .filter(|d| d.editing_name.is_none())
+    {
+        Some(draft) => {
+            draft.captured_login = Some(stash);
+            true
+        }
+        None => false,
+    };
+    if stashed
+        && let Some(idx) = config_rows(app)
+            .iter()
+            .position(|r| *r == ConfigRow::Create)
+    {
+        app.config_action_cursor = idx;
+    }
+    stashed
 }
 
 // ── Chain screen ──────────────────────────────────────────────────────────────
@@ -4447,13 +4746,14 @@ pub(crate) const FALLBACK_ROWS: [FallbackRow; 8] = [
 /// Rows on the program-wide Config tab, in display order. Related knobs sit
 /// together instead of interleaving halt above detection; [`GlobalConfigRow::band`]
 /// names each run, and the renderer turns a band change into an eyebrow header.
-pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 15] = [
+pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 16] = [
     GlobalConfigRow::Theme,
     GlobalConfigRow::ResetShape,
     GlobalConfigRow::ClockNotation,
     GlobalConfigRow::DivergenceDefault,
     GlobalConfigRow::RefreshInterval,
     GlobalConfigRow::RefreshSpentAccounts,
+    GlobalConfigRow::ContextNudge,
     GlobalConfigRow::AutoStartQueue,
     GlobalConfigRow::PreemptiveRotation,
     GlobalConfigRow::WeeklyThreshold,
@@ -4478,6 +4778,7 @@ impl GlobalConfigRow {
             GlobalConfigRow::DivergenceDefault
             | GlobalConfigRow::RefreshInterval
             | GlobalConfigRow::RefreshSpentAccounts
+            | GlobalConfigRow::ContextNudge
             | GlobalConfigRow::AutoStartQueue
             | GlobalConfigRow::PreemptiveRotation => "scheduler",
             GlobalConfigRow::WeeklyThreshold
@@ -4494,8 +4795,9 @@ impl GlobalConfigRow {
 
 /// Config tab keymap (enumerated rows only, per the unified value-row grammar):
 /// ↑↓ walks rows; space cycles every row's value forward, wrapping the top
-/// value back to the first; ⏎ opens the refresh-interval and weekly-threshold
-/// custom-value editors and otherwise mirrors space. No row here binds `+`/`-`
+/// value back to the first; ⏎ opens the refresh-interval, context-nudge and
+/// weekly-threshold custom-value editors and otherwise mirrors space. No row
+/// here binds `+`/`-`
 /// (that's reserved for the Fallback tab's continuous `rotate at` threshold).
 fn handle_global_config_key(app: &mut App, key: KeyEvent) {
     let last = GLOBAL_CONFIG_ROWS.len() - 1;
@@ -4522,6 +4824,8 @@ fn handle_global_config_key(app: &mut App, key: KeyEvent) {
             let row = GLOBAL_CONFIG_ROWS[app.global_config_cursor];
             if row == GlobalConfigRow::RefreshInterval {
                 begin_refresh_interval_edit(app);
+            } else if row == GlobalConfigRow::ContextNudge {
+                begin_context_nudge_edit(app);
             } else if row == GlobalConfigRow::WeeklyThreshold {
                 begin_weekly_threshold_edit(app);
             } else {
@@ -4550,6 +4854,7 @@ fn run_global_config_row(app: &mut App, row: GlobalConfigRow) {
         GlobalConfigRow::SwitchOffWhenSpent => toggle_wrap_off(app),
         GlobalConfigRow::WeeklyThreshold => step_weekly_threshold(app),
         GlobalConfigRow::RefreshInterval => step_refresh_interval(app),
+        GlobalConfigRow::ContextNudge => step_context_nudge(app),
         GlobalConfigRow::BurnAware => toggle_burn_aware_switching(app),
         // Inert while burn-aware is off (rendered dimmed): the floor/cap only
         // shape the projection, which the static path never runs.
@@ -4790,8 +5095,8 @@ fn cycle_divergence_default(app: &mut App) {
 fn toggle_wrap_off(app: &mut App) {
     {
         let mut cfg = app.config();
-        cfg.state.switch_off_when_spent = !cfg.state.switch_off_when_spent;
-        let _ = save_app_state(&cfg.state);
+        let next = !cfg.state.switch_off_when_spent;
+        let _ = set_wrap_off(&mut cfg, next);
     }
     app.last_reload_fp = reload_fingerprint();
 }
@@ -4960,6 +5265,25 @@ fn step_refresh_interval(app: &mut App) {
     app.last_reload_fp = reload_fingerprint();
 }
 
+/// Advance the context-nudge threshold to the next-greater preset, wrapping
+/// past the top back to off — space always cycles forward, never clamps. A
+/// custom off-ladder value lands on the next preset above it, not one past it;
+/// past the top preset it wraps to off, the cycle's first step.
+fn step_context_nudge(app: &mut App) {
+    const PRESETS: [u64; 4] = [300_000, 400_000, 600_000, 900_000];
+    let current = app.config().state.context_nudge_threshold_tokens();
+    let next = match current {
+        None => Some(PRESETS[0]),
+        Some(v) => PRESETS.iter().copied().find(|&p| p > v),
+    };
+    {
+        let mut cfg = app.config();
+        cfg.state.context_nudge_threshold_tokens = next;
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_reload_fp = reload_fingerprint();
+}
+
 /// Open the inline custom-value editor for the global refresh interval, seeded
 /// with the current value in whole seconds. ⏎ commits, ⎋ discards.
 fn begin_refresh_interval_edit(app: &mut App) {
@@ -5008,6 +5332,70 @@ pub(crate) fn parse_refresh_secs(raw: &str) -> Option<u64> {
     (MIN_REFRESH_INTERVAL_MS..=MAX_REFRESH_INTERVAL_MS)
         .contains(&ms)
         .then_some(ms)
+}
+
+/// Open the inline custom-value editor for the context-nudge threshold, seeded
+/// with the current value in the row's own vocabulary (`600k`); from off it
+/// seeds the first preset, the value one space-press would pick. ⏎ commits, ⎋
+/// discards.
+fn begin_context_nudge_edit(app: &mut App) {
+    let current = app.config().state.context_nudge_threshold_tokens();
+    let seed = match current {
+        None => String::from("300k"),
+        // Exact millions seed in k form (`2000k`), never `2M`: the parser's
+        // grammar takes digits or a single trailing k, so an M-form seed
+        // would open the editor in DANGER.
+        Some(v) if v.is_multiple_of(1_000_000) => format!("{}k", v / 1000),
+        Some(v) => format_threshold_tokens(v),
+    };
+    app.context_nudge_draft = Some(InputState::new(&seed));
+}
+
+/// Keystrokes while the context-nudge field is open: ⏎ saves, ⎋ discards.
+fn handle_context_nudge_edit_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => app.context_nudge_draft = None,
+        KeyCode::Enter => commit_context_nudge_edit(app),
+        _ => {
+            if let Some(input) = app.context_nudge_draft.as_mut() {
+                apply_input_edit(input, key);
+            }
+        }
+    }
+}
+
+/// Parse and persist the typed threshold. Invalid input keeps the draft open
+/// so the Config card's inline Invalid-input treatment (DANGER value +
+/// `└ 50k-2M tokens` tooltip) stays on screen until corrected — no toast.
+fn commit_context_nudge_edit(app: &mut App) {
+    let Some(raw) = app.context_nudge_draft.as_ref().map(|i| i.trimmed()) else {
+        return;
+    };
+    let Some(tokens) = parse_context_nudge_tokens(raw) else {
+        return;
+    };
+    {
+        let mut cfg = app.config();
+        cfg.state.context_nudge_threshold_tokens = Some(tokens);
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_reload_fp = reload_fingerprint();
+    app.context_nudge_draft = None;
+}
+
+/// A typed context-nudge threshold is valid only as whole tokens — a plain
+/// number or one with a single trailing `k` (case-insensitive, `600k` → 600
+/// 000) — that lands in `MIN_CONTEXT_NUDGE_TOKENS..=MAX_CONTEXT_NUDGE_TOKENS`.
+/// Shared by the commit path and the Config card's inline check.
+pub(crate) fn parse_context_nudge_tokens(raw: &str) -> Option<u64> {
+    let (digits, scale) = match raw.strip_suffix(['k', 'K']) {
+        Some(prefix) => (prefix, 1_000u64),
+        None => (raw, 1u64),
+    };
+    let tokens = digits.parse::<u64>().ok()?.checked_mul(scale)?;
+    (MIN_CONTEXT_NUDGE_TOKENS..=MAX_CONTEXT_NUDGE_TOKENS)
+        .contains(&tokens)
+        .then_some(tokens)
 }
 
 /// Step the weekly exhaustion line forward through the preset ladder (space on
@@ -5260,15 +5648,26 @@ fn reorder_chain_member(app: &mut App, delta: i32) {
         return;
     };
     let target = pos as i32 + delta;
-    {
+    let landed = {
         let mut cfg = app.config();
         if target < 0 || target as usize >= cfg.state.fallback_chain.len() {
             return;
         }
-        cfg.state.fallback_chain.swap(pos, target as usize);
-        let _ = save_app_state(&cfg.state);
+        let mut order = cfg.state.fallback_chain.clone();
+        order.swap(pos, target as usize);
+        let moved = order[target as usize].clone();
+        set_chain_order(&mut cfg, &order)
+            .ok()
+            .and_then(|saved| saved.iter().position(|n| n == &moved))
+    };
+    // The cursor follows the member only when the reorder landed: a failed save
+    // (a held state flock, a disk error) leaves the chain and the selection
+    // where they were, so the next keypress still acts on the same member. The
+    // saved order may have dropped an unresolvable entry, so the member's new
+    // slot is looked up, never assumed.
+    if let Some(slot) = landed {
+        app.chain_cursor = slot;
     }
-    app.chain_cursor = target as usize;
 }
 
 /// ⏎/space on a member detail row: threshold opens inline editor; remove arms
@@ -5338,14 +5737,6 @@ fn commit_threshold_edit(app: &mut App) {
     };
     write_threshold(app, value);
     app.fallback_threshold_draft = None;
-}
-
-/// A typed threshold is valid only as a number in `0..=100`. Shared by the
-/// commit path and the detail card's inline Invalid-input check.
-pub(crate) fn parse_threshold(raw: &str) -> Option<f64> {
-    raw.parse::<f64>()
-        .ok()
-        .filter(|v| (0.0..=100.0).contains(v))
 }
 
 /// Keystrokes while the `weekly at` override field is open: ⏎ saves, ⎋ discards.
@@ -5505,23 +5896,28 @@ fn write_threshold(app: &mut App, value: f64) {
         let Some(name) = cfg.state.fallback_chain.get(pos).cloned() else {
             return;
         };
-        match cfg.find_mut(&name) {
-            Some(profile) => {
-                profile.fallback_threshold = Some(value);
-                save_profile(profile).err()
-            }
-            None => None,
-        }
+        set_member_threshold(&mut cfg, &name, value).err()
     };
-    if let Some(e) = save_err {
-        app.toast(ToastKind::Danger, format!("save failed\n{e}"));
+    let Some(e) = save_err else {
+        return;
+    };
+    // A member whose roster row vanished inside the reload window is the
+    // baseline's silent no-op: the account has already left, so there is
+    // nothing to save and no wire code belongs on an operator toast.
+    if let Some(ChainEditRefusal {
+        code: ChainRefusal::ProfileNotFound,
+        ..
+    }) = e.downcast_ref::<ChainEditRefusal>()
+    {
+        return;
     }
+    app.toast(ToastKind::Danger, format!("save failed\n{e}"));
 }
 
 /// Step the threshold by `delta`, clamped to 0..=100, and persist.
 fn adjust_threshold(app: &mut App, delta: f64) {
     if let Some(current) = selected_threshold(app) {
-        write_threshold(app, (current + delta).clamp(0.0, 100.0));
+        write_threshold(app, (current + delta).clamp(MIN_THRESHOLD, MAX_THRESHOLD));
     }
 }
 
@@ -5815,25 +6211,124 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
         Modal::DivergenceTarget(_) => handle_divergence_target_key(app, key),
         Modal::ActionMenu(_) => handle_action_menu_key(app, key),
         Modal::EnvCollision(_) => handle_env_collision_key(app, key),
-        Modal::Login => match key.code {
-            // Re-fire the browser open. The URL exists once the worker announced
-            // it; before that there is nothing to open, so `r` is a no-op.
-            KeyCode::Char('r') | KeyCode::Char('R') => {
-                if let Some(url) = app.login.as_ref().and_then(|s| s.url.clone()) {
-                    match crate::platform::open_url(&url) {
-                        Ok(()) => app.toast(ToastKind::Info, "opening your browser…"),
-                        Err(_) => app.toast(ToastKind::Danger, "couldn't open the browser"),
-                    }
+        Modal::Login => handle_login_modal_key(app, key),
+    }
+}
+
+/// Keys on the login progress modal. While the inline code field is open it
+/// owns every key ([`handle_paste_field_key`]). Otherwise `r` re-opens the URL
+/// the session holds; `c` copies the hosted link and `p` opens the code field
+/// on the session, both only while the paste door is open
+/// ([`LoginSession::open_door`]), so the console login and a login already
+/// exchanging a code leave them inert. esc/q/⏎ collapse to the footer
+/// indicator; the login keeps running (the generation is untouched). A real
+/// cancel is the top-level esc once collapsed; ⏎ on the login row re-expands.
+fn handle_login_modal_key(app: &mut App, key: KeyEvent) {
+    if app.login.as_ref().is_some_and(|s| s.paste_field.is_some()) {
+        handle_paste_field_key(app, key);
+        return;
+    }
+    match key.code {
+        // The console login's URL exists once its worker announced it; before
+        // that there is nothing to open, so `r` is a no-op.
+        KeyCode::Char('r' | 'R') => {
+            if let Some(url) = app.login.as_ref().and_then(|s| s.url.clone()) {
+                match crate::platform::open_url(&url) {
+                    Ok(()) => app.toast(ToastKind::Info, "opening your browser…"),
+                    Err(_) => app.toast(ToastKind::Danger, "couldn't open the browser"),
                 }
             }
-            // Collapse to the footer indicator; the login keeps running (the
-            // generation is untouched). A real cancel is the top-level esc
-            // once collapsed; ⏎ on the login row re-expands.
-            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
-                app.modals.pop();
+        }
+        // OSC 52 lands the link on the LOCAL terminal's clipboard, even over ssh.
+        KeyCode::Char('c' | 'C') => {
+            let link = app
+                .login
+                .as_ref()
+                .and_then(LoginSession::open_door)
+                .map(|door| door.links.hosted_url.clone());
+            if let Some(link) = link {
+                match (app.clipboard)(&link) {
+                    Ok(()) => app.toast(ToastKind::Info, "link copied to clipboard"),
+                    Err(e) => app.toast(
+                        ToastKind::Danger,
+                        format!("couldn't copy the link to clipboard\n{e}"),
+                    ),
+                }
             }
-            _ => {}
-        },
+        }
+        KeyCode::Char('p' | 'P') => {
+            if let Some(session) = app.login.as_mut()
+                && session.open_door().is_some()
+            {
+                session.paste_field = Some(InputState::new(""));
+            }
+        }
+        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+            app.modals.pop();
+        }
+        _ => {}
+    }
+}
+
+/// Keys while the login modal's code field is open. It is a text field, so
+/// every printable character is data (`c`, `q` and `p` included — a paste
+/// arrives as one key event per character), capped at `MANUAL_CODE_MAX` at the
+/// door so a runaway paste is never held first and refused after. esc clears
+/// the field and restores the `p  paste code` row (the modal stays); ⏎ submits.
+fn handle_paste_field_key(app: &mut App, key: KeyEvent) {
+    let Some(session) = app.login.as_mut() else {
+        return;
+    };
+    let Some(field) = session.paste_field.as_mut() else {
+        return;
+    };
+    match key.code {
+        KeyCode::Esc => session.paste_field = None,
+        KeyCode::Enter => submit_paste_code(app),
+        KeyCode::Char(_) if field.value.len() >= crate::oauth_login::MANUAL_CODE_MAX => {}
+        _ => apply_input_edit(field, key),
+    }
+}
+
+/// ⏎ on the code field: parse against the running login's own `state`, send a
+/// good code down its paste door and close the field. The session's method is
+/// NOT flipped here: the browser callback may already have won, so the
+/// worker's own `ExchangingCode` report is what names the door. A bad paste is
+/// cleared, not kept: a corrected paste appended to leftover bytes would pass
+/// the shape check and burn the exchange. A field whose door closed meanwhile
+/// (the drain closes it a tick later) has nothing to feed and closes too.
+fn submit_paste_code(app: &mut App) {
+    let Some(session) = app.login.as_mut() else {
+        return;
+    };
+    let Some(raw) = session
+        .paste_field
+        .as_ref()
+        .map(|field| field.trimmed().to_string())
+    else {
+        return;
+    };
+    if raw.is_empty() {
+        return;
+    }
+    let Some(door) = session.open_door() else {
+        session.paste_field = None;
+        return;
+    };
+    match door.links.parse(&raw) {
+        Ok(code) => {
+            // A late paste is never read: `run` already picked its door, so
+            // the send's result is discarded; the result drain handles the rest.
+            let _ = door.tx.send(code);
+            session.paste_field = None;
+        }
+        Err(e) => {
+            session.paste_field = Some(InputState::new(""));
+            app.toast(
+                ToastKind::Danger,
+                format!("{}\ncleared, paste the code again", e.message()),
+            );
+        }
     }
 }
 
@@ -5902,6 +6397,7 @@ pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
                     scoped.push(OpenProviderConsole);
                 }
             } else if app.profile_cursor >= app.profile_count() {
+                // `+ new` only: its draft is what a preset stamps.
                 context = app
                     .config_draft
                     .as_ref()
@@ -6226,6 +6722,13 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
         if draft.is_none_or(|d| d.base_url.value.trim().is_empty()) {
             rows.push(ConfigRow::Login);
         }
+        // The live-login capture row sits right below `+ login` and survives
+        // into api mode (`+ login` doesn't): a live setup can be an endpoint
+        // too. Hidden while the live login is saved or absent — nothing to
+        // capture.
+        if app.unsaved_live_login {
+            rows.push(ConfigRow::CaptureLogin);
+        }
         rows.push(ConfigRow::Create);
         return rows;
     }
@@ -6350,7 +6853,7 @@ fn start_new_account(app: &mut App) {
     app.config_focus = ConfigFocus::Actions;
 }
 
-fn build_draft_new() -> ConfigDraft {
+pub(crate) fn build_draft_new() -> ConfigDraft {
     ConfigDraft {
         editing_name: None,
         name: InputState::new(""),
@@ -6401,12 +6904,12 @@ fn build_draft_existing(app: &App, name: &ProfileName) -> ConfigDraft {
 
 /// Back out of the Setup detail pane, dropping the draft. A `+ new` draft
 /// holding a minted login loses it with the form — say so instead of
-/// discarding a real browser round-trip silently.
+/// discarding a real browser round-trip silently. A stashed live login needs
+/// no warning: re-pressing the row re-reads the same file.
 fn leave_config_detail(app: &mut App) {
-    let mint_dropped = app
-        .config_draft
-        .as_ref()
-        .is_some_and(|d| d.editing_name.is_none() && d.captured_login.is_some());
+    let mint_dropped = app.config_draft.as_ref().is_some_and(|d| {
+        d.editing_name.is_none() && matches!(d.captured_login, Some(DraftLogin::Mint(_)))
+    });
     app.config_focus = ConfigFocus::Profiles;
     app.config_draft = None;
     if mint_dropped {
@@ -6523,45 +7026,58 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                 }
                 LoginRowFlow::OauthMint => {}
             }
-            let target = match editing {
-                Some(name) => Some((name, false)),
-                None => {
-                    let typed = app
-                        .config_draft
-                        .as_ref()
-                        .map(|d| d.name.trimmed().to_string())
-                        .unwrap_or_default();
-                    let validation = {
-                        let cfg = app.config();
-                        validate_profile_name(&typed, &cfg.names(), None)
-                    };
-                    match validation {
-                        Ok(()) => Some((typed, true)),
-                        Err(e) => {
-                            app.toast(ToastKind::Danger, format!("{e}"));
-                            None
-                        }
-                    }
-                }
+            if let Some((name, is_new)) = oauth_login_target(app, editing) {
+                begin_oauth_login(app, name, is_new);
+            }
+        }
+        ConfigRow::CaptureLogin => {
+            // The row only renders on the `+ new` form, where a draft is always
+            // open; the empty and owned states are what HIDE it, so hitting one
+            // here means the live file moved since the flag was computed.
+            let Some(snapshot) = capture_live_or_toast(app) else {
+                // The file emptied since the flag was computed; drop the row.
+                app.refresh_unsaved_live_login();
+                return;
             };
-            if let Some((name, is_new)) = target {
-                // A stashed mint (the `✓ logged in` done-state) makes ⏎ a
-                // stash-replacing re-login; gate it so it can't drop the capture
-                // silently. Only the `+ new` draft ever holds a stash.
-                let has_stash = app
-                    .config_draft
-                    .as_ref()
-                    .is_some_and(|d| d.captured_login.is_some());
-                if has_stash {
-                    app.modals.push(Modal::Confirm(ConfirmState {
-                        message: "replace the captured login?".to_string(),
-                        detail: Some("the login you already captured will be dropped".to_string()),
-                        choice: false,
-                        on_confirm: ConfirmAction::RestartLogin(name, is_new),
-                    }));
-                } else {
-                    start_login(app, name, is_new);
-                }
+            let owner = {
+                let cfg = app.config();
+                find_matching_oauth_profile(&cfg, snapshot.credentials.as_ref())
+            };
+            if let Some(owner) = owner {
+                // Refuse, not confirm: a NEW account over a login another
+                // profile owns is the duplicate `overwrite_captured_profile`
+                // exists to prevent, and this row's whole purpose is the
+                // unowned case.
+                app.toast(
+                    ToastKind::Danger,
+                    format!(
+                        "these credentials already belong to '{owner}'\nswitch to it with:  clauth {owner}"
+                    ),
+                );
+                app.refresh_unsaved_live_login();
+                return;
+            }
+            let mint_stashed = app.config_draft.as_ref().is_some_and(|d| {
+                d.editing_name.is_none() && matches!(d.captured_login, Some(DraftLogin::Mint(_)))
+            });
+            if mint_stashed {
+                // The browser round-trip a mint cost can't be redone for free;
+                // gate replacing it, mirroring the re-login gate above.
+                app.modals.push(Modal::Confirm(ConfirmState {
+                    message: "replace the logged-in mint?".to_string(),
+                    detail: Some(
+                        "the browser login you already captured will be dropped".to_string(),
+                    ),
+                    choice: false,
+                    on_confirm: ConfirmAction::CaptureOverMintStash(Box::new(snapshot)),
+                }));
+                return;
+            }
+            if stash_new_form_login(app, DraftLogin::LiveLogin(Box::new(snapshot))) {
+                app.toast(
+                    ToastKind::Success,
+                    "current login captured\ncreate account saves it",
+                );
             }
         }
         ConfigRow::DeleteCreds => {
@@ -6841,43 +7357,52 @@ fn start_api_relogin(app: &mut App) {
     }
 }
 
-/// Kick a browser OAuth login on a worker. `is_new` → the mint lands in the
-/// `+ new` draft when it arrives; else an existing profile is overwritten
-/// (divergence-gated in `apply_login`). A second ⏎ while one is in flight
-/// re-expands the progress modal instead of starting another login.
+/// Kick an OAuth login: mint it on this thread (no network), open the browser
+/// on its loopback link, and hand the wait to a worker that takes the first
+/// door — the loopback callback, or a code pasted through the login modal.
+/// `is_new` → the mint lands in the `+ new` draft when it arrives; else an
+/// existing profile is overwritten (divergence-gated in `apply_login`). A
+/// second ⏎ while one is in flight re-expands the progress modal instead of
+/// starting another login.
 fn start_login(app: &mut App, name: String, is_new: bool) {
-    if let Some(session) = app.login.as_ref() {
-        // A ⏎ aimed at a different account can't start a second login — say
-        // so instead of silently re-showing the in-flight session's modal.
-        if session.name != name || session.is_new != is_new {
-            app.toast(
-                ToastKind::Warning,
-                format!("a login for '{}' is already in progress", session.name),
-            );
-        }
-        open_login_modal(app);
+    if login_in_flight(app, &name, is_new) {
         return;
     }
+    let pending = match crate::oauth_login::begin_login() {
+        Ok(pending) => pending,
+        Err(e) => {
+            app.toast(
+                ToastKind::Danger,
+                format!("login failed\n{}", e.user_message()),
+            );
+            return;
+        }
+    };
+    let links = pending.links().clone();
+    let (paste_tx, paste_rx) = std::sync::mpsc::channel();
     app.login_generation += 1;
     let generation = app.login_generation;
     app.login = Some(LoginSession {
         name,
         is_new,
         generation,
-        url: None,
+        url: Some(links.browser_url.clone()),
         stage: LoginStage::WaitingBrowser,
+        method: LoginMethod::Browser,
+        paste: Some(PasteDoor {
+            links,
+            tx: paste_tx,
+        }),
+        paste_field: None,
     });
+    // Best effort: the modal's `r` retries it, and the hosted link is the
+    // way in where no browser can open.
+    let _ = crate::platform::open_url(&pending.links().browser_url);
     let event_tx = app.login_event_tx.clone();
     let result_tx = app.login_result_tx.clone();
     spawn_worker(move || {
-        let res = crate::oauth_login::login_with(|progress| {
-            use crate::oauth_login::LoginProgress;
-            let event = match progress {
-                LoginProgress::AuthorizeUrl(url) => LoginEvent::Url(url.to_string()),
-                LoginProgress::ExchangingCode => LoginEvent::Stage(LoginStage::ExchangingCode),
-                LoginProgress::Verifying => LoginEvent::Stage(LoginStage::Verifying),
-            };
-            let _ = event_tx.send((generation, event));
+        let res = pending.run(paste_rx, |progress| {
+            let _ = event_tx.send((generation, login_event(progress)));
         });
         // A toast, not stderr: the canned line without the HTTP status. The
         // status is in `~/.clauth/clauth.log` via the exchange's `logline!`.
@@ -6912,36 +7437,104 @@ pub(crate) enum LoginRowFlow {
 }
 
 /// Resolve the `log in` row's flow for the draft's account (`None` on the
-/// `+ new` form, which can only mint).
+/// `+ new` form, which can only mint; so does an unknown name, which has no
+/// key to re-enter). The console verdict is [`Profile::console_login_target`],
+/// shared with the row's hint and label so the copy cannot describe a
+/// different flow than the one ⏎ runs.
 fn login_row_flow(app: &App, editing: Option<&str>) -> LoginRowFlow {
     let Some(name) = editing else {
         return LoginRowFlow::OauthMint;
     };
-    let name = ProfileName::from(name);
-    if let Some((site, region)) = console_login_target(app, &name) {
+    let cfg = app.config();
+    let Some(p) = cfg.find(&ProfileName::from(name)) else {
+        return LoginRowFlow::OauthMint;
+    };
+    if let Some((site, region)) = p.console_login_target() {
         return LoginRowFlow::Console { site, region };
     }
-    let cfg = app.config();
-    match cfg.find(&name) {
-        Some(p) if !p.login_is_oauth() => LoginRowFlow::ApiKey,
-        _ => LoginRowFlow::OauthMint,
+    if p.login_is_oauth() {
+        LoginRowFlow::OauthMint
+    } else {
+        LoginRowFlow::ApiKey
     }
 }
 
-/// Which console the `log in` row would capture a session from for `name`, or
-/// `None` when that row runs one of its other two flows (an api-key re-entry or
-/// an Anthropic browser mint).
-///
-/// Split out of the row so the decision is readable without starting a browser
-/// round-trip: driving the row itself binds a loopback listener and opens a
-/// browser, which is not something a test may do.
-///
-/// The verdict itself is [`Profile::console_login_target`], shared with the row's
-/// hint and label so the copy cannot describe a different flow than the one ⏎
-/// runs.
-fn console_login_target(app: &App, name: &ProfileName) -> Option<(ConsoleSite, &'static str)> {
-    let cfg = app.config();
-    cfg.find(name)?.console_login_target()
+/// The account an OAuth-mint row acts on: an existing draft re-logs in place;
+/// the `+ new` form validates its typed name now and creates on mint. `None`
+/// (with a toast) when the typed name is unusable.
+fn oauth_login_target(app: &mut App, editing: Option<String>) -> Option<(String, bool)> {
+    match editing {
+        Some(name) => Some((name, false)),
+        None => {
+            let typed = app
+                .config_draft
+                .as_ref()
+                .map(|d| d.name.trimmed().to_string())
+                .unwrap_or_default();
+            let validation = {
+                let cfg = app.config();
+                validate_profile_name(&typed, &cfg.names(), None)
+            };
+            match validation {
+                Ok(()) => Some((typed, true)),
+                Err(e) => {
+                    app.toast(ToastKind::Danger, format!("{e}"));
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// The OAuth-mint head of the login row: nothing starts while a login is in
+/// flight, and a captured stash is confirmed before it is dropped.
+fn begin_oauth_login(app: &mut App, name: String, is_new: bool) {
+    if login_in_flight(app, &name, is_new) {
+        return;
+    }
+    // A stash (the `✓ logged in` / `✓ captured current login` done-states)
+    // makes ⏎ a stash-replacing re-login; gate it so it can't drop the capture
+    // silently. Only the `+ new` draft ever holds a stash.
+    let has_stash = app
+        .config_draft
+        .as_ref()
+        .is_some_and(|d| d.captured_login.is_some());
+    if has_stash {
+        app.modals.push(Modal::Confirm(ConfirmState {
+            message: "replace the captured login?".to_string(),
+            detail: Some("the login you already captured will be dropped".to_string()),
+            choice: false,
+            on_confirm: ConfirmAction::RestartLogin(name, is_new),
+        }));
+    } else {
+        start_login(app, name, is_new);
+    }
+}
+
+/// A login already running owns the progress modal: a ⏎ aimed at the same
+/// target re-expands it, one aimed elsewhere says so. Either way nothing new
+/// starts — a second worker would race the first for `app.login`.
+fn login_in_flight(app: &mut App, name: &str, is_new: bool) -> bool {
+    let Some(session) = app.login.as_ref() else {
+        return false;
+    };
+    if session.name != name || session.is_new != is_new {
+        app.toast(
+            ToastKind::Warning,
+            format!("a login for '{}' is already in progress", session.name),
+        );
+    }
+    open_login_modal(app);
+    true
+}
+
+/// The worker→UI event for one `oauth_login` milestone.
+fn login_event(progress: crate::oauth_login::LoginProgress) -> LoginEvent {
+    use crate::oauth_login::LoginProgress;
+    match progress {
+        LoginProgress::ExchangingCode(door) => LoginEvent::Stage(LoginStage::ExchangingCode(door)),
+        LoginProgress::Verifying => LoginEvent::Stage(LoginStage::Verifying),
+    }
 }
 
 /// Kick the Alibaba console login on a worker — the same browser round-trip and
@@ -6975,6 +7568,9 @@ fn start_console_login(app: &mut App, name: String, site: ConsoleSite, region: &
         generation,
         url: None,
         stage: LoginStage::WaitingBrowser,
+        method: LoginMethod::Browser,
+        paste: None,
+        paste_field: None,
     });
     let event_tx = app.login_event_tx.clone();
     let result_tx = app.login_result_tx.clone();
@@ -7167,6 +7763,7 @@ fn row_committed_value(profile: Option<&Profile>, name: &ProfileName, row: Confi
         | ConfigRow::ModelOverrideAdd
         | ConfigRow::EnvAdd
         | ConfigRow::Login
+        | ConfigRow::CaptureLogin
         | ConfigRow::DeleteCreds
         | ConfigRow::ClearSessionToken
         | ConfigRow::Disabled
@@ -7274,6 +7871,7 @@ fn apply_model_field(models: &mut ModelSettings, field: ConfigRow, raw: &str) {
         | ConfigRow::EnvEntry(_)
         | ConfigRow::EnvAdd
         | ConfigRow::Login
+        | ConfigRow::CaptureLogin
         | ConfigRow::DeleteCreds
         | ConfigRow::ClearSessionToken
         | ConfigRow::Disabled
@@ -7737,12 +8335,17 @@ fn commit_new_account(app: &mut App) {
     let model = d.model.trimmed_some();
     // A draft-held mint only makes sense for an OAuth create; a typed base url
     // flipped the form to API mode (login row hidden), so the mint is dropped.
-    let captured = if base_url.is_none() {
-        d.captured_login.clone()
-    } else {
-        None
+    // The live-login stash commits in BOTH modes — a live setup can be an
+    // endpoint — and the snapshot's own endpoint wins over anything typed.
+    let captured = match d.captured_login.clone() {
+        live @ Some(DraftLogin::LiveLogin(_)) => live,
+        mint @ Some(DraftLogin::Mint(_)) if base_url.is_none() => mint,
+        _ => None,
     };
-    let mint_discarded = base_url.is_some() && d.captured_login.is_some();
+    let mint_discarded =
+        base_url.is_some() && matches!(d.captured_login, Some(DraftLogin::Mint(_)));
+    let endpoint_overridden =
+        base_url.is_some() && matches!(d.captured_login, Some(DraftLogin::LiveLogin(_)));
     let validation = {
         let cfg = app.config();
         validate_profile_name(&name, &cfg.names(), None)
@@ -7755,9 +8358,14 @@ fn commit_new_account(app: &mut App) {
     let result = {
         let mut cfg = app.config();
         match captured {
+            // Both stashes parked the login's uuid until this moment fixed the
+            // name; the commit functions anchor it on the create.
+            Some(DraftLogin::LiveLogin(snapshot)) => {
+                capture_into_profile(&mut cfg, name.clone(), model, *snapshot)
+            }
             // The draft parked the login's uuid until this moment fixed the
             // name; `create_profile_from_login` anchors it on the commit.
-            Some(login) => create_profile_from_login(
+            Some(DraftLogin::Mint(login)) => create_profile_from_login(
                 &mut cfg,
                 name.clone(),
                 model,
@@ -7775,8 +8383,15 @@ fn commit_new_account(app: &mut App) {
                     "base url set\nthe captured oauth login was discarded",
                 );
             }
+            if endpoint_overridden {
+                app.toast(
+                    ToastKind::Info,
+                    "created from the captured current login\nthe typed endpoint fields were not used",
+                );
+            }
             app.refresh_tokens();
             app.last_reload_fp = reload_fingerprint();
+            app.refresh_unsaved_live_login();
             let new_idx = app
                 .config()
                 .profiles
@@ -7823,6 +8438,7 @@ fn finish_delete(app: &mut App, name: &ProfileName, force: bool) {
         Ok(()) => {
             app.refresh_tokens();
             app.last_reload_fp = reload_fingerprint();
+            app.refresh_unsaved_live_login();
             app.config_focus = ConfigFocus::Profiles;
             app.config_draft = None;
             app.clamp_profile_cursor();
@@ -8405,6 +9021,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 Ok(()) => {
                     app.refresh_tokens();
                     app.last_reload_fp = reload_fingerprint();
+                    app.refresh_unsaved_live_login();
                     app.toast(
                         ToastKind::Success,
                         format!("overwrote '{name}' with the captured login"),
@@ -8451,6 +9068,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 Ok(()) => {
                     app.refresh_tokens();
                     app.last_reload_fp = reload_fingerprint();
+                    app.refresh_unsaved_live_login();
                     app.toast(
                         ToastKind::Success,
                         format!("saved the login into '{name}', now active"),
@@ -8542,6 +9160,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             match force_link_profile_credentials(&name) {
                 Ok(()) => {
                     app.refresh_tokens();
+                    app.refresh_unsaved_live_login();
                     app.toast(
                         ToastKind::Success,
                         format!("relinked credentials to '{name}'"),
@@ -8605,12 +9224,21 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 Ok(()) => {
                     app.refresh_tokens();
                     app.last_reload_fp = reload_fingerprint();
+                    app.refresh_unsaved_live_login();
                     app.toast(ToastKind::Success, format!("logged out of '{name}'"));
                 }
                 Err(e) => app.toast(ToastKind::Danger, format!("log out failed\n{e}")),
             }
         }
         ConfirmAction::RestartLogin(name, is_new) => start_login(app, name, is_new),
+        ConfirmAction::CaptureOverMintStash(snapshot) => {
+            if stash_new_form_login(app, DraftLogin::LiveLogin(snapshot)) {
+                app.toast(
+                    ToastKind::Success,
+                    "current login captured\ncreate account saves it",
+                );
+            }
+        }
         ConfirmAction::DeleteLiveSession(name) => {
             finish_delete(app, &ProfileName::from(name), true)
         }
@@ -8881,12 +9509,13 @@ fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
             }
             let result = {
                 let mut cfg = app.config();
-                capture_into_profile(&mut cfg, name.clone(), *snapshot)
+                capture_into_profile(&mut cfg, name.clone(), None, *snapshot)
             };
             match result {
                 Ok(()) => {
                     app.refresh_tokens();
                     app.last_reload_fp = reload_fingerprint();
+                    app.refresh_unsaved_live_login();
                     app.toast(ToastKind::Success, format!("captured '{name}'"));
                 }
                 Err(e) => app.toast(ToastKind::Danger, format!("capture failed\n{e}")),
@@ -9075,8 +9704,12 @@ fn drain_pricing_events(app: &mut App) {
     }
 }
 
-/// Drain the login worker: track URL/stage events, and on a result apply it
-/// (stash or overwrite) — discarding a stale result from a superseded login.
+/// Drain the login worker: track URL/stage events (the door rides the first
+/// stage bump, and only the worker's report may set it — a paste sent a moment
+/// after the browser callback landed lost), and on a result apply it (stash or
+/// overwrite) — discarding a stale result from a superseded login. A stage
+/// bump that closes the paste door closes the code field with it: a code typed
+/// after the browser callback won has no door to reach.
 fn drain_login_events(app: &mut App) {
     while let Ok((generation, event)) = app.login_event_rx.try_recv() {
         if let Some(session) = app.login.as_mut()
@@ -9084,7 +9717,15 @@ fn drain_login_events(app: &mut App) {
         {
             match event {
                 LoginEvent::Url(url) => session.url = Some(url),
-                LoginEvent::Stage(stage) => session.stage = stage,
+                LoginEvent::Stage(stage) => {
+                    if let LoginStage::ExchangingCode(door) = stage {
+                        session.method = door;
+                    }
+                    session.stage = stage;
+                    if session.open_door().is_none() {
+                        session.paste_field = None;
+                    }
+                }
             }
         }
     }
@@ -9119,25 +9760,8 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
         // the mint lives only in the draft, so without one it is dropped. The
         // anchor waits for `create account`: the draft's name is still editable,
         // so the profile this login belongs to has no final name yet.
-        let stashed = match app
-            .config_draft
-            .as_mut()
-            .filter(|d| d.editing_name.is_none())
-        {
-            Some(draft) => {
-                draft.captured_login = Some(Box::new(outcome));
-                true
-            }
-            None => false,
-        };
+        let stashed = stash_new_form_login(app, DraftLogin::Mint(Box::new(outcome)));
         if stashed {
-            // Land the cursor on `create account`, the one step left.
-            if let Some(idx) = config_rows(app)
-                .iter()
-                .position(|r| *r == ConfigRow::Create)
-            {
-                app.config_action_cursor = idx;
-            }
             app.toast(ToastKind::Success, "logged in\ncreate account saves it");
         } else {
             app.toast(
@@ -9191,9 +9815,9 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
             message: format!("replace the stored credentials for '{}'?", session.name),
             detail: Some(
                 if keeps_endpoint {
-                    "a fresh browser login finished for this account. the old tokens are dropped; chain slot, env, model settings, and its endpoint and api key stay."
+                    "a fresh login finished for this account. the old tokens are dropped; chain slot, env, model settings, and its endpoint and api key stay."
                 } else {
-                    "a fresh browser login finished for this account. the old tokens are dropped; chain slot, env, and model settings stay."
+                    "a fresh login finished for this account. the old tokens are dropped; chain slot, env, and model settings stay."
                 }
                 .to_string(),
             ),
@@ -9210,6 +9834,7 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
         Ok(()) => {
             app.refresh_tokens();
             app.last_reload_fp = reload_fingerprint();
+            app.refresh_unsaved_live_login();
             app.toast(ToastKind::Success, format!("logged in '{}'", session.name));
         }
         Err(e) => app.toast(ToastKind::Danger, format!("login failed\n{e}")),
@@ -9469,11 +10094,9 @@ fn update_banner(app: &mut App) {
 fn drain_op_results(app: &mut App) {
     let mut needs_token_snapshot_rebuild = false;
     while let Ok(OpResult { name, outcome }) = app.op_results.try_recv() {
-        if let Ok(mut a) = app.activity.lock()
-            && a.get(&name).copied() == Some(ProfileActivity::Refreshing)
-        {
-            a.remove(&name);
-        }
+        // The rotation marker alone: this result arrives a tick or more after
+        // its worker returned, so the OAuth leg may already belong to a refetch.
+        crate::usage::end_rotation(&app.activity, &ProfileName::from(name.clone()));
         match outcome {
             Ok(()) => {
                 needs_token_snapshot_rebuild = true;
@@ -9590,6 +10213,14 @@ fn poll_credentials_divergence(app: &mut App) {
     if !app.modals.is_empty() {
         return;
     }
+    // The reload fingerprint never stats the live credentials file, so a login
+    // CC itself minted mid-session is invisible to every other refresh site.
+    // This poll already reads at 1Hz; while the Setup tab is open it also
+    // refreshes the `+ capture current login` row's flag — zero accounts is
+    // that row's own onboarding window.
+    if app.tab == Tab::Setup {
+        app.refresh_unsaved_live_login();
+    }
     let Some(active) = app.config().state.active_profile.as_ref().cloned() else {
         app.divergence_pending = None;
         return;
@@ -9617,6 +10248,7 @@ fn poll_credentials_divergence(app: &mut App) {
             Ok(()) => {
                 app.refresh_tokens();
                 app.last_reload_fp = reload_fingerprint();
+                app.refresh_unsaved_live_login();
                 app.toast(ToastKind::Success, format!("saved login into '{active}'"));
             }
             Err(e) => app.toast(ToastKind::Danger, format!("adopt failed\n{e}")),

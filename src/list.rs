@@ -59,12 +59,16 @@ struct Row {
     /// surfaces cannot drift.
     keyless: bool,
     canceled: bool,
-    /// Label for a usage credential that is dead and will not self-heal
-    /// (`fetch_status: "AuthExpired"`), or `None` when it is fine. This table
-    /// has no freshness column, so without the suffix the stale window
-    /// percentages above read as ordinary live numbers.
+    /// The entry's distrusted-reading flag, rendered as `(stale)`.
+    stale: bool,
+    /// Labels for dead credentials the operator must act on. Two sources that
+    /// can both fire on one hybrid (an OAuth pair plus a provider endpoint):
+    /// `auth_status: "broken"` (the OAuth credential is dead — re-auth) and
+    /// `fetch_status: "AuthExpired"` (the usage credential is dead and will not
+    /// self-heal). This table has no freshness column, so without the suffix
+    /// the stale window percentages above read as ordinary live numbers.
     ///
-    /// Three labels, because the state has three causes and they want
+    /// Three fetch labels, because that state has three causes and they want
     /// different actions: a stored session lapsed (`login expired`), none was
     /// ever stored (`login needed`), or an api key the provider rejected
     /// (`key rejected`). An api-key account reaches the second the moment it
@@ -72,12 +76,30 @@ struct Row {
     /// "expired" would tell that operator to renew something they never had;
     /// a non-Alibaba account reaches only the third, since it has no session
     /// to lapse.
-    usage_login: Option<&'static str>,
+    usage_login: [Option<&'static str>; 2],
 }
 
 impl Row {
     fn from_entry(config: &AppConfig, entry: &ProfileEntry) -> Row {
         let typed_name = &entry.name;
+        // A third-party account renders its own headroom in these columns —
+        // its live cached bars, or the wallet a scalar provider publishes —
+        // rather than the store-derived windows the walk judges (owner ruling
+        // 2026-09-09 row 3, unchanged for the accounts whose provider now
+        // publishes 5h/7d windows: the columns stay the provider's figures).
+        let (five_h, seven_d) = match config.find(typed_name) {
+            Some(p) if p.usage_cache_is_third_party() => {
+                let (five, seven) = crate::profile_json::third_party_columns(p);
+                (
+                    five.unwrap_or_else(|| "-".to_string()),
+                    seven.unwrap_or_else(|| "-".to_string()),
+                )
+            }
+            _ => (
+                window_pct(&entry.windows, crate::usage::LABEL_5H),
+                window_pct(&entry.windows, crate::usage::LABEL_7D),
+            ),
+        };
         Row {
             marker: if entry.active { '*' } else { ' ' },
             name: entry.name.as_str().to_string(),
@@ -86,48 +108,63 @@ impl Row {
                 .as_deref()
                 .unwrap_or(entry.provider.as_str())
                 .to_string(),
-            five_h: window_pct(&entry.windows, crate::usage::LABEL_5H),
-            seven_d: window_pct(&entry.windows, crate::usage::LABEL_7D),
+            five_h,
+            seven_d,
             endpoint: entry.base_url.as_deref().unwrap_or("-").to_string(),
             disabled: config.find(typed_name).is_some_and(|p| p.is_disabled()),
             keyless: config
                 .find(typed_name)
                 .is_some_and(|p| p.is_third_party() && !crate::claude::has_inference_auth(p)),
             canceled: crate::profile_json::is_canceled_cached(typed_name),
-            usage_login: (entry.fetch_status.as_deref() == Some("AuthExpired")).then(|| {
-                let p = config.find(typed_name);
-                if p.is_some_and(|p| p.console.is_some()) {
-                    "login expired"
-                } else if p.is_some_and(|p| p.provider != Some(crate::providers::Provider::Alibaba))
-                {
-                    // No console session can be the cause here: the verdict can
-                    // only come from a 401 on the api key.
-                    "key rejected"
-                } else {
-                    "login needed"
-                }
-            }),
+            stale: entry.stale,
+            usage_login: [
+                (entry.auth_status.as_str() == "broken").then_some("login expired"),
+                (entry.fetch_status.as_deref() == Some("AuthExpired")).then(|| {
+                    let p = config.find(typed_name);
+                    if p.is_some_and(|p| p.console.is_some()) {
+                        "login expired"
+                    } else if p
+                        .is_some_and(|p| p.provider != Some(crate::providers::Provider::Alibaba))
+                    {
+                        // No console session can be the cause here: the verdict can
+                        // only come from a 401 on the api key.
+                        "key rejected"
+                    } else {
+                        "login needed"
+                    }
+                }),
+            ],
         }
     }
 
     /// Trailing state marker: `(disabled)`, `(keyless)`, `(canceled)`,
-    /// `(login expired)` /
+    /// `(stale)`, `(login expired)` /
     /// `(login needed)`, or
     /// any combination. All render rather than one winning — an operator usually
     /// disables an account BECAUSE it died, so letting `disabled` mask
     /// `canceled` is the erasure the Fallback tab's stacked pills already exist
-    /// to prevent. This table has no status column, so the suffix is the only
-    /// place any of these facts can appear.
+    /// to prevent. One exception: the two dead-credential sources can render
+    /// the SAME label (`login expired` from a broken OAuth pair and from a
+    /// lapsed console), and the identical label twice says nothing the once
+    /// does, so adjacent duplicates collapse. This table has no status column,
+    /// so the suffix is the only place any of these facts can appear.
     fn state_suffix(&self) -> String {
-        let states: Vec<&str> = [
+        let mut states: Vec<&str> = [
             (self.disabled, "disabled"),
             (self.keyless, "keyless"),
             (self.canceled, "canceled"),
+            (self.stale, "stale"),
         ]
         .into_iter()
         .filter_map(|(on, label)| on.then_some(label))
-        .chain(self.usage_login)
         .collect();
+        for label in self.usage_login {
+            if let Some(l) = label
+                && !states.contains(&l)
+            {
+                states.push(l);
+            }
+        }
         if states.is_empty() {
             return String::new();
         }

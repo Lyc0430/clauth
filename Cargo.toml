@@ -1,6 +1,6 @@
 [package]
 name = "clauth"
-version = "0.15.1"
+version = "0.15.2"
 edition = "2024"
 description = "Manage multiple Claude Code accounts, monitor 5h/7d usage with configurable auto-switch and delegation with an MCP plugin. CLI + TUI."
 license = "MIT"
@@ -14,10 +14,11 @@ categories = ["command-line-utilities", "development-tools"]
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache", "underline-color"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
-toml = "1.1.4"
+utoipa = { version = "5.5", features = ["preserve_order"] } # serde_json already carries preserve_order here, so the schema lists properties in the order the body serializes them
+toml = "1.1.6"
 anyhow = "1.0.104"
-dirs = "6.0.0"
-ureq = "3.4.0"
+dirs = "7.0.0"
+ureq = "3.4.2"
 self-replace = "1.5.0"
 signal-hook = "0.4.4"
 tempfile = "3.27.0"
@@ -36,18 +37,18 @@ rpassword = "7.5.4"
 # tree via rmcp → schemars; only the `clock` feature is new, which adds
 # `iana-time-zone` for the zone lookup. Its `unsafe` stays inside chrono.
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
-rmcp = { version = "3.2.0", features = ["server", "macros", "transport-io"] }
+rmcp = { version = "3.4.0", features = ["server", "macros", "transport-io"] }
 # Filesystem event watcher — drives credential/config reconcile off inotify /
 # FSEvents instead of wall-clock polling. Non-recursive watches only.
 notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
-# Multi-producer multi-consumer channels with select!. Already pulled in as a
-# transitive dep of notify; pinned here so the watchdog loop can use
-# crossbeam_channel::select! to multiplex events, fallback timer, and shutdown.
-crossbeam-channel = "0.5.16"
+# Multi-producer multi-consumer channels with select!; the watchdog loop
+# multiplexes events, fallback timer, and shutdown through
+# crossbeam_channel::select!.
+crossbeam-channel = "0.5.17"
 # `time` is what `enable_all()` needs to arm the timer rmcp's service loop
 # starts — without it the MCP server panics right after its first reply. It
-# reaches the graph transitively via rmcp → tokio-util today; pinned here so a
-# dependency dropping it fails the build instead of the stdio session.
+# reaches the graph transitively via rmcp's own tokio dependency today; pinned
+# here so a dependency dropping it fails the build instead of the stdio session.
 tokio = { version = "1.53.1", features = ["rt", "io-std", "time"] }
 # `CancellationToken` — the type rmcp puts on `RequestContext.ct` and fires when
 # a client sends `notifications/cancelled`. rmcp awaits the tool handler bare
@@ -61,12 +62,35 @@ regex = "1.13.1"
 # the per-subcommand prose wrapping to the real terminal width instead of the
 # hand-padded block it replaced; it adds only `terminal_size` (rustix is already
 # in the tree via crossterm).
-clap = { version = "4.6.6", features = ["derive", "wrap_help"] }
+clap = { version = "4.6.7", features = ["derive", "wrap_help"] }
 # agentgear `PluginHost` derive + lifecycle: the Plugin tab's one-key install and
 # the SessionStart self-heal hook drive `claude plugin` through it instead of a
 # copy-paste hint. Default features (derive + claude + embed) are exactly the
 # claude-only host clauth is; the embedded tree is the committed `plugins/` dir.
 agentgear = "0.1.3"
+
+# `clauth daemon --listen` (the TLS REST API). Every crate below already sits
+# in the lock graph via ureq, and all but `hex` are already compiled in the
+# tree; these lines only promote them to direct deps, so the listener costs no
+# new download and nothing new for cargo-deny to vet.
+#
+# `default-features = false` is load-bearing: rustls' defaults select the
+# aws-lc-rs provider, which would add a second crypto backend, a C toolchain to
+# every build, and a license that is not on deny.toml's allowlist. `ring` is the
+# provider ureq already builds, so pinning it keeps exactly one in the tree.
+rustls = { version = "0.23.45", default-features = false, features = ["std", "ring", "tls12", "logging"] }
+# PEM decoding for the lego certificate and key. Its `pem` module is
+# unconditional, so this covers what rustls-pemfile would otherwise be needed
+# for; `std` is what adds the read-from-file half of it.
+rustls-pki-types = { version = "1.15.1", features = ["std"] }
+# Request-head parsing for that server. Hand-rolling this is where the bugs are;
+# httparse is in the tree via ureq-proto.
+httparse = "1"
+# Constant-time bearer-token comparison. Nothing in the crate compares secrets
+# today — `update.rs`'s hex compare is explicitly marked as unsafe to reuse here.
+subtle = "2.6"
+# Hex for the token. Three ad-hoc `{b:02x}` loops already exist; don't add a fourth.
+hex = "0.4"
 
 [build-dependencies]
 # The version guard `build.rs` runs: fails the build when `plugins/.claude-plugin/

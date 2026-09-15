@@ -62,6 +62,18 @@ fn bar(label: &str, pct: f64) -> UsageBar {
     }
 }
 
+fn lapsed_bar(label: &str, pct: f64) -> UsageBar {
+    UsageBar {
+        label: label.to_string(),
+        pct,
+        resets_at: Some(crate::usage::epoch_secs_to_iso(
+            crate::usage::now_epoch_secs() - 3_600,
+        )),
+        used: None,
+        total: None,
+    }
+}
+
 fn row(label: &str, value: &str) -> StatRow {
     StatRow {
         label: label.to_string(),
@@ -97,6 +109,99 @@ fn third_party_headline_skips_value_less_heading_row() {
         None,
     );
     assert_eq!(third_party_headline(&s), "api balance: $4.20");
+}
+
+/// A bar whose `resets_at` has passed is the previous window's last reading,
+/// not current headroom (#74, the OAuth rule's third-party arm): it drops from
+/// the headline the same way the row drops from the published `windows` array,
+/// while an unstamped bar stays — no stamp is missing data, not a lapsed window.
+#[test]
+fn third_party_headline_drops_bars_whose_reset_has_passed() {
+    let live = crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() + 3_600);
+    let s = third_party_stats(
+        vec![
+            lapsed_bar("5h", 100.0),
+            UsageBar {
+                label: "7d".to_string(),
+                pct: 30.0,
+                resets_at: Some(live),
+                used: None,
+                total: None,
+            },
+        ],
+        vec![],
+        None,
+    );
+    assert_eq!(third_party_headline(&s), "7d 30%");
+}
+
+/// All bars lapsed falls through to the wallet arm: no live bar spoke, so the
+/// honest figure is the funded wallet, not a stale utilization and not an empty
+/// headline.
+#[test]
+fn third_party_headline_all_lapsed_bars_fall_through_to_wallet() {
+    let s = third_party_stats(
+        vec![lapsed_bar("5h", 100.0)],
+        vec![row("api balance", "498.18 CNY")],
+        None,
+    );
+    assert_eq!(third_party_headline(&s), "api balance: 498.18 CNY");
+}
+
+/// Same fall-through one arm deeper: no funded wallet, so the first value row
+/// carries the headline.
+#[test]
+fn third_party_headline_all_lapsed_bars_fall_through_to_row() {
+    let s = third_party_stats(
+        vec![lapsed_bar("5h", 100.0)],
+        vec![row("balance", "$4.20")],
+        None,
+    );
+    assert_eq!(third_party_headline(&s), "balance: $4.20");
+}
+
+/// Control: all lapsed with nothing behind it stays the empty headline, the
+/// same answer as no bars at all.
+#[test]
+fn third_party_headline_all_lapsed_bars_with_nothing_stays_empty() {
+    let s = third_party_stats(vec![lapsed_bar("5h", 100.0)], vec![], None);
+    assert_eq!(third_party_headline(&s), "");
+}
+
+/// The fall-through composite for an exhausted account: all bars lapsed AND a
+/// refusal verdict renders figure beside verdict — never the refusal alone,
+/// which would hide how short the account is behind a lapsed window.
+#[test]
+fn third_party_headline_all_lapsed_bars_render_the_refusal_beside_its_figure() {
+    let mut s = third_party_stats(
+        vec![lapsed_bar("5h", 100.0)],
+        vec![
+            row("api balance", "498.18 CNY"),
+            StatRow {
+                label: String::new(),
+                value: crate::providers::LOW_BALANCE.to_string(),
+                kind: StatRowKind::Danger,
+            },
+        ],
+        None,
+    );
+    s.is_available = false;
+    assert_eq!(
+        third_party_headline(&s),
+        "api balance: 498.18 CNY (balance too low)"
+    );
+}
+
+/// The plan-prefix tail over the fall-through: a plan label still prefixes the
+/// wallet figure when no live bar speaks for the account.
+#[test]
+fn third_party_headline_all_lapsed_bars_keep_the_plan_prefix() {
+    let s = third_party_stats(
+        vec![lapsed_bar("5h", 100.0)],
+        vec![row("api balance", "498.18 CNY")],
+        Some("pro"),
+    );
+    assert_eq!(third_party_headline(&s), "pro: api balance: 498.18 CNY");
 }
 
 /// The reader here is picking a delegate target, so a provider's refusal has to
@@ -598,23 +703,9 @@ fn live_usage_prose_names_every_window_and_warns() {
     );
     assert_eq!(full, "target `work`: 5h 12.3% used, 7d 45.6% used");
 
-    // A null window reads `unknown` (never drops out as if it were zero), and
-    // carries no age even when a cache file exists to take one from: an age
-    // dates a figure, and stamping one onto two `unknown`s would assert a
-    // measurement clauth never made.
-    let uncached = live_usage_prose(
-        &serde_json::json!({
-            "profile": "work",
-            "kind": "oauth",
-            "5h_used_pct": null,
-            "7d_used_pct": null,
-            "fetched_secs_ago": 240,
-            "stale": true,
-        }),
-        "active profile",
-    );
-    assert_eq!(uncached, "active profile `work`: 5h unknown, 7d unknown");
-
+    // A null window reads `unknown` (never drops out as if it were zero); the
+    // dated, flagged and undated shapes of that pair are pinned by
+    // `live_usage_prose_dates_an_all_lapsed_unknown` below.
     // ...and a null profile name reads `none` and names no window at all: with
     // no account configured there is nothing whose windows could be reported,
     // which is a state clauth knows rather than a figure it lost.
@@ -634,6 +725,62 @@ fn live_usage_prose_names_every_window_and_warns() {
         warned,
         "target `work`: 5h 12% used, 7d 45.6% used; ⚠ deepseek-chat slow (~40 tok/s)"
     );
+}
+
+/// An all-lapsed pair reads `5h unknown, 7d unknown`, and the cache's age is
+/// the one signal separating that from a never-fetched account (owner ruling
+/// 2026-09-08: date the unknowns, so a reader can tell how stale the unknown
+/// is). The age rides ALONE — the `stale` word qualifies a figure (owner
+/// ruling 2026-09-09), and beside two unknowns it would claim a figure the
+/// prose does not show. An undatable body (no `fetched_secs_ago`) stays bare:
+/// there is no age, and nothing to date.
+#[test]
+fn live_usage_prose_dates_an_all_lapsed_unknown() {
+    let dated = live_usage_prose(
+        &serde_json::json!({
+            "profile": "work",
+            "kind": "oauth",
+            "5h_used_pct": null,
+            "7d_used_pct": null,
+            "fetched_secs_ago": 240,
+        }),
+        "active profile",
+    );
+    assert_eq!(
+        dated,
+        "active profile `work`: 5h unknown, 7d unknown (cached 4m ago)"
+    );
+
+    // A payload carrying `stale` beside its unknowns (a live weekly window can
+    // stale a body whose 5h/7d both lapsed) still renders no stale word here.
+    let flagged = live_usage_prose(
+        &serde_json::json!({
+            "profile": "work",
+            "kind": "oauth",
+            "5h_used_pct": null,
+            "7d_used_pct": null,
+            "fetched_secs_ago": 240,
+            "stale": true,
+        }),
+        "active profile",
+    );
+    assert_eq!(
+        flagged,
+        "active profile `work`: 5h unknown, 7d unknown (cached 4m ago)"
+    );
+
+    // No age to publish: the never-fetched shape stays bare, so the dated and
+    // undated unknowns are the two states the age clause separates.
+    let absent = live_usage_prose(
+        &serde_json::json!({
+            "profile": "work",
+            "kind": "oauth",
+            "5h_used_pct": null,
+            "7d_used_pct": null,
+        }),
+        "active profile",
+    );
+    assert_eq!(absent, "active profile `work`: 5h unknown, 7d unknown");
 }
 
 /// The denial is conditional on what the provider publishes. One that reports
@@ -683,12 +830,13 @@ fn windows_prose_denies_a_5h_7d_limit_only_where_the_provider_publishes_none() {
     );
 }
 
-/// A freshness clause dates a FIGURE. With nothing to date — no provider figure
-/// yet, no window cached — an age would assert a measurement clauth does not
-/// have, and `(stale)` would land on the structural none instead of on the
-/// number it describes.
+/// An unknown is DATED when the payload carries an age (owner ruling
+/// 2026-09-08: date the unknowns — the age is the one signal separating an
+/// all-lapsed pair from a never-fetched account), and never marked `stale`:
+/// the verdict qualifies a figure (owner ruling 2026-09-09), and beside an
+/// unknown it would claim one the prose does not print.
 #[test]
-fn windows_prose_never_dates_a_figure_it_did_not_print() {
+fn windows_prose_dates_an_unknown_and_never_marks_it_stale() {
     assert_eq!(
         windows_prose(&serde_json::json!({
             "kind": "third_party",
@@ -696,7 +844,7 @@ fn windows_prose_never_dates_a_figure_it_did_not_print() {
             "fetched_secs_ago": 120,
             "stale": true,
         })),
-        "usage unknown",
+        "usage unknown (cached 2m ago)",
     );
     assert_eq!(
         windows_prose(&serde_json::json!({
@@ -705,6 +853,13 @@ fn windows_prose_never_dates_a_figure_it_did_not_print() {
             "fetched_secs_ago": 120,
             "stale": true,
         })),
+        "usage unknown (cached 2m ago)",
+    );
+    // An undated payload stays bare: no age, nothing to date — the two states
+    // the age clause separates (see the `usage unknown` arms of
+    // `windows_prose_denies_a_5h_7d_limit_only_where_the_provider_publishes_none`).
+    assert_eq!(
+        windows_prose(&serde_json::json!({"kind": "oauth", "windows": []})),
         "usage unknown",
     );
     // And it DOES ride the figure when there is one, which is what keeps the
@@ -728,6 +883,44 @@ fn windows_prose_never_dates_a_figure_it_did_not_print() {
             "fetched_secs_ago": 240,
         })),
         "pro: 5h 12.5%, 7d 48% (cached 4m ago)",
+    );
+}
+
+/// The wallet-burn rate rides the balance it qualifies, before the freshness
+/// clause — the shortfall-report shape: the figure and its pace, the caller
+/// judges the runway.
+#[test]
+fn windows_prose_appends_the_wallet_burn_rate_to_the_figure() {
+    assert_eq!(
+        windows_prose(&serde_json::json!({
+            "kind": "third_party",
+            "balance": "api balance: 2.53 CNY",
+            "provider_windows": false,
+            "wallet_burn_per_day": 4.17,
+            "wallet_burn_currency": "CNY",
+        })),
+        "no 5h/7d limits; api balance: 2.53 CNY · ~4.2 CNY/day",
+    );
+    assert_eq!(
+        windows_prose(&serde_json::json!({
+            "kind": "third_party",
+            "balance": "pro: 5h 12.5%, 7d 48%",
+            "provider_windows": true,
+            "wallet_burn_per_day": 4.17,
+            "wallet_burn_currency": "CNY",
+            "fetched_secs_ago": 30,
+        })),
+        "pro: 5h 12.5%, 7d 48% · ~4.2 CNY/day (cached 30s ago)",
+    );
+    // No rate fields, no clause — an account without a trustworthy slope
+    // renders exactly as it did before.
+    assert_eq!(
+        windows_prose(&serde_json::json!({
+            "kind": "third_party",
+            "balance": "api balance: 2.53 CNY",
+            "provider_windows": false,
+        })),
+        "no 5h/7d limits; api balance: 2.53 CNY",
     );
 }
 
@@ -1352,45 +1545,20 @@ fn digest_prose_names_only_moved_observables() {
     );
 }
 
-#[test]
-fn monitor_state_prose_renders_armed_changed_and_unchanged() {
-    // Every arm self-labels `monitor`, the tool the reply belongs to (the old
-    // `watch` label named a tool the handshake no longer lists).
-    assert_eq!(
-        monitor_state_prose(&serde_json::json!({"status": "armed"})),
-        "monitor armed: baseline set on this first digest call, nothing to compare against yet"
-    );
-    assert_eq!(
-        monitor_state_prose(&serde_json::json!({
-            "status": "changed",
-            "since_your_last_call": {"usage_cache": true}
-        })),
-        "monitor: since your last call: usage cache refreshed"
-    );
-    assert_eq!(
-        monitor_state_prose(&serde_json::json!({"status": "unchanged", "waited_secs": 60})),
-        "monitor: no change after 60s"
-    );
-}
-
-/// The listing rides every state arm, names one line per job, and disappears
-/// entirely when there is nothing to list.
-///
-/// The empty-ARRAY case is pinned here rather than only through the handler:
-/// the handler writes no `jobs` key at all for an empty store, so a guard tested
-/// only from there is an equivalent mutant, and this renderer is `pub(crate)`
-/// and answers for whatever payload it is handed.
+/// The listing names one line per job, and an empty store answers "no delegate
+/// jobs" rather than nothing. The empty case is pinned here rather than only
+/// through the handler: the handler writes no `jobs` key at all for an empty
+/// store, and this renderer is `pub(crate)` and answers for whatever payload it
+/// is handed.
 #[test]
 fn monitor_state_prose_lists_the_delegates_and_says_nothing_when_there_are_none() {
     assert_eq!(
-        monitor_state_prose(&serde_json::json!({"status": "armed", "jobs": []})),
-        "monitor armed: baseline set on this first digest call, nothing to compare against yet",
-        "an empty list is no list at all"
+        monitor_state_prose(&serde_json::json!({})),
+        "no delegate jobs",
+        "an empty store names itself"
     );
 
     let listed = monitor_state_prose(&serde_json::json!({
-        "status": "unchanged",
-        "waited_secs": 5,
         "jobs": [
             {"job_id": "d-a-0", "profile": "one", "state": "running", "elapsed_secs": 65},
             {"job_id": "d-b-0", "profile": "two", "state": "blocking", "elapsed_secs": 20},
@@ -1402,7 +1570,6 @@ fn monitor_state_prose_lists_the_delegates_and_says_nothing_when_there_are_none(
     assert_eq!(
         listed,
         [
-            "monitor: no change after 5s",
             "delegates clauth holds:",
             "  job `d-a-0` running on `one`, elapsed 1m 5s",
             "  job `d-b-0` blocking on `two` (its own caller takes the result), elapsed 20s",
@@ -1412,6 +1579,44 @@ fn monitor_state_prose_lists_the_delegates_and_says_nothing_when_there_are_none(
         ]
         .join("\n"),
         "each state is dated by the question that state makes worth asking"
+    );
+}
+
+/// An orphaned listing row carries the run's session id, because the orphan
+/// case is the one where the operator has no other handle: the server that
+/// was writing the record is gone, and the resume id is the only way back
+/// into the run's transcript. A RUNNING row carries none of this: its session
+/// is still held by the live run, and inviting a resume onto a session the
+/// run still holds is the collision the row deliberately does not offer.
+#[test]
+fn an_orphaned_listing_row_carries_the_resume_handle_a_running_one_does_not() {
+    let listed = monitor_state_prose(&serde_json::json!({
+        "jobs": [
+            {
+                "job_id": "d-a-0",
+                "profile": "one",
+                "state": "running",
+                "elapsed_secs": 65,
+                "session_id": "held-by-the-live-run",
+            },
+            {
+                "job_id": "d-d-0",
+                "profile": "four",
+                "state": "orphaned",
+                "since_secs": 4000,
+                "session_id": "6cc9c767-1cc3-4e77-a787-a7f8a6d41515",
+            },
+        ],
+    }));
+    assert_eq!(
+        listed,
+        [
+            "delegates clauth holds:",
+            "  job `d-a-0` running on `one`, elapsed 1m 5s",
+            "  job `d-d-0` orphaned on `four`; resume with session id `6cc9c767-1cc3-4e77-a787-a7f8a6d41515`, last seen 1h 6m ago",
+        ]
+        .join("\n"),
+        "only the orphaned row offers the handle, and the age phrase stays the row's tail"
     );
 }
 
@@ -1448,6 +1653,26 @@ fn a_listing_row_renders_a_zero_span_as_a_length_not_as_an_instant() {
     assert!(
         !listed.contains("now ago") && !listed.contains("elapsed now"),
         "a span never reads as an instant: {listed}"
+    );
+}
+
+/// An orphan is always at least a day old (silence past `RUNNING_TTL_MS` is
+/// what makes one), and its age renders at the day scale — where the zero
+/// hour remainder is the canonical spelling, not an edge: `1d 0h`, never `1d`
+/// or `24h`. The `1d 1h` remainder shape is pinned by `humanize_duration`'s
+/// own test; this pins the zero one.
+#[test]
+fn an_orphaned_row_renders_the_day_scale_spelling() {
+    let listed = monitor_state_prose(&serde_json::json!({
+        "status": "armed",
+        "jobs": [
+            {"job_id": "d-e-0", "profile": "five", "state": "orphaned", "since_secs": 86_400},
+        ],
+    }));
+
+    assert!(
+        listed.contains("job `d-e-0` orphaned on `five`, last seen 1d 0h ago"),
+        "{listed}"
     );
 }
 
@@ -2191,11 +2416,11 @@ fn delegate_refusal_prose_names_the_spelled_targets() {
 
     let targetless = serde_json::json!({
         "is_error": true,
-        "result": "exactly one of `prompt` or `prompt_file` must be given; neither was"
+        "result": "`profiles` is empty: name at least one profile"
     });
     assert_eq!(
         delegate_refusal_prose(&targetless),
-        "delegate failed: exactly one of `prompt` or `prompt_file` must be given; neither was"
+        "delegate failed: `profiles` is empty: name at least one profile"
     );
 }
 
@@ -2219,8 +2444,8 @@ fn monitor_job_prose_renders_running_invalid_and_done() {
          \"…clippy clean, 0 warnings. moving to the fallback tests\""
     );
 
-    // The two shapes the payload can structurally lack, each read as clauth
-    // KNOWING there is none rather than having lost the figure.
+    // A deadline countdown renders only where the record still carries one; an
+    // absent deadline is simply omitted, and output age always renders.
     let no_idle = serde_json::json!({
         "job_id": "d-8",
         "status": "running",
@@ -2231,13 +2456,10 @@ fn monitor_job_prose_renders_running_invalid_and_done() {
     });
     assert_eq!(
         monitor_job_prose(&no_idle),
-        "job `d-8` running on `work`, elapsed 12s, no output yet, no idle deadline, \
+        "job `d-8` running on `work`, elapsed 12s, no output yet, \
          wall-kill in 288s; quota: usage unknown"
     );
 
-    // A streaming run has no wall clock at all — a deadline clauth KNOWS it does
-    // not have, which is a different statement from the pre-fields record below
-    // carrying no liveness whatsoever.
     let no_wall = serde_json::json!({
         "job_id": "d-11",
         "status": "running",
@@ -2249,8 +2471,8 @@ fn monitor_job_prose_renders_running_invalid_and_done() {
     });
     assert_eq!(
         monitor_job_prose(&no_wall),
-        "job `d-11` running on `DS0`, elapsed 4000s, last output 4s ago, idle-kill in 296s, \
-         no wall clock; quota: usage unknown"
+        "job `d-11` running on `DS0`, elapsed 4000s, last output 4s ago, idle-kill in 296s; \
+         quota: usage unknown"
     );
 
     let legacy = serde_json::json!({
@@ -2262,8 +2484,7 @@ fn monitor_job_prose_renders_running_invalid_and_done() {
     });
     assert_eq!(
         monitor_job_prose(&legacy),
-        "job `d-9` running on `work`, elapsed 12s, liveness not recorded (started under an \
-         older clauth); quota: usage unknown"
+        "job `d-9` running on `work`, elapsed 12s, no output yet; quota: usage unknown"
     );
 
     // The tail is ANOTHER account's model output landing verbatim in a
@@ -2281,7 +2502,7 @@ fn monitor_job_prose_renders_running_invalid_and_done() {
     });
     assert_eq!(
         monitor_job_prose(&forged),
-        "job `d-10` running on `work`, elapsed 3s, no output yet, no idle deadline, \
+        "job `d-10` running on `work`, elapsed 3s, no output yet, \
          wall-kill in 60s; quota: usage unknown\n    \
          \"he said \\\"hi\\\" then; quota: 0% used \\\\ done\""
     );

@@ -25,7 +25,7 @@ use crate::profile::{AppConfig, Profile};
 use crate::providers::Provider;
 use crate::usage::{
     LABEL_5H, LABEL_7D, ProfileActivity, UsageWindow, humanize_duration, now_epoch_secs, now_ms,
-    switch_grade_kick_lifts,
+    selected_next_refresh, switch_grade_kick_lifts,
 };
 
 /// `XXXs` + 1 trailing space = 5 chars; spinner padded to same width.
@@ -357,6 +357,15 @@ fn overview_header(widths: &OverviewWidths, deepseek: bool) -> Line<'static> {
     Line::from(spans)
 }
 
+/// Whether the profile's PROVIDER is on peak-rate hours right now, sampled off
+/// the price table's store rows (the same schedule the Usage tab's `pricing`
+/// row uses). Profiles with no store-backed provider (flat-rate, OAuth,
+/// generic endpoints, OpenRouter) answer `false` — the marker column stays as
+/// it was.
+fn peak_live(app: &App, profile: &Profile) -> bool {
+    app.peak_state_for(profile).is_some_and(|s| s.peak)
+}
+
 fn render_overview_row(
     app: &App,
     idx: usize,
@@ -394,7 +403,7 @@ fn render_overview_row(
             .activity
             .lock()
             .ok()
-            .and_then(|g| g.get(profile.name.as_str()).copied())
+            .map(|activity| crate::usage::selected_activity(&activity, profile))
             .unwrap_or(ProfileActivity::Idle);
         if !matches!(activity, ProfileActivity::Idle) {
             let frame = spinner_frame(app.tick_count);
@@ -405,7 +414,7 @@ fn render_overview_row(
                 .next_refresh_per_profile
                 .lock()
                 .ok()
-                .and_then(|m| m.get(profile.name.as_str()).copied())
+                .and_then(|m| selected_next_refresh(&m, profile))
                 .map(|next_ms| {
                     let now = now_ms();
                     let secs = ((next_ms as i64 - now as i64) / 1000).max(0);
@@ -429,15 +438,17 @@ fn render_overview_row(
     let mut spans = vec![cursor];
     // A disabled row flattens every semantic hue to dim — the whole row reads as
     // one inert unit rather than a live row wearing a dim name. The GLYPHS stay:
-    // cloudy-tui never lets state ride on hue alone, so `⊖`/`×`/`⊘`/`!`/`●` still
-    // distinguish themselves without the color.
+    // cloudy-tui never lets state ride on hue alone, so `⊖`/`×`/`⊘`/`!`/`●`/`▲`
+    // still distinguish themselves without the color.
     let hue = |s: Style| if disabled { theme::dim() } else { s };
     // Marker precedence: canceled subscription (⊖) > broken login (×) > token
-    // danger (⊘) > bell (!) > active (●). Canceled is dead-first (the org 403s
-    // every request, matching the Fallback ladder where `Canceled` outranks
-    // `AuthBroken`); a dead login makes usage alerts moot until re-login; a dead /
-    // mis-filled long-lived token signs sessions out on the next switch, so it
-    // outranks a bell.
+    // danger (⊘) > bell (!) > active (●) > peak hours (▲). Canceled is
+    // dead-first (the org 403s every request, matching the Fallback ladder
+    // where `Canceled` outranks `AuthBroken`); a dead login makes usage alerts
+    // moot until re-login; a dead / mis-filled long-lived token signs sessions
+    // out on the next switch, so it outranks a bell. The active dot outranks
+    // the peak marker — naming which account a bare `claude` authenticates as
+    // beats a schedule the Usage tab's pricing row already names.
     if crate::fallback::is_canceled(profile) {
         spans.push(Span::styled("⊖", hue(theme::danger())));
         spans.push(Span::raw(" "));
@@ -455,6 +466,13 @@ fn render_overview_row(
             "●",
             hue(Style::default().fg(theme::accent_2_color())),
         ));
+        spans.push(Span::raw(" "));
+    } else if peak_live(app, profile) {
+        // Peak-rate marker, non-active rows only: the active `●` outranks it,
+        // so an active profile on peak hours keeps its dot and the `▲` reads
+        // "this other account is on the surcharged rate right now". The
+        // pricing row on the Usage tab names the schedule and the flip.
+        spans.push(Span::styled("▲", hue(theme::warning())));
         spans.push(Span::raw(" "));
     } else {
         spans.push(Span::raw("  "));
@@ -503,8 +521,9 @@ fn render_overview_row(
     // Bracketed bars ([███░░░]) for overview account rows only; brackets stay
     // dim — the fetch-state cue lives on the countdown above instead.
     // Usage-page gauges, chain bars, and fallback thresholds stay bracket-less.
-    // OAuth windows come from `usage`; api-key/provider profiles have no `usage`,
-    // so the 5h/7d windows are synthesized from the matching third-party bars.
+    // OAuth windows come from `usage`; an api-key/provider profile carries
+    // `usage` only when it was seeded from its provider windows, and where it
+    // is absent the 5h/7d windows are synthesized from the matching bars.
     let (five_window, seven_window) = overview_windows(profile);
     // Drain-color each reset countdown by the window's burn rate — see
     // `drain_rate` for where that rate comes from per window.
@@ -670,8 +689,9 @@ fn deepseek_balance_cell(profile: &Profile, width: usize, amount_w: usize) -> Ve
 }
 
 /// The `(5h, 7d)` windows to show in the overview row. OAuth profiles use their
-/// live `UsageInfo`; api-key/provider profiles have no `UsageInfo`, so each slot
-/// is synthesized from the third-party bar whose label matches (`5h` / `7d`) —
+/// live `UsageInfo`; an api-key/provider profile carries one only when it was
+/// seeded from its provider windows, so each missing slot is synthesized from
+/// the third-party bar whose label matches (`5h` / `7d`) —
 /// the same labels `zai` decodes from its window codes. `None` per slot when no
 /// source exists (renders `—`).
 fn overview_windows(profile: &Profile) -> (Option<UsageWindow>, Option<UsageWindow>) {
@@ -831,6 +851,31 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         ]
     };
     lines.push(Line::from(caption));
+
+    // A wallet-bearing active's runway: its funded balance and burn rate, and
+    // how long the two hold — the wallet sibling of the projection above. No
+    // threshold and no warning hue; the figure and its pace, the operator
+    // judges. Gated on the cache selector (a profile edited off a third-party
+    // endpoint keeps its never-evicted store entry) and on enabled-ness (the
+    // usage tab renders a disabled account terminal, no figures).
+    if let Some(active) = cfg.state.active_profile.as_ref().and_then(|n| cfg.find(n))
+        && active.usage_cache_is_third_party()
+        && !active.is_disabled()
+        && let Some(rate) = app.wallet_rate_for(active)
+    {
+        let secs = (rate.amount / rate.per_day * 86_400.0) as i64;
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                format!(
+                    "{} drains in ~{}",
+                    rate.label,
+                    crate::usage::humanize_duration(secs)
+                ),
+                theme::faint(),
+            ),
+        ]));
+    }
 
     // `Off` projection: chain-wide, no target row to sit on — keep it a caption.
     if let Some((SwitchAction::Off, secs)) = &projection {
@@ -1105,7 +1150,9 @@ fn drain_reset_style(rate: Option<f64>, rate_unit: &str, window: &UsageWindow) -
 /// `history_cache`, so no disk read happens under the config guard. Every other
 /// window falls back to the window's own average pace, which needs no burn
 /// history at all: 7d moves too slowly for the recency weighting to say much,
-/// and a synthesized third-party window has no history to weigh.
+/// and a third-party window — bar-synthesized or seeded from the provider's
+/// derived usage — has no history to weigh, since no third-party leg ever
+/// appends `usage_history.jsonl`.
 fn drain_rate(
     app: &App,
     name: &crate::profile::ProfileName,
@@ -1114,6 +1161,7 @@ fn drain_rate(
     window: &UsageWindow,
 ) -> Option<f64> {
     if label == LABEL_5H
+        && !profile.usage_cache_is_third_party()
         && let Some(usage) = profile.usage.as_ref()
     {
         return app.active_burn_rate(name, usage);

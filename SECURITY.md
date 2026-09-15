@@ -24,8 +24,12 @@ Per-profile state lives under `~/.clauth/`. On Unix that whole tree is owner-onl
 | `~/.clauth/profiles/<name>/config.toml` | base URL, API key (endpoint profiles), env block | `0600` |
 | `~/.clauth/profiles/<name>/usage_cache.json` | last-known utilization and plan | `0600` |
 | `~/.clauth/profiles/<name>/runtime-<sid>/settings.json` | one live session's Claude Code settings. An endpoint profile's key is **not** in it: the file carries an `apiKeyHelper` line naming `clauth __api-key <profile>`, which Claude Code runs per request to mint the key | `0600` |
+| `~/.clauth/devices.json` | the devices that may call the daemon's REST API: each one's name, tier (`view` or `control`), when and how it joined, and a SHA-256 of its bearer token, plus a SHA-256 of the last token imported from before pairing, so a revoked one is not imported again. Never the token, which is shown once, when it is minted. Only if you have paired or added a device, or run `clauth daemon --listen` over a token from before pairing | `0600` |
+| `~/.clauth/pairing.json` | the one pairing code waiting while `clauth devices pair` runs: a SHA-256 of the code, never the code, with the device name and tier it mints, its expiry, and the tries left. A code that pairs, runs out of tries, or is withdrawn is deleted at once; an expired one by its wait, or by the next redemption that finds it | `0600` |
+| `~/.clauth/tls.json` | which directory holds the REST API's lego certificate; written with the platform default the first time `clauth daemon --listen` starts. Not a secret — a path, no key material | `0600` |
 | `~/.clauth/jobs/<id>.json` | backgrounded `delegate` prompt + result | file `0600`, dir `0700` |
 | `~/.clauth/live_sessions/<sid>.json`, `~/.clauth/live_bare/<pid>` | liveness markers for running sessions: pid, profile name, working directory, flags. No credentials | file `0600`, dir `0700` |
+| `~/.clauth/keychain-quarantine/<UTC>-<pid>-<service>.json` | macOS only: raw bytes of a Keychain item that read back as anything other than the JSON object Claude Code expects, preserved before the write or sign-out that would otherwise destroy them — live credential bytes, which is why nothing prunes the dir | file `0600`, dir `0700` |
 | usage and price caches, session history, logs, lock files (`~/.clauth/`) | last-known usage, third-party state, burn samples, event log, advisory locks | file `0600`, dir `0700` |
 | `~/.local/share/clauth/` (macOS `~/Library/Application Support/clauth/`, Windows `%APPDATA%\clauth\`) | the bundled Claude Code plugin, laid down where `claude plugin` can register it: `plugin.json`, the `hooks/` dir, a generated `marketplace.json`, and an install marker under `markers/`. Content-keyed under `versions/`, with a `current@claude` pointer at the live one. No credentials | your umask; not re-tightened |
 
@@ -35,7 +39,7 @@ On macOS a second copy of the active login lives outside this tree, in the login
 |------|----------|------------|
 | generic password `Claude Code-credentials`, account `$USER` | the OAuth pair for whichever profile is linked | `/usr/bin/security`, one item per `CLAUDE_CONFIG_DIR` |
 
-clauth writes and clears that item; it never reads it back during normal operation. The command line goes to `security -i` over stdin rather than argv, so the token never appears in the process table. Access is whatever the login Keychain grants, not `0600`.
+clauth reads that item before every write (to carry your MCP-server logins across) and reads it back after every write to verify it landed: a write that reads back corrupt fails the switch, and one that cannot be checked completes with a note on its event line. The write goes to `security -i` over stdin while the command line fits 4096 bytes, keeping the token out of the process table; a larger item rides the tool's argument vector instead — visible to processes of your own user for the life of the call, and disclosed on the event line — and one past 512 KiB is refused outright, naming the size and how to shrink the item. A failed write reports the tool's exit code and the size of its stderr, never the stderr itself, since the tool can echo the value being written. Access is whatever the login Keychain grants, not `0600`.
 
 - Writes are atomic. The temp file gets mode `0600` at creation, not a chmod afterward, so a loose umask never leaves a readable window; it's fsynced, then renamed into place. A rotation caught mid-write lands as `credentials.json.pending` and is promoted only once it's durable.
 - Modes are enforced on Unix two ways: each writer creates its file owner-only, and every launch re-tightens the whole `~/.clauth` tree, repairing a store from an older build or a loose umask.
@@ -51,8 +55,8 @@ Every request clauth makes, and what rides along with it:
 |----------|------|---------|
 | `api.github.com/repos/uwuclxdy/clauth/releases/latest` + release assets | background update check on launch (binary installs only) | no credentials, just a `User-Agent` |
 | `platform.claude.com/v1/oauth/token` | token refresh ahead of expiry, on a rejected request, and on `t` force-rotate | your stored refresh token |
-| `claude.com/cai/oauth/authorize` | `clauth login` interactive sign-in, opened in your browser | no credentials; a PKCE challenge + random `state` |
-| `platform.claude.com/v1/oauth/token` | `clauth login` authorization-code exchange | the one-time auth code + PKCE verifier (mints a fresh token pair) |
+| `claude.com/cai/oauth/authorize` | `clauth login` interactive sign-in, opened in your browser or shown as a link for you to open anywhere | no credentials; a PKCE challenge + random `state` |
+| `platform.claude.com/v1/oauth/token` | `clauth login` authorization-code exchange; a pasted code sends Claude Code's hosted redirect URI and the same `state` | the one-time auth code + PKCE verifier (mints a fresh token pair) |
 | `api.anthropic.com/api/oauth/usage` | usage poll on the refresh interval | access token (Bearer) |
 | `api.anthropic.com/api/oauth/profile` | plan-tier detection, and reading which account a token belongs to (so a live re-login can be told apart) | access token |
 | `api.anthropic.com/v1/messages` | auto-start kick (opt-in, off by default) | access token; a 1-token Haiku request |
@@ -65,7 +69,18 @@ Every request clauth makes, and what rides along with it:
 | `bailian.console.aliyun.com` or `modelstudio.console.alibabacloud.com` | `clauth login` on a Model Studio profile, opened in your browser to capture that console session | no credentials; the callback comes back to a loopback listener |
 | a custom base URL you set | requests against an API-endpoint profile, plus a best-effort usage probe against that same origin | whatever you configured |
 
-Your stored Claude access tokens go to `api.anthropic.com` and nowhere else. Your refresh token goes to `platform.claude.com`, which is the token endpoint Claude Code's own client refreshes against: every pair is minted there, whether from a refresh or from the interactive `clauth login`, which follows Claude Code's OAuth flow by opening `claude.com` in your browser to authorize and posting the one-time code back to `platform.claude.com`. clauth runs no telemetry or analytics; it talks to the hosts above and no others.
+Your stored Claude access tokens go to `api.anthropic.com` and nowhere else. Your refresh token goes to `platform.claude.com`, which is the token endpoint Claude Code's own client refreshes against: every pair is minted there, whether from a refresh or from the interactive `clauth login`, which follows Claude Code's OAuth flow by opening `claude.com` in your browser to authorize (or showing you the same link to open on any device) and posting the one-time code back to `platform.claude.com`. clauth runs no telemetry or analytics; it talks to the hosts above and no others.
+
+### Listening sockets
+
+clauth binds a socket in exactly two places, both narrow:
+
+| Listener | When | Reachable from |
+|----------|------|----------------|
+| `127.0.0.1:<random port>` | for the seconds `clauth login` waits for the browser redirect | loopback only; it checks the OAuth `state` and closes |
+| the address you pass to `clauth daemon --listen` | for as long as that daemon runs | wherever you bind it |
+
+`--listen` is off unless you ask for it, and it is the only way anything outside this machine can reach clauth. It is TLS-only (from this host's lego certificate, or the `--cert`/`--key` pair named on the command line, read at startup), and every route but the pairing redemption requires the bearer token of a device paired on this machine, checked in constant time against the SHA-256 digests in `~/.clauth/devices.json`. A device joins through a one-time code from `clauth devices pair` (8 characters from the OS random source, valid for 5 minutes, used once, dropped after 5 wrong tries) or a token `clauth devices add` mints and prints once, and its tier is fixed there: `view` reads the feed, `control` may also switch accounts. `clauth devices revoke` refuses a device's next request. It serves the health check, the status feed, the OpenAPI document, the account switch (control devices only), and the pairing redemption. The feed it serves carries what `status.json` carries: names, tiers, percentages, timestamps, never a token or key; the one response that carries a token is the pairing that mints it, and no log line carries one. Connections persist and may be pipelined; `Content-Length` is the only framing accepted, chunked is refused, and any framing error closes the connection rather than resynchronizing, so the ambiguity request smuggling depends on does not arise. A connection slot is claimed at `accept()`, before the handshake and before any token is seen, so a peer reaching the port occupies one while connected; the clock bounds it — a peer that connects and says nothing gets the 10s first-request timeout, not the full connection lifetime — and an unauthenticated request or a failed pairing is answered and closed at once, so no unauthenticated client can hold a slot. Limits: 8 KiB of headers, 64 KiB of body, 32 concurrent connections, 100 requests and 120 seconds per connection, a 10s deadline per read or write. `CLAUTH_NO_API=1` disables it. See `wiki/Daemon.md`.
 
 ## What acts on your behalf
 
@@ -86,6 +101,7 @@ User-invoked, only when you run the command:
 
 - **Interactive login (`clauth login <profile>`).** Opens your browser to Claude's OAuth authorize page and binds a loopback listener on `127.0.0.1:<random port>` to catch the redirect, then exchanges the returned code for a fresh token pair written into the new profile.
   - It reproduces Claude Code's own PKCE flow, touches no other account, and never opens a usage window. On macOS this is why `clauth login` works at all: Claude Code's own `/login` under a custom config dir writes only a per-config-dir Keychain item, never the profile's credentials file.
+- **Pasting the code (`clauth login <profile>`, or the Setup tab's login modal).** The same authorize request, with the loopback callback and a paste door through Claude Code's hosted redirect — whichever lands first wins. You open the link wherever you like, and the page shows a one-time `code#state` string that you paste back. clauth checks the `state` half against the one it generated before exchanging the code. The pasted string is a bearer-grade secret until exchanged: read echo-off on the command line, held in memory only, never logged and never written to disk. In the TUI, <kbd>c</kbd> writes the link (which carries no credential) to your terminal's clipboard through the OSC 52 escape and nothing else.
 - **`clauth start` / `clauth resume`.** Spawns `claude` against the profile you named, so everything that session sends bills to that account. clauth forwards your args and sends nothing of its own.
 
 - **Rolling session token (`clauth rolling-token <profile>`).** Points the profile's `session-token.json` at that profile's own OAuth usage chain: the daemon re-stamps the file with the chain's current access token, minus the refresh token, so sessions still hold nothing rotatable.
@@ -99,6 +115,11 @@ Agent-invoked, only when the Claude Code plugin is installed:
 - **`delegate` (MCP tool).** Sends a real, billed `/v1/messages` request on a target profile under its own OAuth token, opening a full 5-hour usage window on that account.
   - It fires only when an agent calls the tool, and is hard-capped at recursion depth 1 (a delegated session cannot call `delegate` again).
 - **`switch_profile` (MCP tool).** Relinks the global `~/.claude` credentials to another profile, the same write `clauth switch` performs. It changes which account the global session refreshes onto; it sends no inference itself.
+
+Network-invoked, only while `clauth daemon --listen` is running:
+
+- **`POST /api/v1/switch`.** The same relink as the `switch` MCP tool, performed for a device paired with control. It sends no inference itself, and it refuses the cases that need a human (a login clauth has not saved, credentials a refresh has rejected, a disabled account) rather than resolving them unattended.
+- **`POST /api/v1/pair`.** Adds the device a live pairing code names, at the tier chosen when `clauth devices pair` minted the code, and hands it its token. The code is the only credential it takes, so while a `--control` code is live, whoever enters it first gets control.
 
 Nothing else sends inference or writes to your account.
 
@@ -130,9 +151,10 @@ Every command below goes through an argument vector, never a shell, so there is 
 | `clauth mcp`, `claude --version` | Plugin-tab checks: a JSON-RPC handshake against clauth's own server, and Claude Code's version |
 | `claude plugin …` (`marketplace add`, `install`, `list --json`) | registering the bundled plugin and repairing a broken registration: the Plugin tab's install, the `clauth self-heal` hook, and the gated heal `clauth start`, `clauth mcp` and the daemon tick share, which runs only when a registry read says the registration is broken |
 | `herdr` (from `HERDR_BIN_PATH`, else `PATH`) | `clauth herdr install` / `uninstall`, which drive herdr's own plugin installer and let herdr validate the config before it is written; plus `pane report-metadata` during a `delegate` run, with the herdr pane knobs on |
-| `/usr/bin/security` | macOS only: writing and clearing the Keychain item above |
+| `/usr/bin/security` | macOS only: reading, writing and clearing the Keychain item above |
 | `xdg-open` (Linux), `open` (macOS), `rundll32` (Windows) | opening a URL: the browser login page, or a status incident from the Status tab. The URL is passed as one argument |
 | `kill` / `taskkill`, plus `ps` on macOS and `tasklist` on Windows | `clauth daemon --replace` only: the pid is checked against a running clauth daemon before it is signalled (Linux reads `/proc/<pid>/cmdline` instead of shelling out) |
+| `hostname -f` (macOS, Linux), `powershell.exe` evaluating `[System.Net.Dns]::GetHostEntry($env:COMPUTERNAME).HostName` (Windows) | `clauth daemon --listen` without `--cert`/`--key` only: once at startup, to learn which lego certificate to load. Naming the certificate outright runs neither command. No part of it comes from you — the argument vector is a compile-time constant — and the answer is rejected unless it looks like a hostname before it is used as a filename in the certificate directory named by `~/.clauth/tls.json`, which is yours to edit and owner-only like the rest of the tree |
 
 clauth runs no other external commands.
 
@@ -153,6 +175,7 @@ On the first TUI launch clauth offers to install shell completions. For bash and
 |--------|--------|
 | `CLAUTH_NO_UPDATE=1` | disables all background update checks and self-replacement |
 | `CLAUTH_NO_COMPLETIONS=1` | skips the first-run completion-install prompt |
+| `CLAUTH_NO_API=1` | stops `clauth daemon --listen` from opening its socket, whatever the flags say |
 | an empty `fallback_chain` (the default) | clauth never switches accounts on its own |
 | `allow extra usage` off (the default) | no auto-switch can reach an account that bills money |
 | `auto_start = false` (the default) | clauth sends no inference of its own |

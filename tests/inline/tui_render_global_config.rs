@@ -45,6 +45,7 @@ fn tunables() -> RowTunables {
         burn_floor_pct: 98.0,
         burn_horizon_ms: 60_000,
         default_divergence: None,
+        context_nudge_tokens: None,
     }
 }
 
@@ -182,6 +183,7 @@ fn edit_line_buffer_starts_at_the_value_column() {
     for rendered in [
         line_text(&weekly_edit_line(Span::raw("  "), &input)),
         line_text(&refresh_edit_line(Span::raw("  "), &input)),
+        line_text(&context_nudge_edit_line(Span::raw("  "), &input)),
     ] {
         assert_eq!(
             rendered.find("45"),
@@ -400,6 +402,222 @@ fn a_non_default_value_shows_a_faint_default_reminder() {
         !default.contains("default:"),
         "the default value carries no reminder: {default}"
     );
+}
+
+// ── context nudge ────────────────────────────────────────────────────────────
+
+/// The nudge row is a five-way cycle: `off` first (the shipped default), then
+/// the four presets. `None` brackets `off`; a preset value brackets its chip.
+#[test]
+fn context_nudge_cycle_line_renders_off_then_presets() {
+    let off = line_text(&detail_row(
+        GlobalConfigRow::ContextNudge,
+        true,
+        toggles(),
+        tunables(), // None
+        None,
+    ));
+    assert!(off.contains("[off]"), "None brackets off: {off}");
+    for label in ["300k", "400k", "600k", "900k"] {
+        assert!(off.contains(label), "all presets render: {off}");
+    }
+
+    let mut set = tunables();
+    set.context_nudge_tokens = Some(300_000);
+    let low = line_text(&detail_row(
+        GlobalConfigRow::ContextNudge,
+        true,
+        toggles(),
+        set,
+        None,
+    ));
+    assert!(low.contains("[300k]"), "the live preset brackets: {low}");
+    assert!(
+        !low.contains("[off]"),
+        "off stays bare while a preset is live: {low}"
+    );
+
+    let mut set = tunables();
+    set.context_nudge_tokens = Some(900_000);
+    let high = line_text(&detail_row(
+        GlobalConfigRow::ContextNudge,
+        true,
+        toggles(),
+        set,
+        None,
+    ));
+    assert!(high.contains("[900k]"), "the top preset brackets: {high}");
+}
+
+/// A custom value matches no preset, so the real threshold is appended in
+/// `ACCENT` instead of mis-bracketing the nearest chip — the refresh row's
+/// custom-value append. The shared display form: `{n}k`, `{n}M`, or plain
+/// tokens.
+#[test]
+fn context_nudge_custom_value_appends_in_accent_without_bracketing_a_preset() {
+    let mut set = tunables();
+    set.context_nudge_tokens = Some(450_000);
+    let line = detail_row(GlobalConfigRow::ContextNudge, true, toggles(), set, None);
+    assert!(
+        !line_text(&line).contains('['),
+        "no preset may bracket: {}",
+        line_text(&line)
+    );
+    let custom = line
+        .spans
+        .iter()
+        .find(|s| s.content.contains("450k"))
+        .expect("the custom value appends in k form");
+    assert_eq!(
+        custom.style.fg,
+        theme::accent().fg,
+        "the custom append renders accent: {:?}",
+        custom.style
+    );
+
+    let mut set = tunables();
+    set.context_nudge_tokens = Some(450_500);
+    let plain = line_text(&detail_row(
+        GlobalConfigRow::ContextNudge,
+        false,
+        toggles(),
+        set,
+        None,
+    ));
+    assert!(
+        plain.contains("450500"),
+        "an indivisible value appends as plain tokens: {plain}"
+    );
+
+    let mut set = tunables();
+    set.context_nudge_tokens = Some(1_000_000);
+    let million = line_text(&detail_row(
+        GlobalConfigRow::ContextNudge,
+        false,
+        toggles(),
+        set,
+        None,
+    ));
+    assert!(
+        million.contains("1M"),
+        "an exact million appends in M form: {million}"
+    );
+}
+
+/// The default is off, so the faint ` default: off` reminder rides the row only
+/// while a threshold is set — the refresh row's off-default idiom.
+#[test]
+fn context_nudge_default_reminder_appears_only_when_set() {
+    let mut set = tunables();
+    set.context_nudge_tokens = Some(600_000);
+    let on = line_text(&detail_row(
+        GlobalConfigRow::ContextNudge,
+        false,
+        toggles(),
+        set,
+        None,
+    ));
+    assert!(on.contains("default: off"), "a set value carries it: {on}");
+
+    let off = line_text(&detail_row(
+        GlobalConfigRow::ContextNudge,
+        false,
+        toggles(),
+        tunables(), // None = the default
+        None,
+    ));
+    assert!(
+        !off.contains("default:"),
+        "the default carries no reminder: {off}"
+    );
+}
+
+/// The hint states what the row does per live value, byte-pinned: off names
+/// the absence of a nudge, a set threshold names the number it crosses.
+#[test]
+fn context_nudge_hint_tracks_the_live_value() {
+    assert_eq!(
+        row_hint(GlobalConfigRow::ContextNudge, toggles(), tunables()).as_deref(),
+        Some("no context nudge is sent"),
+    );
+    let mut set = tunables();
+    set.context_nudge_tokens = Some(600_000);
+    assert_eq!(
+        row_hint(GlobalConfigRow::ContextNudge, toggles(), set).as_deref(),
+        Some("tells a running session when its context usage crosses 600k"),
+    );
+}
+
+/// The editor takes raw tokens (a trailing `k` lives inside the buffer), so an
+/// out-of-range or non-numeric buffer renders DANGER through `value_caret` —
+/// pinned at the span level since a text dump cannot see color.
+#[test]
+fn context_nudge_edit_line_marks_invalid_buffer_danger() {
+    let invalid = InputState::new("49999");
+    let line = context_nudge_edit_line(Span::raw("  "), &invalid);
+    let buffer = line
+        .spans
+        .iter()
+        .find(|s| s.content == "49999")
+        .expect("the typed buffer renders");
+    assert_eq!(buffer.style.fg, theme::danger().fg, "{:?}", buffer.style);
+
+    let valid = InputState::new("600k");
+    let line = context_nudge_edit_line(Span::raw("  "), &valid);
+    let buffer = line
+        .spans
+        .iter()
+        .find(|s| s.content == "600k")
+        .expect("the typed buffer renders");
+    assert_eq!(buffer.style.fg, theme::body().fg, "{:?}", buffer.style);
+}
+
+/// The invalid tooltip renders leader + reason both in DANGER (the house
+/// Invalid-input treatment); the valid range tooltip stays in the faint help
+/// shape. Both name the same range: `50k-2M tokens`.
+#[test]
+fn context_nudge_range_tooltip_marks_invalid_input_danger() {
+    let invalid = InputState::new("49999");
+    let lines = context_nudge_range_tooltip(&invalid, 40);
+    for line in &lines {
+        for span in &line.spans {
+            assert_eq!(
+                span.style.fg,
+                theme::danger().fg,
+                "leader and reason both danger: {span:?}"
+            );
+        }
+    }
+    let text: String = lines.iter().map(line_text).collect();
+    assert!(text.contains("50k-2M tokens"), "{text}");
+
+    let valid = InputState::new("600k");
+    for line in context_nudge_range_tooltip(&valid, 40) {
+        for span in line.spans {
+            assert_ne!(
+                span.style.fg,
+                theme::danger().fg,
+                "a valid buffer keeps the tooltip out of danger: {span:?}"
+            );
+        }
+    }
+}
+
+/// The row belongs to the scheduler band, between the refresh rows and the
+/// auto-start queue — a nudge is cadence behavior, not a switch rule.
+#[test]
+fn context_nudge_sits_in_the_scheduler_band_after_the_refresh_rows() {
+    assert_eq!(GlobalConfigRow::ContextNudge.band(), "scheduler");
+    let pos = |row: GlobalConfigRow| {
+        GLOBAL_CONFIG_ROWS
+            .iter()
+            .position(|r| *r == row)
+            .expect("row in the config list")
+    };
+    let nudge = pos(GlobalConfigRow::ContextNudge);
+    assert!(nudge > pos(GlobalConfigRow::RefreshInterval));
+    assert!(nudge > pos(GlobalConfigRow::RefreshSpentAccounts));
+    assert!(nudge < pos(GlobalConfigRow::AutoStartQueue));
 }
 
 /// Value rows fold the live value into their hint, so cycling a row re-explains

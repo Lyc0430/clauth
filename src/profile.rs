@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -18,7 +18,7 @@ pub(crate) enum DivergenceChoice {
 use crate::lock::{StateLockHeld, with_state_lock};
 use crate::logline::logline;
 use crate::providers::{Provider, ThirdPartyStats};
-use crate::usage::{FetchStatus, UsageInfo};
+use crate::usage::{FetchStatus, UsageInfo, WalletSample};
 
 /// A slot that reads like its inner value but writes only through the
 /// witness-gated [`SlotOps::set`]. `active_profile` and `credentials` are
@@ -281,6 +281,37 @@ pub(crate) struct OAuthToken {
     pub(crate) scopes: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) subscription_type: Option<String>,
+    /// Every key of the login block this struct does not name, kept verbatim on
+    /// both boundaries of every store rewrite. Claude Code writes fields of its
+    /// own into `claudeAiOauth` (`rateLimitTier`, `refreshTokenExpiresAt`,
+    /// `clientId`) and re-emits them only on a token save, so a typed model
+    /// that silently dropped them made every clauth write of the store sticky
+    /// (issue #75): the parse lost them before any merge could see them, and
+    /// the serialize never emitted them. This is the login block's share of
+    /// [`preserve_extra_blocks`]'s rule — the store's own value is the record,
+    /// the model is a patch onto it — and it fixes the parse boundary too,
+    /// which no write-side merge can reach: a first capture has no disk bytes
+    /// to merge from.
+    #[serde(flatten, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub(crate) extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl OAuthToken {
+    /// `..Self::default_extra()` — the struct-update tail for every constructor
+    /// minting a login from clauth's own flow, where no outside writer has put
+    /// anything into the block yet. `Default` is deliberately not derived: the
+    /// named fields carry no defaults (`access_token` has none), so this named
+    /// constructor is the one spelling of "starts empty".
+    pub(crate) fn default_extra() -> Self {
+        Self {
+            access_token: String::new(),
+            refresh_token: None,
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            extra: serde_json::Map::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -360,6 +391,13 @@ pub(crate) struct Profile {
     pub(crate) credentials: LockedSlot<Option<ClaudeCredentials>>,
     pub(crate) usage: Option<UsageInfo>,
     pub(crate) fetch_status: Option<FetchStatus>,
+    /// Cache age past [`crate::profile_json::stale_after_ms`] — the Usage tab's
+    /// degraded cue (#74). Fed by `tui::app::apply_usage` from the same age
+    /// source `status.json`'s `stale` arm reads (the body's `fetched_at` for
+    /// OAuth, the cache mtime for third-party), keyed to the live refresh
+    /// interval; a fact orthogonal to `fetch_status`, so a `cached` pill and
+    /// this cue can coexist.
+    pub(crate) usage_stale: bool,
     /// Recognised third-party provider (derived from base_url).
     pub(crate) provider: Option<Provider>,
     /// Provider-specific usage data (e.g. DeepSeek balance).
@@ -390,6 +428,7 @@ impl Profile {
             credentials: slot(None),
             usage: None,
             fetch_status: None,
+            usage_stale: false,
             provider,
             third_party_usage: None,
         }
@@ -679,7 +718,7 @@ pub(crate) struct AppState {
     /// [`AppState::switch_off_when_budget_spent`] — see that field for why the
     /// two are separate.
     ///
-    /// The on-disk key stays `switch_off_when_spent`: it is also a `status.json` field
+    /// The on-disk key stays `wrap_off`: it is also a `status.json` field
     /// (schema 1, `wiki/Daemon.md`), so renaming it would break a published read
     /// contract and every existing profiles.toml. The Rust name says what it
     /// does; the serde name is the compatibility surface. Don't "align" them.
@@ -792,6 +831,14 @@ pub(crate) struct AppState {
     pub(crate) count_cache: bool,
     #[serde(default = "default_refresh_interval")]
     pub(crate) refresh_interval_ms: u64,
+    /// Context-window nudge threshold, tokens: at or past it, the hook's
+    /// context leg (`hook_context`) tells the conversation once per value.
+    /// `None` = off. Read through
+    /// [`AppState::context_nudge_threshold_tokens`], which resets a
+    /// hand-edited out-of-band value to off. Valid range
+    /// [`MIN_CONTEXT_NUDGE_TOKENS`]..=[`MAX_CONTEXT_NUDGE_TOKENS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) context_nudge_threshold_tokens: Option<u64>,
     /// Default action when credential divergence is detected. `None` = show the
     /// Divergence modal (current behavior).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -939,6 +986,15 @@ impl AppState {
             .filter(|v| (MIN_REFRESH_INTERVAL_MS..=MAX_REFRESH_INTERVAL_MS).contains(v))
             .unwrap_or(DEFAULT_BURN_HORIZON_MS)
     }
+
+    /// The effective context-nudge threshold: an out-of-band hand-edit reads
+    /// as off (reset-to-`None`, never clamp — the same fail-safe rationale as
+    /// [`AppState::weekly_switch_threshold_pct`], off having no default to
+    /// reset to).
+    pub(crate) fn context_nudge_threshold_tokens(&self) -> Option<u64> {
+        self.context_nudge_threshold_tokens
+            .filter(|v| (MIN_CONTEXT_NUDGE_TOKENS..=MAX_CONTEXT_NUDGE_TOKENS).contains(v))
+    }
 }
 
 fn default_show_estimates() -> bool {
@@ -999,6 +1055,10 @@ pub(crate) const MIN_WEEKLY_SWITCH_PCT: f64 = 50.0;
 /// hard-cap behavior (switch only once the API already refuses).
 pub(crate) const MAX_WEEKLY_SWITCH_PCT: f64 = 100.0;
 
+/// Bounds of [`AppState::context_nudge_threshold_tokens`], tokens.
+pub(crate) const MIN_CONTEXT_NUDGE_TOKENS: u64 = 50_000;
+pub(crate) const MAX_CONTEXT_NUDGE_TOKENS: u64 = 2_000_000;
+
 /// Default burn-aware floor (percent). 98 mirrors the weekly default: a safe
 /// backstop that never lets a projected switch waste more than 2% of the
 /// window, while the horizon cap does the common-case reclaiming. Tune up for
@@ -1041,6 +1101,7 @@ impl Default for AppState {
             show_pace: false,
             count_cache: false,
             refresh_interval_ms: default_refresh_interval(),
+            context_nudge_threshold_tokens: None,
             default_divergence: None,
             weekly_switch_threshold: None,
             burn_switch_floor_pct: None,
@@ -1492,6 +1553,10 @@ struct HistoryLine {
     usage: UsageInfo,
 }
 
+/// Retention window shared by both per-profile series logs
+/// (`usage_history.jsonl`, `wallet_history.jsonl`).
+const HISTORY_RETENTION_MS: u64 = 2 * 24 * 60 * 60 * 1000;
+
 /// Prune a profile's usage_history.jsonl to keep at most 2 days of entries.
 /// Rewrites the file in place when there's anything to remove; no-op when it is
 /// missing, unparseable, or already within the retention window.
@@ -1510,7 +1575,7 @@ pub(crate) fn prune_usage_history(name: &ProfileName) {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
-        - 2 * 24 * 60 * 60 * 1000;
+        - HISTORY_RETENTION_MS;
 
     let mut kept: Vec<&str> = Vec::new();
     let mut pruned: usize = 0;
@@ -1535,9 +1600,10 @@ pub(crate) fn prune_usage_history(name: &ProfileName) {
     }
 }
 
-/// Open a profile's `usage_history.jsonl` for append, creating it 0o600 on Unix.
-/// The log records per-profile utilization samples under `~/.clauth`, so it
-/// rides the owner-only invariant rather than the process umask.
+/// Open a profile's series log (`usage_history.jsonl` / `wallet_history.jsonl`)
+/// for append, creating it 0o600 on Unix. The logs record per-profile usage
+/// and balance samples under `~/.clauth`, so they ride the owner-only
+/// invariant rather than the process umask.
 fn history_append_file(path: &Path) -> std::io::Result<std::fs::File> {
     let mut opts = std::fs::OpenOptions::new();
     opts.create(true).append(true);
@@ -1590,15 +1656,29 @@ pub(crate) fn append_usage_sample_at(
     next: &UsageInfo,
     ts: u64,
 ) {
-    let Ok(next_json) = serde_json::to_string(next) else {
+    // `fetched_at` is a cache-age clock, not a usage figure: two live reads of
+    // the same numbers differ only in that stamp, so the unchanged check (and
+    // the lines it writes) exclude it. Otherwise a quiet account would append
+    // one line per poll instead of only when the numbers moved.
+    let mut next_body = next.clone();
+    next_body.fetched_at = None;
+    let Ok(next_json) = serde_json::to_string(&next_body) else {
         return;
     };
-    let bridge_json = prev.and_then(|p| serde_json::to_string(p).ok());
+    let bridge_json = prev.and_then(|p| {
+        let mut p = p.clone();
+        p.fetched_at = None;
+        serde_json::to_string(&p).ok()
+    });
     let unchanged = match &bridge_json {
         Some(json) => json == &next_json,
         None => load_usage_history(name)
             .last()
-            .and_then(|(_, info)| serde_json::to_string(info).ok())
+            .and_then(|(_, info)| {
+                let mut info = info.clone();
+                info.fetched_at = None;
+                serde_json::to_string(&info).ok()
+            })
             .is_some_and(|json| json == next_json),
     };
     if unchanged {
@@ -1652,6 +1732,160 @@ pub(crate) fn load_usage_history(name: &ProfileName) -> Vec<(u64, UsageInfo)> {
         .collect();
     entries.sort_by_key(|(ts, _)| *ts);
     entries
+}
+
+pub(crate) fn profile_wallet_history_path(name: &ProfileName) -> Result<PathBuf> {
+    Ok(profile_dir(name)?.join("wallet_history.jsonl"))
+}
+
+/// Append this landing fetch's wallet readings to `wallet_history.jsonl` —
+/// the durable balance series the wallet-burn rate replays
+/// (`usage::burn::compute_wallet_rate_from_history`).
+///
+/// Mirrors [`append_usage_sample`]: per wallet, an unchanged reading (same
+/// amount under the same `(label, currency)` identity) writes nothing, and a
+/// changed one writes a bridge line stamping the previous amount 1 ms before
+/// the new reading so an idle stretch keeps its temporal density instead of
+/// replaying as one long ramp. Every wallet a provider reports is recorded —
+/// the rate renders the funded one's, but a wallet that drains to zero and
+/// later refills still needs its own series. One `write_all` per fetch so an
+/// append can never land interleaved; best-effort, a failure is logged,
+/// never fatal.
+pub(crate) fn append_wallet_readings(name: &ProfileName, stats: &ThirdPartyStats) {
+    append_wallet_readings_at(name, stats, crate::usage::now_ms());
+}
+
+/// Time-injected body of [`append_wallet_readings`] — the seam that lets a
+/// test seed the series through the REAL writer, bridge lines included, at
+/// controlled timestamps. Same role [`append_usage_sample_at`] plays for the
+/// window series.
+pub(crate) fn append_wallet_readings_at(name: &ProfileName, stats: &ThirdPartyStats, ts: u64) {
+    let wallets = crate::providers::balance_wallets(&stats.rows);
+    if wallets.is_empty() {
+        return;
+    }
+    // Last recorded reading per `(label, currency)` identity: the unchanged
+    // check and the bridge compare against each wallet's OWN prior reading,
+    // never a bare file tail (a multi-wallet provider interleaves its
+    // wallets' lines in one file).
+    let prior: HashMap<(String, String), WalletSample> = load_wallet_history(name)
+        .into_iter()
+        .map(|s| ((s.label.clone(), s.currency.clone()), s))
+        .collect();
+    let mut body = String::new();
+    for wallet in &wallets {
+        let prev = prior.get(&(wallet.label.clone(), wallet.currency.clone()));
+        if prev.is_some_and(|p| p.amount == wallet.amount) {
+            continue; // unchanged reading: the log grows only when numbers moved
+        }
+        if let Some(p) = prev {
+            extend_wallet_line(
+                &mut body,
+                ts.saturating_sub(1),
+                &p.label,
+                p.amount,
+                &p.currency,
+            );
+        }
+        extend_wallet_line(
+            &mut body,
+            ts,
+            &wallet.label,
+            wallet.amount,
+            &wallet.currency,
+        );
+    }
+    if body.is_empty() {
+        return;
+    }
+    let Ok(path) = profile_wallet_history_path(name) else {
+        return;
+    };
+    if let Some(dir) = path.parent()
+        && let Err(e) = mkdir_700(dir)
+    {
+        logline!("clauth: failed to create the profile dir for {name}: {e}");
+        return;
+    }
+    match history_append_file(&path) {
+        Ok(mut file) => {
+            use std::io::Write;
+            if let Err(e) = file.write_all(body.as_bytes()) {
+                logline!("clauth: failed to append wallet history for {name}: {e}");
+            }
+        }
+        Err(e) => logline!("clauth: failed to open wallet history for {name}: {e}"),
+    }
+}
+
+/// Serialize one series line onto `body`; skipped only on a serialization
+/// failure, which this plain-data struct cannot produce.
+fn extend_wallet_line(body: &mut String, ts: u64, label: &str, amount: f64, currency: &str) {
+    if let Ok(json) = serde_json::to_string(&WalletSample {
+        ts,
+        label: label.to_string(),
+        amount,
+        currency: currency.to_string(),
+    }) {
+        body.push_str(&json);
+        body.push('\n');
+    }
+}
+
+/// Load all parsed entries from a profile's wallet_history.jsonl, sorted by
+/// timestamp.
+pub(crate) fn load_wallet_history(name: &ProfileName) -> Vec<WalletSample> {
+    let Ok(path) = profile_wallet_history_path(name) else {
+        return vec![];
+    };
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return vec![];
+    };
+    let mut entries: Vec<WalletSample> = content
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    entries.sort_by_key(|s| s.ts);
+    entries
+}
+
+/// Prune a profile's wallet_history.jsonl to keep at most
+/// [`HISTORY_RETENTION_MS`] of entries — the same window and rewrite shape
+/// [`prune_usage_history`] applies to the usage series.
+pub(crate) fn prune_wallet_history(name: &ProfileName) {
+    let Ok(path) = profile_wallet_history_path(name) else {
+        return;
+    };
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let cutoff = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+        - HISTORY_RETENTION_MS;
+
+    let mut kept: Vec<&str> = Vec::new();
+    let mut pruned: usize = 0;
+    for line in content.lines() {
+        if let Ok(entry) = serde_json::from_str::<WalletSample>(line) {
+            if entry.ts >= cutoff {
+                kept.push(line);
+            } else {
+                pruned += 1;
+            }
+        }
+    }
+
+    if pruned > 0 {
+        let body = kept.join("\n");
+        let body = if body.is_empty() { body } else { body + "\n" };
+        // 0o600: the rename swaps the inode, so a plain write would revert the
+        // history log (re-created 0o600 by the appender) to the umask.
+        if let Err(e) = atomic_write_600(&path, body) {
+            logline!("clauth: failed to prune wallet history for {name}: {e}");
+        }
+    }
 }
 
 fn profile_credentials_pending_path(name: &ProfileName) -> Result<PathBuf> {
@@ -1881,15 +2115,187 @@ pub(crate) fn load_app_state() -> Result<AppState> {
     if state.burn_horizon_cap_ms.is_some() {
         state.burn_horizon_cap_ms = Some(state.burn_horizon_cap_ms());
     }
+    if state.context_nudge_threshold_tokens.is_some() {
+        state.context_nudge_threshold_tokens = state.context_nudge_threshold_tokens();
+    }
     Ok(state)
 }
 
 pub(crate) fn save_app_state(state: &AppState) -> Result<()> {
     with_state_lock(|_held| {
         mkdir_700(&clauth_dir()?)?;
-        atomic_write_600(&app_state_path()?, toml::to_string_pretty(state)?)
+        let path = app_state_path()?;
+        let rendered = toml::to_string_pretty(state).context("failed to render profiles.toml")?;
+        atomic_write_600(&path, preserve_unmodelled_state_keys(rendered, &path))
             .context("failed to write profiles.toml")
     })
+}
+
+/// Re-attach onto a rendered `profiles.toml` every top-level key the on-disk
+/// file holds that `AppState` does not model — the `profiles.toml` half of the
+/// rule `serialize_credentials_preserving_extra` states for the credential
+/// store: a rewrite over itself must keep what the model cannot hold.
+///
+/// `AppState` is a closed struct, so a plain re-serialize deletes unknown keys
+/// on every save, and the writers that put them there are exactly the ones
+/// clauth must not overrule: a NEWER clauth whose keys this binary has not
+/// learned (an older install against a newer config silently erases them —
+/// the `auto_start_queue` regression, issue #75) and an operator's hand-edit.
+///
+/// Two exclusions, each closing the other's hole. "Modelled" is decided by
+/// ROUND-TRIPPING the on-disk file through this binary's own `AppState`, so a
+/// modelled key the new state just moved to a default (absent from the render,
+/// its `skip_serializing_if` omitted it) cannot come back from disk with its
+/// stale value — resurrection. But that round-trip erases a modelled key whose
+/// ON-DISK value is itself the skipped default (`show_pace = false` written
+/// by hand), so the second exclusion drops any key the RENDER already names —
+/// without it, a save that moves such a key off default emits it twice, and a
+/// duplicate top-level key is a hard parse error bricking the file. A carried
+/// key is one the model's round-trip never saw AND the render does not write.
+fn preserve_unmodelled_state_keys(rendered: String, path: &Path) -> String {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return rendered; // nothing on disk to preserve (first save)
+    };
+    let Ok(disk) = raw.parse::<toml::Table>() else {
+        return rendered; // unparseable: not ours to resurrect keys from
+    };
+    let Ok(modelled) = modelled_state_keys(&raw) else {
+        // The state did not parse, so which keys are modelled is UNKNOWN, and
+        // carrying everything would duplicate modelled keys already in the
+        // render — a duplicate top-level key is a hard parse error, bricking
+        // the file this save is supposed to keep loadable. Carry nothing.
+        return rendered;
+    };
+    // A key the render itself writes must never be carried beside its copy.
+    let Ok(rendered_keys) = rendered.parse::<toml::Table>() else {
+        return rendered; // a render that does not parse: nothing safe to merge
+    };
+    let carried: Vec<(String, toml::Value)> = disk
+        .into_iter()
+        .filter(|(k, _)| !modelled.contains(k.as_str()) && !rendered_keys.contains_key(k.as_str()))
+        .collect();
+    if carried.is_empty() {
+        return rendered; // the common case: nothing unmodelled on disk
+    }
+    merge_carried_keys(rendered, &carried)
+}
+
+/// Every top-level `profiles.toml` key `AppState` recognizes, derived by
+/// parsing `raw` and re-serializing it: the keys the type emits are exactly the
+/// keys it holds. Serde ignores unmodelled keys on the parse, so their absence
+/// from the re-render is what marks them; this needs no maintained key array
+/// and cannot drift when `AppState` gains a field (a new field's key appears in
+/// the round-trip output on its own). Err on a file that does not parse as
+/// `AppState` — the caller must refuse to carry rather than guess.
+fn modelled_state_keys(raw: &str) -> std::result::Result<std::collections::BTreeSet<String>, ()> {
+    let state = toml::from_str::<AppState>(raw).map_err(|_| ())?;
+    toml::to_string_pretty(&state)
+        .ok()
+        .and_then(|rendered| rendered.parse::<toml::Table>().ok())
+        .map(|t| t.keys().cloned().collect())
+        .ok_or(())
+}
+
+/// Marker comment written above keys `AppState` does not model, so a hand-editor
+/// sees they were carried rather than authored by this save.
+const PRESERVED_KEYS_MARKER: &str =
+    "# keys preserved from the previous file; not modelled by this clauth:";
+
+/// Splice `carried` top-level keys into a rendered TOML document, preserving
+/// table-header scoping — the shared core of the `profiles.toml` and
+/// `config.toml` carries. Appending everything as trailing text (the shape this
+/// replaced) lands a scalar AFTER the render's last `[table]` header, i.e.
+/// inside that table: into `[env]` it is a type error that bricks
+/// `load_profile`, into `[herdr]` it is silently dropped on the next load.
+///
+/// So scalars insert as top-level lines BEFORE the first table header of the
+/// render, tables append at the end (a `[key]` block is top-level wherever it
+/// sits, and its own sub-scope is its own), and within the carried set a
+/// table-valued key is emitted before any carried scalar follows it — the same
+/// trap one level down, from `BTreeMap`'s ordering of the carry itself.
+/// An unrenderable value drops rather than corrupting the document.
+/// A value that renders as one or more `[key]`-headed blocks: a table, or an
+/// array of tables (`[[key]]`). `is_table()` alone misses the array shape,
+/// which is a `Value::Array` whose elements are all tables.
+fn is_table_shaped(value: &toml::Value) -> bool {
+    value.is_table()
+        || value
+            .as_array()
+            .is_some_and(|a| !a.is_empty() && a.iter().all(|v| v.is_table()))
+}
+
+pub(crate) fn merge_carried_keys(rendered: String, carried: &[(String, toml::Value)]) -> String {
+    let lines: Vec<&str> = rendered.lines().collect();
+    // First line that opens a table header — `render_config_toml` and the state
+    // render both emit top-level scalars before any table, so this is the
+    // insertion point for carried scalars.
+    let first_table = lines.iter().position(|l| l.trim_start().starts_with('['));
+    let scalar_cutoff = first_table.unwrap_or(lines.len());
+
+    let mut out = String::with_capacity(rendered.len() + 64);
+    let mut head: Vec<String> = Vec::new();
+    let mut tail: Vec<String> = Vec::new();
+    for (key, value) in carried {
+        let entry: toml::Table = [(key.clone(), value.clone())].into_iter().collect();
+        let Ok(block) = toml::to_string(&entry) else {
+            continue; // unrenderable: drop rather than corrupt
+        };
+        let block = block.trim_end().to_string();
+        // Table-shaped values (a table, or an array of tables — `[[key]]`)
+        // go to the tail; everything else is a top-level scalar for the head.
+        // An array of tables landing in `head` would swallow a later scalar
+        // into its last element, the same scoping trap one level down.
+        if is_table_shaped(value) {
+            tail.push(block);
+        } else {
+            head.push(block);
+        }
+    }
+    if head.is_empty() && tail.is_empty() {
+        return rendered; // nothing renderable; the render alone is the answer
+    }
+    // Scalars: before the first table header, with the marker naming them.
+    if !head.is_empty() {
+        head.insert(0, PRESERVED_KEYS_MARKER.to_string());
+    }
+    // Tables carry the marker only when no scalar block introduced one above —
+    // a marker already naming this save's carried keys, and the tail's blocks
+    // are no farther from it than the render's own trailing sections are.
+    if !tail.is_empty() && head.is_empty() {
+        tail.insert(0, PRESERVED_KEYS_MARKER.to_string());
+    }
+    for (i, line) in lines.iter().enumerate() {
+        if i == scalar_cutoff && !head.is_empty() {
+            if !out.is_empty() && !out.ends_with("\n\n") {
+                out.push('\n');
+            }
+            out.push_str(&head.join("\n"));
+            out.push('\n');
+            if !line.trim().is_empty() {
+                out.push('\n');
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    // Cutoff past the last line (render had no table header): the loop above
+    // never reached the insert point, so the head lands after everything.
+    if scalar_cutoff >= lines.len() && !head.is_empty() {
+        if !out.is_empty() && !out.ends_with("\n\n") {
+            out.push('\n');
+        }
+        out.push_str(&head.join("\n"));
+        out.push('\n');
+    }
+    if !tail.is_empty() {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push('\n');
+        out.push_str(&tail.join("\n"));
+        out.push('\n');
+    }
+    out
 }
 
 /// Set or clear `name`'s persisted `auth_broken` flag against the CURRENT
@@ -2097,10 +2503,11 @@ fn usage_cache_is_third_party(
 /// profile keeps the ENDPOINT on both readers (the pair never reaches it),
 /// but the classification still disagrees: this read sees no pair and answers
 /// third-party where the adopting load answers OAuth-cache. Only the
-/// callers that skip the full load — [`crate::mcp::digest`]'s sample and
-/// [`crate::profile_json::published_windows`] — can observe it; every other caller runs
+/// callers that skip the full load — [`crate::mcp::digest`]'s sample,
+/// [`crate::profile_json::published_windows`], and the MCP roster's
+/// `load_windows` — can observe it; every other caller runs
 /// `load_config` first, and `recover_pending_credentials` consumes the sidecar —
-/// and it costs at most one digest call reporting no refresh. Pinned, in that
+/// and it costs at most one digest call or one roster row reporting no refresh. Pinned, in that
 /// direction, by
 /// `a_staged_pair_is_the_one_state_the_lock_free_read_reads_differently` (both
 /// spellings), and pinned agreeing everywhere else by
@@ -2290,6 +2697,14 @@ pub(crate) fn load_profile(name: &ProfileName) -> Result<Profile> {
     } else {
         None
     };
+    // A third-party account's windows ARE its usage snapshot, so seed `usage`
+    // from them at the same boundary. Every OAuth account keeps `None` here and
+    // is filled by the usage store as before — this load has no OAuth cache to
+    // read, and `third_party_usage` is `Some` only where that store never had an
+    // entry to begin with, so the two can't overwrite each other.
+    let usage = third_party_usage
+        .as_ref()
+        .and_then(crate::providers::ThirdPartyStats::to_usage_info);
 
     let profile = Profile {
         name: name.clone(),
@@ -2325,8 +2740,9 @@ pub(crate) fn load_profile(name: &ProfileName) -> Result<Profile> {
         disabled: config.disabled,
         console: console_credential(&config.console),
         credentials: slot(credentials),
-        usage: None,
+        usage,
         fetch_status: None,
+        usage_stale: false,
         provider,
         third_party_usage,
     };
@@ -2372,6 +2788,7 @@ fn maybe_rewrite_config_toml(config_path: &Path, raw_config: &str, profile: &Pro
     if needs_rewrite {
         let _ = with_state_lock(|_held| {
             // config.toml can carry `api_key` — same 0600 rule as save_profile.
+            let rendered = preserving_config_render(&rendered, config_path);
             let _ = atomic_write_600(config_path, &rendered);
             Ok(())
         });
@@ -2451,12 +2868,70 @@ pub(crate) fn save_profile(profile: &Profile) -> Result<()> {
 
         atomic_write_600(
             &profile_config_path(&profile.name)?,
-            render_config_toml(profile),
+            preserving_config_render(
+                &render_config_toml(profile),
+                &profile_config_path(&profile.name)?,
+            ),
         )
         .context("failed to write config.toml")?;
 
         Ok(())
     })
+}
+
+/// `render_config_toml`'s output with every top-level key the config already
+/// holds that `ProfileConfig` does not model re-attached under a marker — the
+/// `config.toml` half of the same rule `serialize_credentials_preserving_extra`
+/// states for the credential store. The writers that put such keys there are
+/// the ones clauth must not overrule: a newer clauth (whose `auto_start`/
+/// `fallback_threshold` ancestors were themselves once new keys) and an
+/// operator's hand-edit; deleting them on every config mutation (issue #75's
+/// `clauth disable` erasure) loses data no other writer holds.
+///
+/// "Modelled" is decided by round-tripping the ON-DISK file through
+/// `ProfileConfig` — same shape as `preserve_unmodelled_state_keys`, and for
+/// the same reason: a modelled key the profile just moved to a default is
+/// absent from the render, and must not come back from disk. `load_profile`'s
+/// typed-vs-typed drift comparison never sees unmodelled keys, so carrying
+/// them does not add write thrash.
+pub(crate) fn preserving_config_render(rendered: &str, config_path: &Path) -> String {
+    let Ok(raw) = std::fs::read_to_string(config_path) else {
+        return rendered.to_string(); // no file yet: nothing to preserve
+    };
+    let Ok(disk) = raw.parse::<toml::Table>() else {
+        return rendered.to_string(); // unparseable: not ours to resurrect keys from
+    };
+    let Ok(modelled) = modelled_config_keys(&raw) else {
+        // Same refusal as the profiles.toml carry: an unparseable config
+        // cannot be classified, and carrying everything would duplicate the
+        // modelled keys already in the render — a duplicate top-level key is
+        // a hard parse error on the next load.
+        return rendered.to_string();
+    };
+    // A key the render itself writes must never be carried beside its copy.
+    let Ok(rendered_keys) = rendered.parse::<toml::Table>() else {
+        return rendered.to_string(); // a render that does not parse: merge nothing
+    };
+    let carried: Vec<(String, toml::Value)> = disk
+        .into_iter()
+        .filter(|(k, _)| !modelled.contains(k.as_str()) && !rendered_keys.contains_key(k.as_str()))
+        .collect();
+    if carried.is_empty() {
+        return rendered.to_string(); // the common case
+    }
+    merge_carried_keys(rendered.to_string(), &carried)
+}
+
+/// Every top-level `config.toml` key `ProfileConfig` recognizes, derived the
+/// same way `modelled_state_keys` derives its set: parse, re-render, take the
+/// keys. Err on a file that does not parse — the caller refuses to carry.
+fn modelled_config_keys(raw: &str) -> std::result::Result<std::collections::BTreeSet<String>, ()> {
+    let config = toml::from_str::<ProfileConfig>(raw).map_err(|_| ())?;
+    toml::to_string(&config)
+        .ok()
+        .and_then(|rendered| rendered.parse::<toml::Table>().ok())
+        .map(|t| t.keys().cloned().collect())
+        .ok_or(())
 }
 
 /// Write rotated credentials to a sidecar BEFORE `save_profile`. Single-use

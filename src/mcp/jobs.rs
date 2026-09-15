@@ -2,9 +2,9 @@
 //!
 //! A background delegate returns a `job_id` at once and finishes on a detached
 //! blocking task. The result must outlive the originating tool call AND be
-//! readable by a separate process (the `mcp-await-job` PostToolUse hook), so it
-//! lands on disk at `~/.clauth/jobs/<job_id>.json` rather than an in-memory
-//! registry. Writes are atomic (tmp + rename) so a concurrent reader never sees
+//! collectable later, so it lands on disk at `~/.clauth/jobs/<job_id>.json`
+//! rather than an in-memory registry. Writes are atomic (tmp + rename) so a
+//! concurrent reader never sees
 //! a torn file. No lock is taken: the path is keyed by a unique `job_id` and the
 //! finalizing task is the sole writer for its own file — a leaf with no ordering
 //! against the runtime/state locks.
@@ -52,21 +52,18 @@ pub(super) const DONE_TTL_MS: u64 = 24 * 60 * 60 * 1000; // 24h
 /// A `running` file SILENT this long is orphaned (its server died mid-job); reap
 /// it.
 ///
-/// Silence rather than age, because a streaming delegate has no wall clock and
-/// so no maximum lifetime to sit above: a run still healthy at any age would
-/// have had its file deleted under it, and answered `unknown job_id` while its
-/// child kept spending the account.
+/// Silence rather than age, because a delegate has no wall clock and so no
+/// maximum lifetime to sit above: a run still healthy at any age would have had
+/// its file deleted under it, and answered `unknown job_id` while its child kept
+/// spending the account.
 ///
 /// The window is a day plus a 600 s grace, and the day is the point rather than
 /// a deadline derivation: a record whose server died — crash, kill, reboot —
 /// stays resolvable for a day, so the `session_id` it carries can still be
 /// collected and resumed the next morning. Nothing a healthy run does comes
-/// near it: whichever deadline a run's shape carries bounds that run's SILENCE,
-/// and `resolve_deadlines` caps it at `mcp`'s `MAX_RUN_TIMEOUT_SECS` (3600 s),
-/// so once a run has spawned, only a dead server keeps its record silent for
-/// anything close to a day. The 600 s grace, carried over from the old
-/// 3600+600 s window, covers the heartbeat throttle, the kill and the teardown
-/// before `write_done` lands.
+/// near it: a delegate is unbounded, so once a run has spawned, only a dead
+/// server keeps its record silent for anything close to a day. The 600 s grace
+/// covers the heartbeat throttle and the teardown before `write_done` lands.
 ///
 /// "Silent" is measured from the record's own mint (`recorded_at`), not the
 /// run's birth. A blocking delegate handed off mid-flight keeps a `started_at`
@@ -76,24 +73,16 @@ pub(super) const DONE_TTL_MS: u64 = 24 * 60 * 60 * 1000; // 24h
 ///
 /// What CAN sit silent that long under a server that is still alive is the
 /// pre-spawn delay: `ProfileRuntime::acquire` waits out a same-profile rotation
-/// or sibling session start, and the
-/// reader thread that writes the beats has not spawned yet. Both background
-/// shapes spend that delay silent-since-mint — a streaming run is still inside
-/// the acquire with no child, while a pinned-format one can be well past it,
-/// since the same wait plus its 3600 s wall already sits a long run past the
-/// old window with the child spending. The day covers both where 3600+600 s
-/// could not. The delay's two legs are the wait for another holder's rotation
-/// lock, bounded by `runtime::ROTATION_LOCK_TIMEOUT` at tens of seconds, and this
-/// acquire's OWN recursive `~/.claude` copy, which runs inside its own hold and is
-/// bounded by nothing but the disk — so a wait past the day is no longer a
-/// session's lifetime away, as this used to claim, but this run's own tree copy
-/// taking a day, at which point a live run's record does read as a corpse.
-/// A blocking run's
-/// [`RecordKind::Liveness`] record is minted at
-/// the spawn, so the delay is outside its clock entirely and its silence is
-/// bounded by the run's own guards. A handed-off run adds no third exposure:
-/// its clock starts at the crossing, which is strictly after the spawn, so it
-/// is bounded by whichever of the two shapes it already is.
+/// or sibling session start, and the reader thread that writes the beats has not
+/// spawned yet. Both background shapes spend that delay silent-since-mint. The
+/// delay's two legs are the wait for another holder's rotation lock, bounded by
+/// `runtime::ROTATION_LOCK_TIMEOUT` at tens of seconds, and this acquire's OWN
+/// recursive `~/.claude` copy, which runs inside its own hold and is bounded by
+/// nothing but the disk — so a wait past the day reads a live run's record as a
+/// corpse. A blocking run's [`RecordKind::Liveness`] record is minted at the
+/// spawn, so the delay is outside its clock entirely. A handed-off run adds no
+/// third exposure: its clock starts at the crossing, which is strictly after
+/// the spawn.
 pub(crate) const RUNNING_TTL_MS: u64 = (24 * 60 * 60 + 600) * 1000;
 /// The bound on one `monitor` `job_ids` list, keeping one response from growing
 /// without limit.
@@ -129,9 +118,9 @@ pub(crate) enum JobState {
 /// mechanisms hold it up, and both are needed because neither covers the other:
 ///
 /// - An **id-keyed** reader returns content only through [`read`], which joins
-///   `Collectable` and nothing else. `monitor`'s collect and wait paths and
-///   `mcp::await_job` all go through it, and each also filters the id through
-///   [`is_safe_job_id`], which refuses the `.` a `Liveness` name needs.
+///   `Collectable` and nothing else. `monitor`'s collect path goes through it,
+///   and filters the id through [`is_safe_job_id`], which refuses the `.` a
+///   `Liveness` name needs.
 ///   [`liveness_exists`] names the other spelling but answers a bool rather than
 ///   content, and guards its own id.
 /// - [`list`] DOES return `Liveness` content — the pane draws that record's
@@ -192,7 +181,7 @@ pub(crate) struct JobRecord {
     pub(crate) provider: Option<String>,
     /// Whether this run launched isolated (`delegate({isolated: true})`): its
     /// transcript lived in a throwaway tree that dies with the run, so a
-    /// `session_id` on such a record is NOT a handle `delegate({resume})`
+    /// `session_id` on such a record is NOT a handle `delegate({session_id})`
     /// accepts — only `rescue_teardown` lifts an isolated store, and a crash
     /// skips it. `false` on a record an older server wrote: shared is the
     /// delegate default either way, and the serde default keeps those records
@@ -203,21 +192,20 @@ pub(crate) struct JobRecord {
     /// one: the resume handle a crashed run's record must outlive its server
     /// for. The stdout reader captures it long before any crash and the
     /// heartbeat writes it, so a `running` record a killed server left behind
-    /// carries the exact value a `delegate({resume})` accepts. `None` before
+    /// carries the exact value a `delegate({session_id})` accepts. `None` before
     /// the first event names one, on a record an older server wrote (the
     /// `default`), and on a `done` record — a killed run's salvage envelope
     /// carries the handle inside the envelope instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) session_id: Option<String>,
-    /// The wall-clock ceiling this run actually launched under, resolved once by
-    /// `resolve_deadlines`. `0` is never a run about to be killed: it means this
-    /// run HAS no wall clock, which is the normal streaming case, or — paired
-    /// with an absent `idle_secs` — that the server which wrote the record
-    /// predates these fields. `idle_secs` is what tells those two apart.
+    /// Dead fields on new records: a delegate has no wall clock or idle ceiling
+    /// anymore, so the producer writes `0`/`None` here. Kept with serde defaults
+    /// because a record an OLDER server wrote still carries a real deadline pair,
+    /// and [`running_liveness`] still reads that pair back for those records.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub(crate) timeout_secs: u64,
-    /// The idle ceiling, `None` when the idle leg is off entirely (a
-    /// caller-pinned `--output-format` leaves silence carrying no information).
+    /// See [`Self::timeout_secs`]: written `None` on new records, read back only
+    /// from records an older server wrote.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) idle_secs: Option<u64>,
     /// Epoch ms of the most recent stdout line — the same anchor `started_at`
@@ -267,11 +255,10 @@ pub(crate) struct JobRecord {
 }
 
 /// What one job's `running` record carries from its mint through every
-/// heartbeat: identity, the spelling it lands under, and the deadlines the run
-/// launched under. Grouped
-/// so the reserve resolves them once and the heartbeat cannot re-derive them
-/// differently — `resolve_deadlines` applies defaults, clamps and a streaming
-/// fork, and a second derivation goes wrong the first time that fork changes.
+/// heartbeat: identity, the spelling it lands under, and the record's
+/// deadline pair. Grouped so the reserve resolves them once and the heartbeat
+/// cannot re-derive them differently. New records write `0`/`None` here; the
+/// fields stay so a test can still mint the shape an OLDER server wrote.
 #[derive(Debug, Clone)]
 pub(crate) struct RunningSpec {
     pub(crate) job_id: String,
@@ -340,7 +327,7 @@ pub(crate) fn new_job_id(started_at: u64) -> String {
 }
 
 /// True iff `id` is safe as a single path component (no separators, no
-/// traversal). Job ids reaching `monitor` / `mcp-await-job` come from
+/// traversal). Job ids reaching `monitor` come from
 /// tool input, so this guards the path join.
 pub(crate) fn is_safe_job_id(id: &str) -> bool {
     !id.is_empty()
@@ -519,22 +506,6 @@ pub(crate) fn write_done(
 pub(crate) fn read(job_id: &str) -> Option<JobRecord> {
     let bytes = std::fs::read(job_path(job_id, RecordKind::Collectable).ok()?).ok()?;
     serde_json::from_slice(&bytes).ok()
-}
-
-/// The collectable record's mtime, in epoch ms: the moment that record was
-/// finalized, since a Done file's only writer is [`write_atomic`]'s rename and
-/// everything after it removes the file rather than rewriting it. The cancel
-/// verdict dates a kill off this rather than the record's own `done_at`, which
-/// a file written by an older server may not carry.
-pub(crate) fn collectable_mtime_ms(job_id: &str) -> Option<u64> {
-    let path = job_path(job_id, RecordKind::Collectable).ok()?;
-    let mtime = std::fs::metadata(path).ok()?.modified().ok()?;
-    mtime
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_millis()
-        .try_into()
-        .ok()
 }
 
 /// Delete a job file (best-effort). No delivery path calls this any more:
@@ -954,10 +925,6 @@ pub(crate) fn list_banded(now: u64) -> Vec<StoredJob> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RunningLiveness {
     pub(crate) elapsed_secs: u64,
-    /// `false` on a record written before these fields existed, where every
-    /// figure below is absent rather than zero. A wall-less streaming run is the
-    /// other zero-`timeout_secs` shape, and `idle_secs` is what tells them apart.
-    pub(crate) recorded: bool,
     pub(crate) last_output_secs_ago: Option<u64>,
     pub(crate) idle_kill_in_secs: Option<u64>,
     pub(crate) wall_kill_in_secs: Option<u64>,
@@ -971,15 +938,6 @@ pub(crate) struct RunningLiveness {
 /// than this file, so the two never have to agree exactly.
 pub(crate) fn running_liveness(record: &JobRecord, now: u64) -> RunningLiveness {
     let elapsed_secs = now.saturating_sub(record.started_at) / 1000;
-    if record.timeout_secs == 0 && record.idle_secs.is_none() {
-        return RunningLiveness {
-            elapsed_secs,
-            recorded: false,
-            last_output_secs_ago: None,
-            idle_kill_in_secs: None,
-            wall_kill_in_secs: None,
-        };
-    }
     // A run that has said nothing has been idle for its whole life, which is
     // also how the kill path counts it.
     let idle_for_secs = if record.last_output_at == 0 {
@@ -989,7 +947,6 @@ pub(crate) fn running_liveness(record: &JobRecord, now: u64) -> RunningLiveness 
     };
     RunningLiveness {
         elapsed_secs,
-        recorded: true,
         last_output_secs_ago: (record.last_output_at > 0).then_some(idle_for_secs),
         idle_kill_in_secs: record.idle_secs.map(|i| i.saturating_sub(idle_for_secs)),
         wall_kill_in_secs: (record.timeout_secs > 0)

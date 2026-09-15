@@ -167,32 +167,34 @@ impl Note<'_> {
 }
 
 /// The fields of a hook payload this subcommand reads; everything else is
-/// ignored.
-struct Payload {
+/// ignored. `pub(crate)` because the context leg (`hook_context`) reads the
+/// same payload.
+pub(crate) struct Payload {
     /// Echoed back in the output envelope, so the host routes the context to the
     /// event it came from.
-    event: String,
-    session_id: String,
+    pub(crate) event: String,
+    pub(crate) session_id: String,
     /// Present only on a fire from inside a subagent, which is what makes it the
     /// per-call scope key.
-    agent_id: Option<String>,
+    pub(crate) agent_id: Option<String>,
     /// `PostToolUse` only: the tool that fired. `Task` is Claude Code's
     /// agent-spawn tool, the one call the headroom nudge gates on.
-    tool_name: Option<String>,
+    pub(crate) tool_name: Option<String>,
     /// `SessionStart` only. Claude Code documents five: `startup`, `resume`,
     /// `clear`, `compact`, `fork`. Anything this does not recognise rebaselines
     /// silently, because every source Claude Code has added so far marks a
     /// context boundary, and announcing a switch about turns a fresh context
     /// never held is the worse failure.
-    source: Option<String>,
+    pub(crate) source: Option<String>,
     /// Recorded so the sweep can reap a record whose conversation is gone.
-    transcript: Option<PathBuf>,
+    pub(crate) transcript: Option<PathBuf>,
 }
 
 /// One scope's memory of what it was last told, plus the cache that lets the
-/// common fire answer without resolving anything.
+/// common fire answer without resolving anything. `pub(crate)` because the
+/// context leg reads and writes the fields it owns.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-struct NoteRecord {
+pub(crate) struct NoteRecord {
     /// The account this scope was last told about. `None` until a first fire
     /// establishes the baseline — there are no earlier turns to correct then.
     #[serde(default)]
@@ -221,12 +223,17 @@ struct NoteRecord {
     resolved_at: Option<SystemTime>,
     /// This conversation's transcript, for the sweep.
     #[serde(default)]
-    transcript: Option<PathBuf>,
+    pub(crate) transcript: Option<PathBuf>,
     /// The headroom nudge's last-emitted state (r7). `None` on every record
     /// written before the field existed — the `#[serde(default)]` upgrade gate
     /// that keeps old records parsing.
     #[serde(default)]
     nudge: Option<NudgeState>,
+    /// The context leg's memory for this scope: which threshold it last told.
+    /// `None` on every record written before the field existed and while the
+    /// feature is off.
+    #[serde(default)]
+    pub(crate) context: Option<crate::hook_context::ContextState>,
 }
 
 /// The headroom nudge's memory for this scope: which 5h window the last verdict
@@ -403,6 +410,9 @@ pub(crate) fn run() -> Result<()> {
     {
         notes.push(note);
     }
+    if let Some(note) = crate::hook_context::note(&payload) {
+        notes.push(note);
+    }
     // One envelope, whatever fired: two JSON documents on stdout would parse
     // as none, and one `additionalContext` field carries both notes when both
     // earned the turn.
@@ -525,7 +535,7 @@ fn records_dir() -> Result<PathBuf> {
 /// One record per (conversation, scope). The `.` separator is what keeps the two
 /// shapes apart: [`is_bare_id`] admits no dot, so a subagent's file can never
 /// spell the bare conversation's.
-fn record_path(session_id: &str, agent_id: Option<&str>) -> Result<PathBuf> {
+pub(crate) fn record_path(session_id: &str, agent_id: Option<&str>) -> Result<PathBuf> {
     let name = match agent_id {
         Some(agent) => format!("{session_id}.{agent}.json"),
         None => format!("{session_id}.json"),
@@ -533,13 +543,13 @@ fn record_path(session_id: &str, agent_id: Option<&str>) -> Result<PathBuf> {
     Ok(records_dir()?.join(name))
 }
 
-fn load_record(path: &Path) -> Option<NoteRecord> {
+pub(crate) fn load_record(path: &Path) -> Option<NoteRecord> {
     serde_json::from_slice(&std::fs::read(path).ok()?).ok()
 }
 
 /// Owner-only like every `~/.clauth` write: a record names the account a
 /// conversation runs on and where its transcript sits.
-fn store_record(path: &Path, record: &NoteRecord) -> Result<()> {
+pub(crate) fn store_record(path: &Path, record: &NoteRecord) -> Result<()> {
     atomic_write_600(path, serde_json::to_vec(record)?)?;
     Ok(())
 }
@@ -829,7 +839,7 @@ fn touch_record(path: &Path) {
 /// is outer to it — so a future edit that reaches for the state flock while the
 /// scope lock is held trips [`crate::lockorder::RankGuard::enter`]'s assertion
 /// instead of deadlocking.
-struct ScopeLock {
+pub(crate) struct ScopeLock {
     /// Held open for the guard's lifetime and never read: closing the fd is what
     /// releases the flock, so the binding IS the lock. Named like `StateLock`'s
     /// own guards for the same reason. Drops before `_rank`, so the flock
@@ -839,7 +849,7 @@ struct ScopeLock {
 }
 
 impl ScopeLock {
-    fn acquire() -> Self {
+    pub(crate) fn acquire() -> Self {
         const WAIT: Duration = Duration::from_secs(2);
         let held = (|| {
             let dir = records_dir().ok()?;
@@ -1292,9 +1302,11 @@ fn render_nudge(f: &NudgeFigures) -> Option<String> {
 /// would act" about that switch
 /// ([`crate::fallback::snapshot_chain_from`]). Same call the leg makes,
 /// `fallback::next_auto_switch_target`, fed a store hydrated from the caches
-/// the daemon's own store is persisted to and hydrated from; a member with no
-/// cached OAuth usage reads exactly as it reads in the real store (absent
-/// entry = headroom). The `Arc<RankedMutex>` wrapper is the entry point's
+/// the daemon's own store is persisted to and hydrated from — OAuth caches and
+/// third-party caches alike, the latter through the same `to_usage_info`
+/// derivation the scheduler's mirror runs, so a provider window judges this
+/// replay exactly as it judges the live leg. A member with no cached usage
+/// reads exactly as it reads in the real store (absent entry = headroom). The `Arc<RankedMutex>` wrapper is the entry point's
 /// signature, not shared state: the mutex is process-private, never
 /// contended, locked only for the walk's own snapshot clone, and taken while
 /// this process holds no other rank — so no rank in the global order is
@@ -1316,14 +1328,24 @@ fn chain_would_act(
     let usage: std::collections::HashMap<String, crate::usage::UsageInfo> = snapshot
         .chain
         .iter()
-        .filter_map(
-            |m| match crate::profile_json::profile_windows_for(&m.name) {
+        .filter_map(|m| {
+            let derived = match crate::profile_json::profile_windows_for(&m.name) {
                 crate::profile_json::ProfileWindows::Oauth {
                     usage: Some(usage), ..
-                } => Some((m.name.to_string(), *usage)),
-                _ => None,
-            },
-        )
+                } => *usage,
+                // A third-party member's provider windows are windows the live
+                // leg walks on — the scheduler mirrors this same derivation
+                // into its own store — so the replay must judge them too. An
+                // OAuth-only replay reads the member as windowless headroom
+                // and answers "the chain would act" about a switch the live
+                // leg refuses.
+                crate::profile_json::ProfileWindows::ThirdParty {
+                    stats: Some(stats), ..
+                } => stats.to_usage_info()?,
+                _ => return None,
+            };
+            Some((m.name.to_string(), derived))
+        })
         .collect();
     let store: crate::usage::UsageStore =
         std::sync::Arc::new(crate::lockorder::RankedMutex::new(usage));

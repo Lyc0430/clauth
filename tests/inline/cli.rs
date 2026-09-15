@@ -367,6 +367,16 @@ fn login_bare_name_is_oauth_mode() {
     assert!(!a.yes);
 }
 
+// ── capture ──────────────────────────────────────────────────────────────────
+
+#[test]
+fn capture_parses_with_a_profile_argument() {
+    let Command::Capture { profile } = command(&["capture", "acme"]) else {
+        panic!("capture must parse");
+    };
+    assert_eq!(profile, "acme");
+}
+
 #[test]
 fn login_accepts_a_short_alias_or_a_full_custom_model_id() {
     assert_eq!(
@@ -535,6 +545,50 @@ fn login_rejects_flag_shaped_profile_names_and_a_second_positional() {
     }
 }
 
+/// `--cert`/`--key` come as a pair, and only alongside `--listen`.
+///
+/// Both halves matter. A lone `--cert` would otherwise be accepted and then
+/// silently fall back to the lego certificate at startup, which is the failure
+/// the flag exists to avoid — the operator would be told the host has no
+/// certificate for a name they never asked it to use. And without `--listen`
+/// there is no listener for either file to serve, so accepting them would be a
+/// no-op that reads like configuration.
+#[test]
+fn cert_and_key_are_required_together_and_only_with_listen() {
+    for args in [
+        ["daemon", "--listen", "--cert", "/tmp/a.crt"].as_slice(),
+        ["daemon", "--listen", "--key", "/tmp/a.key"].as_slice(),
+        ["daemon", "--cert", "/tmp/a.crt", "--key", "/tmp/a.key"].as_slice(),
+    ] {
+        assert_eq!(parse_exit_code(args), 2, "{args:?} must be a usage error");
+    }
+
+    let Command::Daemon {
+        listen, cert, key, ..
+    } = command(&[
+        "daemon",
+        "--listen",
+        "--cert",
+        "/tmp/a.crt",
+        "--key",
+        "/tmp/a.key",
+    ])
+    else {
+        panic!("must parse");
+    };
+    assert!(
+        listen.is_some(),
+        "bare --listen still takes the default bind"
+    );
+    assert_eq!(
+        (cert.as_deref(), key.as_deref()),
+        (
+            Some(std::path::Path::new("/tmp/a.crt")),
+            Some(std::path::Path::new("/tmp/a.key"))
+        )
+    );
+}
+
 // ── delete / disable / enable ───────────────────────────────────────────────
 
 #[test]
@@ -676,6 +730,10 @@ fn daemon_modes_are_mutually_exclusive_and_default_to_exit_if_running() {
         no_standby,
         replace,
         status,
+        listen,
+        cert,
+        key,
+        dump_openapi,
     } = command(&["daemon"])
     else {
         panic!("must parse");
@@ -684,6 +742,19 @@ fn daemon_modes_are_mutually_exclusive_and_default_to_exit_if_running() {
         (standby, no_standby, replace, status),
         (false, false, false, false),
         "bare `clauth daemon` picks no mode, which dispatch reads as exit-if-running"
+    );
+    assert!(
+        !dump_openapi,
+        "the document dump is opt-in exactly like the listener"
+    );
+    assert_eq!(
+        listen, None,
+        "the REST API is off unless an address is asked for"
+    );
+    assert_eq!(
+        (cert, key),
+        (None, None),
+        "TLS comes from this host's lego certificate unless both files are named"
     );
 
     for (args, flag) in [
@@ -697,6 +768,10 @@ fn daemon_modes_are_mutually_exclusive_and_default_to_exit_if_running() {
             no_standby,
             replace,
             status,
+            listen,
+            cert: _,
+            key: _,
+            dump_openapi: _,
         } = command(args)
         else {
             panic!("{args:?} must parse");
@@ -715,9 +790,11 @@ fn daemon_modes_are_mutually_exclusive_and_default_to_exit_if_running() {
                 name == flag
             );
         }
+        assert_eq!(listen, None, "{args:?} asks for no listener");
     }
 
-    // Every pair conflicts, so no invocation can ask for two start modes.
+    // Every pair conflicts, so no invocation can ask for two start modes, and
+    // the one-shot `--status` cannot be asked for alongside one.
     for pair in [
         ["--standby", "--no-standby"],
         ["--standby", "--replace"],
@@ -733,6 +810,295 @@ fn daemon_modes_are_mutually_exclusive_and_default_to_exit_if_running() {
         );
     }
     assert_eq!(parse_exit_code(&["daemon", "--nope"]), 2);
+}
+
+/// `--listen` is orthogonal to the start modes (a supervised daemon still
+/// serves the API) but not to the one-shots, which print and exit.
+#[test]
+fn listen_parses_an_address_and_composes_with_the_start_modes() {
+    let Command::Daemon { listen, .. } = command(&["daemon", "--listen", "0.0.0.0:8443"]) else {
+        panic!("must parse");
+    };
+    assert_eq!(
+        listen,
+        Some(std::net::SocketAddr::from(([0, 0, 0, 0], 8443))),
+        "clap parses the address, so a typo fails before the daemon starts"
+    );
+
+    let Command::Daemon { listen, .. } = command(&["daemon", "--listen", "127.0.0.1:9000"]) else {
+        panic!("must parse");
+    };
+    assert_eq!(
+        listen,
+        Some(std::net::SocketAddr::from(([127, 0, 0, 1], 9000)))
+    );
+
+    for mode in ["--standby", "--no-standby", "--replace"] {
+        let Command::Daemon { listen, .. } = command(&["daemon", mode, "--listen", "0.0.0.0:8443"])
+        else {
+            panic!("daemon {mode} --listen must parse");
+        };
+        assert!(listen.is_some(), "{mode} should not conflict with --listen");
+    }
+
+    assert_eq!(
+        parse_exit_code(&["daemon", "--status", "--listen", "0.0.0.0:8443"]),
+        2,
+        "daemon --status --listen must be refused as a conflict"
+    );
+
+    for bad in ["8443", "not-an-address", "0.0.0.0", "0.0.0.0:99999"] {
+        assert_eq!(
+            parse_exit_code(&["daemon", "--listen", bad]),
+            2,
+            "--listen {bad:?} must be refused at parse time"
+        );
+    }
+}
+
+/// A value-less `--listen` binds [`crate::cli::DEFAULT_LISTEN`], and taking no
+/// value must not make the flag start swallowing the argument after it.
+#[test]
+fn bare_listen_defaults_to_every_interface_without_eating_the_next_flag() {
+    let default = crate::cli::DEFAULT_LISTEN
+        .parse::<std::net::SocketAddr>()
+        .expect("DEFAULT_LISTEN must be a parseable address");
+
+    let Command::Daemon { listen, .. } = command(&["daemon", "--listen"]) else {
+        panic!("bare `daemon --listen` must parse");
+    };
+    assert_eq!(
+        listen,
+        Some(default),
+        "a value-less --listen takes the documented default"
+    );
+
+    // The flag is still opt-in: nothing about the default leaks into a `daemon`
+    // that never asked for a listener.
+    let Command::Daemon { listen, .. } = command(&["daemon"]) else {
+        panic!("must parse");
+    };
+    assert_eq!(listen, None, "no --listen still means no listener");
+
+    // `num_args = 0..=1` is the risk here: a following flag must be read as a
+    // flag, not consumed as the address, in either order.
+    for mode in ["--standby", "--no-standby", "--replace"] {
+        let Command::Daemon {
+            listen,
+            standby,
+            no_standby,
+            replace,
+            ..
+        } = command(&["daemon", "--listen", mode])
+        else {
+            panic!("daemon --listen {mode} must parse");
+        };
+        assert_eq!(
+            listen,
+            Some(default),
+            "--listen {mode} must default, not swallow {mode}"
+        );
+        assert!(
+            standby || no_standby || replace,
+            "{mode} must still register as a start mode after a bare --listen"
+        );
+
+        let Command::Daemon { listen, .. } = command(&["daemon", mode, "--listen"]) else {
+            panic!("daemon {mode} --listen must parse");
+        };
+        assert_eq!(
+            listen,
+            Some(default),
+            "{mode} then a bare --listen defaults"
+        );
+    }
+
+    // The one-shot conflicts with the shorthand exactly as it does with the
+    // spelled-out address.
+    assert_eq!(
+        parse_exit_code(&["daemon", "--status", "--listen"]),
+        2,
+        "daemon --status --listen must be refused as a conflict"
+    );
+}
+
+/// The global token's flags are gone with no shim, so a script still passing
+/// either gets clap's own unknown-argument error, alone or beside another flag.
+#[test]
+fn the_retired_token_flags_are_unknown_arguments() {
+    for args in [
+        ["daemon", "--print-token"].as_slice(),
+        ["daemon", "--rotate-token"].as_slice(),
+        ["daemon", "--listen", "--print-token"].as_slice(),
+        ["daemon", "--status", "--rotate-token"].as_slice(),
+    ] {
+        let err = parse(args).expect_err("a retired flag must not parse");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::UnknownArgument,
+            "{args:?}"
+        );
+        assert_eq!(err.exit_code(), 2, "{args:?}");
+    }
+}
+
+/// `--dump-openapi` writes the exact bytes `GET /api/v1/openapi.json` serves.
+/// Driven through `write_openapi_document` into a buffer, never the real
+/// stdout: the document is ~27 KB and printing it on every selecting run is
+/// noise. The no-home pin and the gone-reader exit live in
+/// `tests/dump_openapi.rs`, which spawns the real binary.
+#[test]
+fn dump_openapi_writes_the_served_bytes_verbatim() {
+    let mut buf: Vec<u8> = Vec::new();
+    crate::write_openapi_document(&mut buf).expect("dump must write");
+    assert_eq!(
+        buf,
+        crate::daemon::api::routes::openapi_document_bytes().expect("document serializes"),
+        "the dump must be the exact bytes GET /api/v1/openapi.json serves"
+    );
+}
+
+/// A reader that left mid-dump ends the dump at `Ok` — exit 0 at the real
+/// entry — because the pipeline reported what the reader returned, not this run
+/// failing.
+#[test]
+fn dump_openapi_ends_ok_when_the_reader_is_gone() {
+    struct BrokenPipe;
+    impl std::io::Write for BrokenPipe {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    crate::write_openapi_document(&mut BrokenPipe)
+        .expect("a gone reader ends the dump at Ok, not an error");
+}
+
+/// `--dump-openapi` refuses every flag that starts or probes a daemon, so no
+/// invocation can ask for both a document dump and a listener/certificate/probe.
+#[test]
+fn dump_openapi_conflicts_with_every_daemon_starting_or_probing_flag() {
+    for (other, value) in [
+        ("--standby", None),
+        ("--no-standby", None),
+        ("--replace", None),
+        ("--status", None),
+        ("--listen", None),
+        ("--cert", Some("/tmp/a.crt")),
+        ("--key", Some("/tmp/a.key")),
+    ] {
+        let mut args = vec!["daemon", "--dump-openapi", other];
+        if let Some(v) = value {
+            args.push(v);
+        }
+        let err = parse(&args).expect_err("--dump-openapi must refuse this flag");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "--dump-openapi + {other}"
+        );
+        assert_eq!(err.exit_code(), 2, "--dump-openapi + {other}");
+    }
+}
+
+// ── devices ─────────────────────────────────────────────────────────────────
+
+/// `devices` parses its four verbs: bare lists, with or without `--json`;
+/// `pair` and `add` take a name and an optional `--control`; `revoke` a name.
+#[test]
+fn devices_parses_its_four_verbs() {
+    use crate::cli::DevicesCommand;
+
+    assert!(matches!(
+        command(&["devices"]),
+        Command::Devices {
+            json: false,
+            cmd: None
+        }
+    ));
+    assert!(matches!(
+        command(&["devices", "--json"]),
+        Command::Devices {
+            json: true,
+            cmd: None
+        }
+    ));
+    for (args, want_control) in [
+        (["devices", "pair", "phone"].as_slice(), false),
+        (["devices", "pair", "phone", "--control"].as_slice(), true),
+        (["devices", "pair", "--control", "phone"].as_slice(), true),
+    ] {
+        let Command::Devices {
+            cmd: Some(DevicesCommand::Pair { name, control }),
+            ..
+        } = command(args)
+        else {
+            panic!("{args:?} must parse as pair");
+        };
+        assert_eq!(
+            (name.as_str(), control),
+            ("phone", want_control),
+            "{args:?}"
+        );
+    }
+    for (args, want_control) in [
+        (["devices", "add", "tray"].as_slice(), false),
+        (["devices", "add", "tray", "--control"].as_slice(), true),
+    ] {
+        let Command::Devices {
+            cmd: Some(DevicesCommand::Add { name, control }),
+            ..
+        } = command(args)
+        else {
+            panic!("{args:?} must parse as add");
+        };
+        assert_eq!((name.as_str(), control), ("tray", want_control), "{args:?}");
+    }
+    let Command::Devices {
+        cmd: Some(DevicesCommand::Revoke { name }),
+        ..
+    } = command(&["devices", "revoke", "phone"])
+    else {
+        panic!("revoke must parse");
+    };
+    assert_eq!(name, "phone");
+
+    for args in [
+        ["devices", "pair"].as_slice(),
+        ["devices", "add"].as_slice(),
+        ["devices", "revoke"].as_slice(),
+        ["devices", "revoke", "phone", "--control"].as_slice(),
+        ["devices", "pair", "phone", "extra"].as_slice(),
+        ["devices", "--json", "pair", "phone"].as_slice(),
+        ["devices", "pair", "phone", "--json"].as_slice(),
+        ["devices", "list"].as_slice(),
+    ] {
+        assert_eq!(parse_exit_code(args), 2, "{args:?} must be a usage error");
+    }
+}
+
+/// `revoke` of a name no device holds is a plain failure naming it: exit 1,
+/// not the usage code.
+#[test]
+fn revoking_an_unknown_device_exits_one_naming_it() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let err = dispatch(Cli {
+        theme: None,
+        command: Some(Command::Devices {
+            json: false,
+            cmd: Some(crate::cli::DevicesCommand::Revoke {
+                name: "ghost".to_string(),
+            }),
+        }),
+    })
+    .expect_err("no device holds that name");
+    assert_eq!(
+        err.to_string(),
+        "no device named 'ghost'; `clauth devices` lists the paired ones"
+    );
+    assert_eq!(crate::exit_code(Err(err)), 1);
 }
 
 #[test]
@@ -1048,6 +1414,10 @@ fn an_absent_daemon_reports_exit_one_not_the_usage_code() {
             no_standby: false,
             replace: false,
             status: true,
+            listen: None,
+            cert: None,
+            key: None,
+            dump_openapi: false,
         }),
     })
     .expect_err("no daemon is running in the sandbox");
@@ -1250,6 +1620,7 @@ fn acme_with_chain() -> crate::profile::Profile {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     acme
@@ -1748,6 +2119,7 @@ mod static_token_verdicts {
                     "user:profile".to_string(),
                 ]),
                 subscription_type: Some("max".into()),
+                ..crate::profile::OAuthToken::default_extra()
             },
         )
         .expect("stamp");
@@ -1808,6 +2180,7 @@ mod static_token_verdicts {
                     "user:sessions:claude_code".to_string(),
                 ]),
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         };
         std::fs::write(
@@ -1843,6 +2216,7 @@ mod static_token_verdicts {
                     "user:profile".to_string(),
                 ]),
                 subscription_type: Some("max".into()),
+                ..crate::profile::OAuthToken::default_extra()
             }),
         });
         crate::profile::save_profile(&profile).expect("save profile");
@@ -1912,6 +2286,7 @@ mod static_token_verdicts {
                 expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         });
         crate::profile::save_profile(&profile).expect("save profile");
@@ -1946,6 +2321,7 @@ mod static_token_verdicts {
                 expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         });
         crate::profile::save_profile(&unusable).expect("save profile");
@@ -2026,6 +2402,7 @@ mod static_token_verdicts {
                     "user:sessions:claude_code".to_string(),
                 ]),
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         });
         crate::profile::save_profile(&profile).expect("save profile");
@@ -2088,6 +2465,7 @@ mod static_token_verdicts {
                 expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         };
         std::fs::write(
@@ -2122,6 +2500,7 @@ mod static_token_verdicts {
                     "user:sessions:claude_code".to_string(),
                 ]),
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         };
         std::fs::write(
@@ -2149,6 +2528,7 @@ mod static_token_verdicts {
                     "user:sessions:claude_code".to_string(),
                 ]),
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         };
         std::fs::write(
@@ -2381,6 +2761,7 @@ mod static_token_clear {
                     expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
                     scopes: None,
                     subscription_type: None,
+                    ..crate::profile::OAuthToken::default_extra()
                 }),
             });
         }
@@ -2416,6 +2797,7 @@ mod static_token_clear {
                     "user:profile".to_string(),
                 ]),
                 subscription_type: Some("max".into()),
+                ..crate::profile::OAuthToken::default_extra()
             },
         )
         .expect("stamp");
@@ -2481,6 +2863,7 @@ mod static_token_clear {
                         expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
                         scopes: None,
                         subscription_type: None,
+                        ..crate::profile::OAuthToken::default_extra()
                     }),
                 })
                 .expect("serialize login"),
@@ -2682,6 +3065,7 @@ mod static_token_clear {
                     expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
                     scopes: None,
                     subscription_type: None,
+                    ..crate::profile::OAuthToken::default_extra()
                 }),
             })
             .expect("ser"),
@@ -2756,5 +3140,159 @@ fn cli_delete_refuses_while_a_rotation_holds_the_lock() {
             .expect_err("an in-flight rotation must block the CLI delete")
             .to_string(),
         "'cli-held' has a token rotation in progress, retry in a moment"
+    );
+}
+
+// ── login paste door: the piped reader and the raw-mode key loop ─────────────
+
+/// The piped-stdin reader behind the paste door: a driver writes one line and
+/// may close stdin without a newline; an EOF or a blank line is `Ok(None)`
+/// (the browser door keeps waiting), and nothing longer than the cap is held.
+#[test]
+fn read_manual_code_from_accepts_one_bounded_line() {
+    use std::io::Cursor;
+    let ok = |s: &str| super::read_manual_code_from(Cursor::new(s.as_bytes().to_vec()));
+    let line = |s: &str| ok(s).expect("must read").map(|l| l.trim().to_string());
+    assert_eq!(line("abc#st\n").as_deref(), Some("abc#st"));
+    assert_eq!(
+        line("abc#st").as_deref(),
+        Some("abc#st"),
+        "a line ended by EOF passes"
+    );
+    assert_eq!(
+        line("abc#st\nsecond line\n").as_deref(),
+        Some("abc#st"),
+        "only the first line is the code"
+    );
+    assert!(ok("").expect("immediate eof").is_none(), "EOF is Ok(None)");
+    assert!(
+        ok("   \n").expect("blank line").is_none(),
+        "a blank line is Ok(None)"
+    );
+    // The cap is judged on the code, not the line: exactly the cap passes
+    // with a `\n`, a CRLF, or EOF behind it, and one byte more is refused
+    // however the line ends.
+    let exact = "a".repeat(crate::oauth_login::MANUAL_CODE_MAX);
+    for tail in ["\n", "\r\n", ""] {
+        let got = ok(&format!("{exact}{tail}")).unwrap_or_else(|e| panic!("{tail:?}: {e}"));
+        assert_eq!(
+            got.as_deref().map(|s| s.trim_end_matches(['\r', '\n'])),
+            Some(exact.as_str()),
+            "{tail:?}"
+        );
+    }
+    let long = "a".repeat(crate::oauth_login::MANUAL_CODE_MAX + 1);
+    for tail in ["\n", "\r\n", ""] {
+        let err = ok(&format!("{long}{tail}")).expect_err("one over the cap");
+        assert_eq!(
+            err.to_string(),
+            crate::oauth_login::ManualCodeError::TooLong.message(),
+            "{tail:?}: the canned message, never the input"
+        );
+        assert!(!err.to_string().contains("aaaa"), "never echoes the input");
+    }
+}
+
+/// The raw-mode paste loop's pure step: which keystrokes edit, submit, or
+/// cancel, and that a non-`Press` event (Windows delivers release events too)
+/// changes nothing.
+#[test]
+fn feed_paste_key_decides_append_cap_backspace_submit_and_cancel() {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
+    let mut buf = String::new();
+    assert!(matches!(
+        super::feed_paste_key(&mut buf, crate::testutil::key(KeyCode::Char('a'))),
+        super::PasteKey::Continue
+    ));
+    assert_eq!(buf, "a");
+    super::feed_paste_key(&mut buf, crate::testutil::key(KeyCode::Char('#')));
+    assert_eq!(buf, "a#");
+    assert!(matches!(
+        super::feed_paste_key(&mut buf, crate::testutil::key(KeyCode::Backspace)),
+        super::PasteKey::Continue
+    ));
+    assert_eq!(buf, "a");
+    assert!(matches!(
+        super::feed_paste_key(&mut buf, crate::testutil::key(KeyCode::Enter)),
+        super::PasteKey::Submit
+    ));
+    assert!(matches!(
+        super::feed_paste_key(&mut buf, crate::testutil::key(KeyCode::Esc)),
+        super::PasteKey::Cancel
+    ));
+    assert!(matches!(
+        super::feed_paste_key(
+            &mut buf,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+        ),
+        super::PasteKey::Cancel
+    ));
+    // A non-Press event is a no-op.
+    let before = buf.clone();
+    assert!(matches!(
+        super::feed_paste_key(
+            &mut buf,
+            KeyEvent::new_with_kind(
+                KeyCode::Char('x'),
+                KeyModifiers::NONE,
+                KeyEventKind::Release
+            )
+        ),
+        super::PasteKey::Continue
+    ));
+    assert_eq!(buf, before, "a Release must not edit the buffer");
+    // A Char at the cap is dropped, never echoed: the buffer stays at the cap.
+    let mut full = "a".repeat(crate::oauth_login::MANUAL_CODE_MAX);
+    assert!(matches!(
+        super::feed_paste_key(&mut full, crate::testutil::key(KeyCode::Char('b'))),
+        super::PasteKey::Continue
+    ));
+    assert_eq!(
+        full.len(),
+        crate::oauth_login::MANUAL_CODE_MAX,
+        "cap is exact"
+    );
+    super::feed_paste_key(&mut full, crate::testutil::key(KeyCode::Backspace));
+    assert_eq!(full.len(), crate::oauth_login::MANUAL_CODE_MAX - 1);
+}
+
+/// The paste loop's other exit, decided between keystrokes off the progress
+/// channel: a landed door ends the prompt, and so does a worker that returned
+/// with none (the channel disconnects), or the prompt would outlive the login
+/// and its error would print as `login canceled`. A verify bump cannot arrive
+/// before the door it follows, and an empty channel keeps the prompt.
+#[test]
+fn the_paste_prompt_ends_on_a_landed_door_or_a_finished_worker() {
+    use crate::oauth_login::{LoginMethod, LoginProgress};
+    use std::sync::mpsc::TryRecvError;
+    for door in [LoginMethod::Browser, LoginMethod::Manual] {
+        assert!(
+            super::worker_done(Ok(LoginProgress::ExchangingCode(door))),
+            "{door:?}: a landed door ends the prompt"
+        );
+    }
+    assert!(
+        super::worker_done(Err(TryRecvError::Disconnected)),
+        "a worker that gave up ends the prompt"
+    );
+    assert!(
+        !super::worker_done(Ok(LoginProgress::Verifying)),
+        "a verify bump keeps it"
+    );
+    assert!(
+        !super::worker_done(Err(TryRecvError::Empty)),
+        "an empty channel keeps it"
+    );
+}
+
+/// `--manual` is gone: an argv naming it is now an unknown-flag refusal, like
+/// any other flag that never existed.
+#[test]
+fn login_rejects_the_removed_manual_flag() {
+    assert_eq!(
+        parse_exit_code(&["login", "acme", "--manual"]),
+        2,
+        "a removed flag must be a usage error, not silently ignored"
     );
 }

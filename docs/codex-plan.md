@@ -26,7 +26,7 @@ Ownership: the contributor's agent implements the whole thing (harness groundwor
    - clauth never refreshes a chain whose access token is inside codex's own 5-minute pre-expiry window. That race is lost by construction.
 8. **Concurrent codex sessions are allowed, and safe because they share one physical `auth.json`.** Not because clauth propagates anything. Every session home links `auth.json` to `profiles/<name>/auth.json`; codex's own reload-and-skip guard (`manager.rs:2366-2400`) handles codex-versus-codex, and `RotationGuard` handles clauth-versus-codex. Any design that COPIES the file creates a second carrier that cannot see the first, which is the permanent-death case.
 9. **Behavior-preserving for claude.** `profiles.toml`, the credential/switch path, and the claude usage/fallback code are untouched by the file split. The existing suite gates it. The four latent fixes in "Folded fixes" are the deliberate exception and each ships as its own commit.
-10. **Published surface is ADDITIVE, no schema bump.** `status.json` stays `SCHEMA_VERSION` 1; top-level `active_profile` + `wrap_off` remain the claude slot (`status_json.rs:235,237`); per-harness fields are added alongside. `which --json` and MCP `list_profiles` gain codex fields additively. Note there are now TWO in-binary readers of that feed, `probe.rs` and `list.rs`, so additive means additive for `list`'s column derivation too.
+10. **Published surface is ADDITIVE, no schema bump.** `status.json` stays `SCHEMA_VERSION` 2; top-level `active_profile` + `wrap_off` remain the claude slot (`status_json.rs:235,237`); per-harness fields are added alongside. `which --json` and MCP `list_profiles` gain codex fields additively. Note there are now TWO in-binary readers of that feed, `probe.rs` and `list.rs`, so additive means additive for `list`'s column derivation too.
 11. **Capture refuses under keyring/auto.** `clauth login <p> --codex` reads the operator's real `~/.codex/auth.json`, which under `keyring`/`auto` is absent or stale by design. Capture errors naming `cli_auth_credentials_store` and the fix, rather than silently snapshotting nothing.
 12. **Ship as a reviewable series** (see "Delivery"), never one entangled diff. That is what made #51 hard to review.
 
@@ -161,7 +161,7 @@ The rest of the sweep has no codex multiplier; all but three rows landed 2026-08
 | isolated `start` | port (`CODEX_HOME` pin, forced file store, the runtime table above) |
 | `clauth which` | port (codex arm off `CODEX_HOME`) |
 | burn rate + ETA | port unchanged (`burn.rs` is label-driven and names no window) |
-| `status.json` / `which --json` / `list_profiles` / completions | ADDITIVE codex fields, schema stays 1 |
+| `status.json` / `which --json` / `list_profiles` / completions | ADDITIVE codex fields, schema stays 2 |
 | TUI `c codex` / `c claude` filter + header chip | in scope |
 | TUI Overview active-account marker animation | in scope: `⬢`/`⬣` beside the active codex account; claude side TBD, its glyphs captured from a live CC session |
 | daemon version in the feed + an old-daemon warning line | in scope |

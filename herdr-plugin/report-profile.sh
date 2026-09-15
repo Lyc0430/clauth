@@ -29,8 +29,6 @@ session_row() {
     _pid=$1
     _depth=0
     while [ "${_pid:-0}" -gt 1 ] && [ "$_depth" -lt 8 ]; do
-        # The trailing wildcard keeps the hook's own `clauth mcp-await-job`
-        # out: that cmdline continues with a dash, never a space or nothing.
         _args=$(ps -o args= -p "$_pid" 2>/dev/null)
         case "$_args" in
             'clauth mcp '* | 'clauth mcp') : ;;

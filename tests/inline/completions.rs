@@ -841,3 +841,17 @@ fn the_parity_scan_still_catches_a_bare_apostrophe_beside_the_escape_idiom() {
         "the idiom alone is balanced zsh and must not red"
     );
 }
+
+/// `--manual` is gone from the login surface: no shell script may mention it,
+/// and the zsh + fish login descriptions read the bare browser-OAuth wording.
+#[test]
+fn every_shell_drops_the_manual_login_flag() {
+    for script in [&BASH, &ZSH, &FISH] {
+        assert!(
+            !script.contains("--manual"),
+            "the --manual flag must not appear in any completion script"
+        );
+    }
+    assert!(ZSH.contains("'login[log in via browser OAuth or an API key]'"));
+    assert!(FISH.contains("-a login -d \"Log in via browser OAuth or an API key\""));
+}

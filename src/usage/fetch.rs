@@ -11,7 +11,7 @@ use crate::profile_cache::{
     write_profile_cache,
 };
 
-use super::scheduler::{ActivityStore, ProfileActivity, mark_activity};
+use super::scheduler::{ActivityStore, MAX_RETRY_AFTER_MS, ProfileActivity, mark_activity};
 
 const USAGE_ENDPOINT: &str = "https://api.anthropic.com/api/oauth/usage";
 const PROFILE_ENDPOINT: &str = "https://api.anthropic.com/api/oauth/profile";
@@ -465,6 +465,15 @@ pub(crate) struct UsageInfo {
     /// those lines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) open_at: Option<i64>,
+    /// Epoch-ms of the fetch that produced this body — the age clock EVERY
+    /// OAuth surface keys on, through the one contract in
+    /// [`crate::profile_json::oauth_age`]: `status.json`, the TUI stale cue and
+    /// the MCP payloads alike. Stamped only on live fetch outcomes, so a
+    /// plan-only cache re-write advances no age; `None` = undated (a plan-only
+    /// cold fill, or a cache written before this field existed), which reads
+    /// STALE with no age published rather than fresh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) fetched_at: Option<u64>,
 }
 
 /// Fixed labels for the two always-present windows. Per-model weekly labels are
@@ -839,27 +848,38 @@ pub(super) enum FetchError {
 /// Parse a `retry-after` header value into a delay from now. Accepts the
 /// delta-seconds form (`120`) and the IMF-fixdate HTTP-date form
 /// (`Wed, 21 Oct 2015 07:28:00 GMT`); a past date yields `Duration::ZERO` and
-/// anything else returns `None` — no usable hint.
+/// anything else returns `None` — no usable hint. The result is clamped to
+/// [`MAX_RETRY_AFTER_MS`] (see [`parse_retry_after_at`]).
 pub(crate) fn parse_retry_after(value: &str) -> Option<Duration> {
     parse_retry_after_at(value, now_epoch_secs())
 }
 
 /// Pure core of [`parse_retry_after`] taking the reference instant, so the
 /// HTTP-date branch is deterministic under test.
+///
+/// Both branches clamp the returned delay to [`MAX_RETRY_AFTER_MS`]: a server
+/// hint past the cap becomes the cap (cloudy's 2026-09-07 ruling), and the
+/// bound keeps every consumer's `as_millis() as u64` cast from wrapping — an
+/// unbounded 2^61-second hint would otherwise cast to exactly 0 ms, i.e.
+/// "retry now". `Duration::ZERO` survives the clamp; the deferral sites'
+/// own `.min(MAX_RETRY_AFTER_MS)` stays as defense in depth.
 pub(crate) fn parse_retry_after_at(value: &str, now_secs: i64) -> Option<Duration> {
     let value = value.trim();
-    if let Ok(secs) = value.parse::<u64>() {
-        return Some(Duration::from_secs(secs));
-    }
-    let target = httpdate_to_epoch_secs(value)?;
-    Some(Duration::from_secs(
-        target.saturating_sub(now_secs).max(0) as u64
-    ))
+    let raw = if let Ok(secs) = value.parse::<u64>() {
+        Duration::from_secs(secs)
+    } else {
+        let target = httpdate_to_epoch_secs(value)?;
+        Duration::from_secs(target.saturating_sub(now_secs).max(0) as u64)
+    };
+    Some(raw.min(Duration::from_millis(MAX_RETRY_AFTER_MS)))
 }
 
 /// Parse an HTTP-date in IMF-fixdate form (`Wed, 21 Oct 2015 07:28:00 GMT`) to
 /// Unix epoch seconds. The obsolete RFC-850 / asctime forms and anything
-/// malformed return `None`.
+/// malformed return `None`. Every calendar field is range-checked BEFORE any
+/// arithmetic: the year fits the 4DIGIT grammar (0..=9999), the day exists in
+/// its month, and the time fields are non-negative — so no out-of-range input
+/// reaches `days_from_civil` or the epoch arithmetic.
 fn httpdate_to_epoch_secs(value: &str) -> Option<i64> {
     let mut parts = value.split_ascii_whitespace();
     parts.next()?; // day-of-week (e.g. "Wed,") — unused
@@ -887,10 +907,31 @@ fn httpdate_to_epoch_secs(value: &str) -> Option<i64> {
     let hour: i64 = hms.next()?.parse().ok()?;
     let minute: i64 = hms.next()?.parse().ok()?;
     let second: i64 = hms.next()?.parse().ok()?;
-    if hms.next().is_some() || !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60 {
+    // IMF-fixdate year is 4DIGIT (RFC 9110 §5.6.7), so anything outside
+    // 0..=9999 is malformed. The bound also makes the arithmetic below
+    // overflow-proof: 9999-12-31 is ~2.5e11 epoch seconds, orders of
+    // magnitude inside i64, so no product can overflow on either profile.
+    if hms.next().is_some()
+        || !(0..=9999).contains(&year)
+        || !(1..=days_in_month(year, month)).contains(&day)
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&minute)
+        || !(0..=60).contains(&second)
+    {
         return None;
     }
     Some(days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second)
+}
+
+/// Length of `month` (1..=12) in `year`, proleptic Gregorian, leap-year-correct
+/// February.
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        4 | 6 | 9 | 11 => 30,
+        2 if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 => 29,
+        2 => 28,
+        _ => 31,
+    }
 }
 
 static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
@@ -1158,6 +1199,7 @@ fn assemble_usage(
                 extra_usage: raw.extra_usage,
                 spend,
                 open_at: None,
+                fetched_at: None,
             })
         }
         Err(FetchError::RateLimited { retry_after, .. }) => Err(FetchError::RateLimited {

@@ -75,11 +75,11 @@ pub(crate) enum Retry {
     /// connection and retry` gives two different and incompatible reasons to
     /// retry, one of which is wrong).
     Stated,
-    /// There is nothing left to retry in-process: `login_with` has no retry
-    /// path around its code exchange, so whatever the status, the only action
-    /// available is running `clauth login` again. Stated as the ABSENCE of a
-    /// retry loop rather than as a fact about the code or the listener, because
-    /// this correctly stops being true the moment someone adds one.
+    /// There is nothing left to retry in-process: `PendingLogin::run` has no
+    /// retry path around its code exchange, so whatever the status, the only
+    /// action available is running `clauth login` again. Stated as the ABSENCE
+    /// of a retry loop rather than as a fact about the code or the listener,
+    /// because this correctly stops being true the moment someone adds one.
     Restart,
 }
 
@@ -554,6 +554,31 @@ pub(crate) fn format_pct(pct: f64) -> String {
         format!("{pct:.0}%")
     } else {
         format!("{pct}%")
+    }
+}
+
+/// Absolute API amount: whole numbers render bare, fractions at two decimals →
+/// `42`, `42.35`. The one shared spelling for a bar's `used / total` figures;
+/// a surface-local twin of this is a drift, not a specialization.
+pub(crate) fn format_amount(n: f64) -> String {
+    if n.fract() == 0.0 {
+        format!("{n:.0}")
+    } else {
+        format!("{n:.2}")
+    }
+}
+
+/// A token threshold in its display form: exact millions as `{n}M` (`2M`),
+/// whole thousands below a million as `{n}k` (`600k`), anything else plain.
+/// The one rule behind the hook note, the Config row's custom-value append,
+/// its hint, and the editor seed.
+pub(crate) fn format_threshold_tokens(v: u64) -> String {
+    if v.is_multiple_of(1_000_000) {
+        format!("{}M", v / 1_000_000)
+    } else if v < 1_000_000 && v.is_multiple_of(1000) {
+        format!("{}k", v / 1000)
+    } else {
+        v.to_string()
     }
 }
 

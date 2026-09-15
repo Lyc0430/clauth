@@ -27,7 +27,7 @@ use crate::providers::{Provider, StatRowKind};
 use crate::usage::{
     ExtraPeriod, FetchStatus, KickBlock, ProfileActivity, QueueSlot, StreakCounts, UsageWindow,
     WindowDollars, humanize_duration, ideal_pace_pct, is_stuck_streak, kick_block_switch_grade,
-    now_epoch_secs, now_ms, queue_anchor_cached, switch_grade_kick_lifts,
+    now_epoch_secs, now_ms, queue_anchor_cached, selected_next_refresh, switch_grade_kick_lifts,
 };
 
 const KEY_W: usize = 8;
@@ -73,6 +73,10 @@ struct HeaderState {
     kick_block: Option<KickBlock>,
     /// Config-derived diagnostic flags driving the `└` fix hints.
     diag: DiagFlags,
+    /// The shown profile's peak-rate state, sampled now off the provider's
+    /// own price-store rows. `None` = no store-backed provider or flat rates
+    /// — no `pricing` row renders at all.
+    peak: Option<crate::pricing::PeakState>,
     /// The shown profile's auto-start queue slot, resolved before the Config
     /// guard (rank order) like the chain card used to; `None` when the queue
     /// toggle is off or the profile holds no slot. The `usage auto-start`
@@ -137,13 +141,13 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .activity
             .lock()
             .ok()
-            .and_then(|g| g.get(profile.name.as_str()).copied())
+            .map(|activity| crate::usage::selected_activity(&activity, profile))
             .unwrap_or(ProfileActivity::Idle),
         next_refresh_ms: app
             .next_refresh_per_profile
             .lock()
             .ok()
-            .and_then(|m| m.get(profile.name.as_str()).copied()),
+            .and_then(|m| selected_next_refresh(&m, profile)),
         tick: app.tick_count,
         streaks: streaks
             .get(profile.name.as_str())
@@ -165,6 +169,7 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
             }
         },
         queue_slot: QueueView::new(&cfg, &kick_lifts, queue_anchor).slot(&profile.name),
+        peak: app.peak_state_for(profile),
     };
 
     let show_estimates = cfg.state.show_estimates;
@@ -204,12 +209,16 @@ fn build_usage_lines(
     // OAuth accounts — including OAuth run against a custom base_url — fall
     // through to their live window bars.
     if profile.usage_cache_is_third_party() {
+        // In-memory series only (`app.wallet_cache`) — the same no-disk-read
+        // discipline the 5h rate's `history_cache` read keeps one branch up.
+        let wallet_rate = app.wallet_rate_for(profile);
         lines.extend(build_tp_rows(
             profile,
             inner_w,
             show_estimates,
             show_pace,
             reset_fmt,
+            wallet_rate.as_ref(),
         ));
         return lines;
     }
@@ -770,8 +779,35 @@ fn header_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
         ));
     }
     let mut lines = vec![Line::from(plan_spans)];
+    if let Some(peak) = header.peak {
+        lines.push(pricing_line(peak));
+    }
     lines.extend(status_lines(profile, header, inner_w));
     lines
+}
+
+/// The `pricing` header row: the peak-rate state sampled now, named as a pill
+/// plus the countdown to the next flip. Peak is a charged state (WARNING);
+/// off-peak is the neutral resting state. No trailing countdown when no flip
+/// lands inside the query horizon. Windows come from the price table's own
+/// constraints — the same schedule cost pricing uses, never a second opinion.
+fn pricing_line(peak: crate::pricing::PeakState) -> Line<'static> {
+    let (label, style) = if peak.peak {
+        ("peak rate", theme::warning().bold())
+    } else {
+        ("off-peak", theme::dim().bold())
+    };
+    let mut spans = vec![key_span("pricing")];
+    spans.extend(pill(label.to_string(), style));
+    if let Some((to_peak, secs)) = peak.next_flip {
+        let verb = if to_peak { "peak" } else { "off-peak" };
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("{verb} starts in {}", humanize_duration(secs)),
+            theme::faint(),
+        ));
+    }
+    Line::from(spans)
 }
 
 /// The `usage auto-start in …` value, shown for ANY account that opted into
@@ -975,6 +1011,21 @@ fn status_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
     // nothing else wrong that leaves a single row and a lone `└`.
     if disabled {
         return render_status_rows(rows, w);
+    }
+
+    // The `stale` cue: cache age past `stale_after_ms`, a fact orthogonal to
+    // `fetch_status` — the same kick-`blocked` precedent earns it its own pill.
+    // A `cached` pill and this cue can coexist: one names the last outcome, the
+    // other the reading's age. Same threshold + exemption as `status.json`'s
+    // `stale` age arm.
+    if profile.usage_stale {
+        rows.push(DiagRow {
+            content: pill(
+                "stale".to_string(),
+                theme::warning().add_modifier(Modifier::BOLD),
+            ),
+            hint: None,
+        });
     }
 
     let countdown = header.next_refresh_ms.map(|next| {
@@ -1278,12 +1329,17 @@ fn oauth_empty_msg(profile: &Profile) -> &'static str {
 
 /// Render provider-agnostic third-party stats. The header (plan + status) was
 /// already pushed by the caller; only the stats body goes here.
+///
+/// `wallet_rate` is the funded wallet's burn figure (in-memory series), which
+/// the balance row carries beside its value — the wallet sibling of the window
+/// bars' `· rate` eyebrow section.
 fn build_tp_rows(
     profile: &Profile,
     inner_w: u16,
     show_estimates: bool,
     show_pace: bool,
     reset_fmt: ResetFmt,
+    wallet_rate: Option<&crate::usage::WalletRate>,
 ) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
 
@@ -1360,7 +1416,22 @@ fn build_tp_rows(
                     StatRowKind::Faint => theme::faint(),
                     _ => theme::body(),
                 };
-                lines.push(Line::from(key_value_span(&row.label, &row.value, style)));
+                let mut spans = key_value_span(&row.label, &row.value, style);
+                // The rate rides only the funded wallet's own row — matched on
+                // (label, currency), since a two-wallet provider lists both
+                // under the same label with different currencies.
+                if let Some(rate) = wallet_rate.filter(|r| {
+                    r.label == row.label
+                        && crate::providers::parse_balance(&row.value)
+                            .is_some_and(|(currency, _)| currency == r.currency)
+                }) {
+                    spans.push(Span::styled(" · ", theme::dim()));
+                    spans.push(Span::styled(
+                        format!("~{:.1} {}/day", rate.per_day, rate.currency),
+                        theme::faint(),
+                    ));
+                }
+                lines.push(Line::from(spans));
             }
         }
     } else if !has_bars {
@@ -1442,16 +1513,12 @@ fn bar_reset_trailing(rem: Option<i64>, reset_fmt: ResetFmt) -> String {
 /// Eyebrow amount for a bar: `used / total` when both are present, else empty.
 fn bar_amount(bar: &crate::providers::UsageBar) -> String {
     match (bar.used, bar.total) {
-        (Some(used), Some(total)) => format!("{} / {}", fmt_amount(used), fmt_amount(total)),
+        (Some(used), Some(total)) => format!(
+            "{} / {}",
+            crate::format::format_amount(used),
+            crate::format::format_amount(total)
+        ),
         _ => String::new(),
-    }
-}
-
-fn fmt_amount(n: f64) -> String {
-    if n.fract() == 0.0 {
-        format!("{n:.0}")
-    } else {
-        format!("{n:.2}")
     }
 }
 

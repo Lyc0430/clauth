@@ -16,6 +16,8 @@
 
 **Can I add an account without logging out of the one I am using?** `clauth login <name>` opens a browser, runs Claude Code's OAuth flow, and writes the tokens into a new profile. The session you are in is untouched.
 
+**Can I log in on a server with no browser, over ssh?** Yes. `clauth login <name>` prints the link under `Browser didn't open? Use the url below to sign in` and prompts `Paste code here if prompted:`: open the link on any device, sign in, and paste back the code the page shows. Same credential as a browser login, no flag. The Setup tab's login modal has the same: <kbd>c</kbd> copies the link to your local clipboard through the terminal, <kbd>p</kbd> turns its row into a code field (type or paste the code, <kbd>⏎</kbd> submits, <kbd>esc</kbd> brings the row back). [Quickstart](Quickstart#commands).
+
 **Is there an MCP server for switching accounts from inside a chat?** Yes. Install the plugin, then a live session can call `profiles`, `switch_profile`, or `delegate` a whole prompt to another account. [Claude Code plugin](Claude-Code-Plugin).
 
 **How do I stop clauth updating itself?** `CLAUTH_NO_UPDATE=1`. A cargo install never self-replaces anyway.
@@ -38,7 +40,7 @@
 
 **A `delegate` run did nothing and the tree is unchanged.** A delegate spawns with the permission gate armed and nobody to answer it. Pass the permission flag through `args` for a delegate that writes files, and read the `permission_denials` array in the envelope. [Claude Code plugin](Claude-Code-Plugin#delegate).
 
-**My custom endpoint shows no usage bars.** Only DeepSeek, Z.ai, OpenRouter and Alibaba Model Studio have typed panels. Everything else gets a best-effort scan of the usual usage paths, which can come back empty. Press <kbd>r</kbd> to retry an endpoint clauth gave up on. An Alibaba account is the one case where an api key is not enough: run `clauth login <account>` to capture the console session its quota is read with ([Configuration](Configuration#the-alibaba-console-session)).
+**My custom endpoint shows no usage bars.** Only DeepSeek, Z.ai, OpenRouter, MiniMax and Alibaba Model Studio have typed panels. Everything else gets a best-effort scan of the usual usage paths, which can come back empty; the scan retries at most once every five minutes (or once per refresh interval, whichever is longer), and <kbd>r</kbd> forces one immediately. An Alibaba account is the one case where an api key is not enough: run `clauth login <account>` to capture the console session its quota is read with ([Configuration](Configuration#the-alibaba-console-session)).
 
 **The Tokens tab shows `$X+` instead of a figure.** Some model in that period has no published price, or the period reaches into days that carry no cache split. The number is a floor. [Tokens and cost](Tokens-And-Cost#period-lens).
 
