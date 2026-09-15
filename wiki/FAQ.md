@@ -16,7 +16,7 @@
 
 **Can I add an account without logging out of the one I am using?** `clauth login <name>` opens a browser, runs Claude Code's OAuth flow, and writes the tokens into a new profile. The session you are in is untouched.
 
-**Can I log in on a server with no browser, over ssh?** Yes. `clauth login <name> --manual` prints a link instead of opening anything; open it on any device, sign in, and paste back the code the page shows. Same credential as a browser login. The Setup tab's `manual login (no browser)` row does the same, and <kbd>c</kbd> there sends the link to your local clipboard through the terminal. [Quickstart](Quickstart#commands).
+**Can I log in on a server with no browser, over ssh?** Yes. `clauth login <name>` prints the link under `Browser didn't open? Use the url below to sign in` and prompts `Paste code here if prompted:`: open the link on any device, sign in, and paste back the code the page shows. Same credential as a browser login, no flag. The Setup tab's login modal has the same: <kbd>c</kbd> copies the link to your local clipboard through the terminal, <kbd>p</kbd> turns its row into a code field (type or paste the code, <kbd>⏎</kbd> submits, <kbd>esc</kbd> brings the row back). [Quickstart](Quickstart#commands).
 
 **Is there an MCP server for switching accounts from inside a chat?** Yes. Install the plugin, then a live session can call `profiles`, `switch_profile`, or `delegate` a whole prompt to another account. [Claude Code plugin](Claude-Code-Plugin).
 
