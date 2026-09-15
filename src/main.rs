@@ -748,6 +748,13 @@ fn feed_paste_piped(
     );
 }
 
+/// The one "browser didn't open" line every CLI login prints under its
+/// preamble, so the OAuth login and the Alibaba console capture cannot drift
+/// into two spellings of it again.
+fn print_browser_fallback(url: &str) {
+    outln!("\nBrowser didn't open? Use the url below to sign in\n{url}\n");
+}
+
 /// Run an OAuth login (preamble, the links, minted tokens, login summary,
 /// identity-anchor seed) and wrap it in a capture snapshot. One flow, two
 /// doors: the browser opens as today, the hosted link is printed under the
@@ -768,10 +775,7 @@ fn run_oauth(reauth: bool, target: &str) -> Result<actions::CaptureSnapshot> {
     }
     let pending = oauth_login::begin_login().map_err(cli_err)?;
     let links = pending.links().clone();
-    outln!(
-        "\nBrowser didn't open? Use the url below to sign in\n{}\n",
-        links.hosted_url
-    );
+    print_browser_fallback(&links.hosted_url);
     let _ = crate::platform::open_url(&links.browser_url);
 
     let (paste_tx, paste_rx) = std::sync::mpsc::channel::<oauth_login::ManualCode>();
@@ -1006,9 +1010,7 @@ fn cmd_login_console(config: &mut AppConfig, target: &str, model: Option<&str>) 
     outln!(
         "clauth: opening the Alibaba Model Studio console to capture a usage session for '{target}'…"
     );
-    let outcome = alibaba_login::login_with(site, region, |url| {
-        outln!("\nIf the browser didn't open, visit this URL to sign in:\n{url}\n");
-    })?;
+    let outcome = alibaba_login::login_with(site, region, print_browser_fallback)?;
     actions::store_console_login(config, &target, outcome.console.clone())?;
     if let Some(model) = model {
         actions::set_profile_default_model(config, &target, model)?;
