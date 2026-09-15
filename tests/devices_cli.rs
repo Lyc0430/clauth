@@ -7,7 +7,7 @@
 #![cfg(unix)]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -210,21 +210,37 @@ fn closed_stdout(home: &Path, args: &[&str]) -> std::process::Output {
         .expect("run clauth")
 }
 
-/// `clauth <args>` with stdout pointed at `/dev/full`, where every write fails
-/// with `ENOSPC` instead of the `EPIPE` a closed pipe gives: the write-error
-/// arm the closed-pipe tests never exercise. Opened for writing, the way a
-/// shell's `> /dev/full` opens it — a read-only handle would buffer the line
-/// away instead of failing the write.
+/// `clauth <args>` with stdout pointed at a socket whose send buffer is
+/// already full and whose peer never reads, so every write fails with `EAGAIN`
+/// instead of the `EPIPE` a closed pipe gives: the write-error arm the
+/// closed-pipe tests never exercise. A full buffer is the one write fault that
+/// fails the same way on every Unix runner — the Linux `/dev/full` has no
+/// macOS twin, and a read-only handle's `EBADF` is what stdio swallows, not
+/// what clauth sees.
 fn full_stdout(home: &Path, args: &[&str]) -> std::process::Output {
-    let sink = std::fs::OpenOptions::new()
-        .write(true)
-        .open("/dev/full")
-        .expect("open /dev/full for writing");
-    clauth(home)
+    let (peer, writer) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+    writer.set_nonblocking(true).expect("nonblocking write end");
+    let mut filler = writer.try_clone().expect("clone the write end");
+    // Fill the send buffer to capacity: a write that stops at `EAGAIN` has met
+    // a full buffer, and a full buffer is what every later write meets too.
+    let chunk = [0u8; 8192];
+    loop {
+        match filler.write(&chunk) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) => panic!("fill the send buffer: {e}"),
+        }
+    }
+    drop(filler);
+    let out = clauth(home)
         .args(args)
-        .stdout(Stdio::from(sink))
+        .stdout(Stdio::from(std::os::fd::OwnedFd::from(writer)))
         .output()
-        .expect("run clauth")
+        .expect("run clauth");
+    // `peer` stays open past the child's exit, so the child meets a full
+    // buffer, not the `EPIPE` of a reader that left.
+    drop(peer);
+    out
 }
 
 /// True when `text` holds a run of 64 hex chars, the whole shape of a minted
@@ -301,9 +317,9 @@ fn pair_with_closed_stdout_withdraws_and_exits_1() {
     );
 }
 
-/// A full disk behind the token line is the same loss as a gone reader, not a
-/// panic: the run revokes the device it just minted and exits 1, and the
-/// stderr names the loss and the cause without the token itself.
+/// A destination too full to take the token line is the same loss as a gone
+/// reader, not a panic: the run revokes the device it just minted and exits 1,
+/// and the stderr names the loss and the cause without the token itself.
 #[test]
 fn add_with_full_stdout_rolls_back_and_exits_1() {
     let home = tempfile::tempdir().expect("home");
@@ -314,6 +330,10 @@ fn add_with_full_stdout_rolls_back_and_exits_1() {
     assert!(
         stderr.contains("never reached its reader"),
         "stderr names the loss: {stderr}"
+    );
+    assert!(
+        stderr.contains("never reached its reader ("),
+        "stderr names the cause too: {stderr}"
     );
     assert!(!has_token_shape(&stderr), "stderr holds no token: {stderr}");
 
@@ -331,8 +351,8 @@ fn add_with_full_stdout_rolls_back_and_exits_1() {
     );
 }
 
-/// A full disk behind the code line withdraws the code and exits 1, so an
-/// `add` under the same name succeeds right after.
+/// A destination too full to take the code line withdraws the code and exits
+/// 1, so an `add` under the same name succeeds right after.
 #[test]
 fn pair_with_full_stdout_withdraws_and_exits_1() {
     let home = tempfile::tempdir().expect("home");
@@ -343,6 +363,10 @@ fn pair_with_full_stdout_withdraws_and_exits_1() {
     assert!(
         stderr.contains("never reached its reader"),
         "stderr names the loss: {stderr}"
+    );
+    assert!(
+        stderr.contains("never reached its reader ("),
+        "stderr names the cause too: {stderr}"
     );
     assert!(!has_code_shape(&stderr), "stderr holds no code: {stderr}");
 
