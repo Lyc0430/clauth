@@ -64,7 +64,12 @@ fn ctx() -> std::sync::Arc<ApiContext> {
     crate::daemon::api::devices::seed_for_tests(DEVICE, Tier::Control, TOKEN)
         .expect("pair the fixture device");
     let status_path = crate::profile::clauth_dir().unwrap().join("status.json");
-    ApiContext::new(empty_config(), status_path, None)
+    ApiContext::new(
+        empty_config(),
+        status_path,
+        None,
+        crate::daemon::api::panes::absent_probe(),
+    )
 }
 
 /// The name the generated certificate is issued for, and the name the client

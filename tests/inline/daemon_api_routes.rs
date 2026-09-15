@@ -72,7 +72,7 @@ fn ctx_with(config: ConfigHandle) -> std::sync::Arc<ApiContext> {
     let status_path = crate::profile::clauth_dir()
         .expect("clauth dir")
         .join("status.json");
-    ApiContext::new(config, status_path, None)
+    ApiContext::new(config, status_path, None, panes::absent_probe())
 }
 
 /// The same context a running daemon builds: one that can see the scheduler's
@@ -85,7 +85,7 @@ fn ctx_with_live(
     let status_path = crate::profile::clauth_dir()
         .expect("clauth dir")
         .join("status.json");
-    ApiContext::new(config, status_path, Some(live))
+    ApiContext::new(config, status_path, Some(live), panes::absent_probe())
 }
 
 /// A request as the HTTP layer would hand it to the router.
@@ -406,6 +406,8 @@ fn the_route_table_is_exactly_this() {
             ("HEAD", "/openapi.json", Access::View),
             ("POST", "/switch", Access::Control),
             ("POST", "/pair", Access::None),
+            ("GET", "/panes", Access::View),
+            ("HEAD", "/panes", Access::View),
         ]
     );
 }
@@ -907,6 +909,17 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         &mut produced,
     );
 
+    let panes = call(&ctx, &req("GET", "/api/v1/panes", Some(TOKEN), ""));
+    check_answer(
+        &doc,
+        "GET",
+        "/panes",
+        200,
+        &panes,
+        &mut driven,
+        &mut produced,
+    );
+
     let status = call(&ctx, &req("GET", "/api/v1/status", Some(TOKEN), ""));
     check_answer(
         &doc,
@@ -1014,6 +1027,7 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         ("GET", "/health"),
         ("GET", "/status"),
         ("GET", "/openapi.json"),
+        ("GET", "/panes"),
         ("POST", "/switch"),
     ] {
         let resp = call(&ctx, &req(method, &format!("{API_PREFIX}{path}"), None, ""));
@@ -1044,6 +1058,7 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         ("GET", "/health"),
         ("GET", "/status"),
         ("GET", "/openapi.json"),
+        ("GET", "/panes"),
         ("POST", "/switch"),
     ] {
         let body = if method == "POST" {
@@ -1248,6 +1263,7 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         ("GET", "/health"),
         ("GET", "/status"),
         ("GET", "/openapi.json"),
+        ("GET", "/panes"),
         ("POST", "/switch"),
     ] {
         let body = if method == "POST" {

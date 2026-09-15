@@ -3633,24 +3633,18 @@ fn push_herdr_knob_change() {
     });
 }
 
-/// `bin pane list` → pane ids, parsed leniently: an unknown payload shape (a
-/// herdr release moving a field) reads as no panes rather than a wrong one.
-/// Bounded at `crate::herdr::PROBE_TIMEOUT` — a hung herdr delays the push
-/// worker, never the key handling.
+/// `bin pane list` → pane ids, parsed by the one typed parser the pane
+/// reporter shares: an unknown payload shape (a herdr release moving a field)
+/// reads as no panes rather than a wrong one. Bounded at
+/// `crate::herdr::PROBE_TIMEOUT` — a hung herdr delays the push worker, never
+/// the key handling.
 fn herdr_pane_ids(bin: &str) -> Option<Vec<String>> {
     let out = crate::herdr::bounded_output(bin, &["pane", "list"], &[])?;
     if !out.status.success() {
         return None;
     }
-    let root: serde_json::Value =
-        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).ok()?;
-    let panes = root.get("result")?.get("panes")?.as_array()?;
-    Some(
-        panes
-            .iter()
-            .filter_map(|pane| pane.get("pane_id")?.as_str().map(str::to_string))
-            .collect(),
-    )
+    crate::herdr::parse_pane_list(&out.stdout)
+        .map(|panes| panes.into_iter().map(|pane| pane.pane_id).collect())
 }
 
 /// Re-run `report-profile.sh` for one pane with the pane id set and the

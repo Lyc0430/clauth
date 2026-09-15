@@ -10447,7 +10447,7 @@ fn herdr_border_label_toggle_reruns_the_pane_report_per_pane() {
     let herdr_shim = write_shim(
         tmp.path(),
         "herdr",
-        "printf '%s\\n' \"$*\" >> \"$(dirname \"$0\")/herdr.log\"\nprintf '%s\\n' '{\"id\":\"cli:pane:list\",\"result\":{\"panes\":[{\"pane_id\":\"pane-a\"},{\"pane_id\":\"pane-b\"}]}}'",
+        "printf '%s\\n' \"$*\" >> \"$(dirname \"$0\")/herdr.log\"\nprintf '%s\\n' '{\"id\":\"cli:pane:list\",\"result\":{\"panes\":[{\"pane_id\":\"pane-a\",\"workspace_id\":\"wA\",\"tab_id\":\"tA\",\"agent_status\":\"idle\",\"focused\":false},{\"pane_id\":\"pane-b\",\"workspace_id\":\"wB\",\"tab_id\":\"tB\",\"agent_status\":\"idle\",\"focused\":false}]}}'",
     );
     let _report_shim = write_shim(
         tmp.path(),

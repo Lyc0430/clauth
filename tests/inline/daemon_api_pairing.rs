@@ -27,7 +27,12 @@ fn ctx() -> std::sync::Arc<ApiContext> {
             profiles: Vec::new(),
         },
     ));
-    ApiContext::new(config, clauth_dir().expect("dir").join("status.json"), None)
+    ApiContext::new(
+        config,
+        clauth_dir().expect("dir").join("status.json"),
+        None,
+        crate::daemon::api::panes::absent_probe(),
+    )
 }
 
 fn post_pair(ctx: &ApiContext, body: &str) -> Response {

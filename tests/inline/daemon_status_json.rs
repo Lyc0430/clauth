@@ -2306,38 +2306,60 @@ fn status_schema_agrees_with_the_serialized_body() {
     schema_agrees_with_type::<StatusBody>(&value);
 }
 
-/// The one always-serialized `Option` in the answer bodies is required in its
-/// schema (`previous` answers `null`, never a dropped key), and the one
-/// skip-when-absent `Option` (`ErrorBody.reason`) stays optional.
+/// The always-serialized `Option` fields in the answer bodies are required in
+/// their schemas (`SwitchOk.previous`, `PaneEntry.title`/`agent`/`tag`/
+/// `foreground_process_group_id`/`cwd`, and `PaneSession.cwd` answer `null`,
+/// never a dropped key), and the skip-when-absent `Option`s (`ErrorBody.reason`,
+/// `HerdrState.reason`) stay optional.
 #[test]
 fn always_serialized_option_fields_are_required_and_skipped_ones_are_not() {
+    use crate::daemon::api::panes::{HerdrState, PaneEntry, PaneSession};
     use crate::daemon::api::routes::{ErrorBody, SwitchOk};
 
     let no_components: BTreeMap<String, RefOr<Schema>> = BTreeMap::new();
 
-    let switch_ok_schema = SwitchOk::schema();
-    let switch_ok_object = match schema_deref(&switch_ok_schema, &no_components) {
-        Schema::Object(object) => object,
-        _ => panic!("SwitchOk must be an object"),
+    let required = |schema: &RefOr<Schema>, name: &str| -> Vec<String> {
+        match schema_deref(schema, &no_components) {
+            Schema::Object(object) => object.required.clone(),
+            _ => panic!("{name} must be an object"),
+        }
     };
+
+    let switch_ok_required = required(&SwitchOk::schema(), "SwitchOk");
     assert!(
-        switch_ok_object
-            .required
-            .iter()
-            .any(|name| name == "previous"),
+        switch_ok_required.iter().any(|name| name == "previous"),
         "SwitchOk.previous is serialized on every answer, so its schema requires it"
     );
 
-    let error_body_schema = ErrorBody::schema();
-    let error_body_object = match schema_deref(&error_body_schema, &no_components) {
-        Schema::Object(object) => object,
-        _ => panic!("ErrorBody must be an object"),
-    };
+    let pane_entry_required = required(&PaneEntry::schema(), "PaneEntry");
+    for field in [
+        "title",
+        "agent",
+        "tag",
+        "foreground_process_group_id",
+        "cwd",
+    ] {
+        assert!(
+            pane_entry_required.iter().any(|name| name == field),
+            "PaneEntry.{field} is serialized on every answer, so its schema requires it"
+        );
+    }
+
+    let pane_session_required = required(&PaneSession::schema(), "PaneSession");
     assert!(
-        !error_body_object
-            .required
-            .iter()
-            .any(|name| name == "reason"),
+        pane_session_required.iter().any(|name| name == "cwd"),
+        "PaneSession.cwd is serialized on every answer, so its schema requires it"
+    );
+
+    let herdr_state_required = required(&HerdrState::schema(), "HerdrState");
+    assert!(
+        !herdr_state_required.iter().any(|name| name == "reason"),
+        "HerdrState.reason is skipped when absent, so its schema leaves it optional"
+    );
+
+    let error_body_required = required(&ErrorBody::schema(), "ErrorBody");
+    assert!(
+        !error_body_required.iter().any(|name| name == "reason"),
         "ErrorBody.reason is skipped when absent, so its schema leaves it optional"
     );
 }
@@ -2348,6 +2370,7 @@ fn always_serialized_option_fields_are_required_and_skipped_ones_are_not() {
 /// they only deserialize.
 #[test]
 fn every_rest_body_schema_agrees_with_its_wire_shape() {
+    use crate::daemon::api::panes::PanesBody;
     use crate::daemon::api::routes::{
         ErrorBody, HealthBody, PairBody, PairOk, SwitchBody, SwitchOk,
     };
@@ -2384,6 +2407,36 @@ fn every_rest_body_schema_agrees_with_its_wire_shape() {
     schema_agrees_with_type::<ErrorBody>(&serde_json::json!({
         "ok": false,
         "error": "bad_request",
+    }));
+
+    schema_agrees_with_type::<PanesBody>(&serde_json::json!({
+        "ok": true,
+        "herdr": {"present": false, "reason": "herdr is not installed on this host"},
+        "panes": [],
+    }));
+    schema_agrees_with_type::<PanesBody>(&serde_json::json!({
+        "ok": true,
+        "herdr": {"present": true},
+        "panes": [{
+            "pane_id": "w0:pK",
+            "workspace_id": "w0",
+            "tab_id": "w0:tH",
+            "title": null,
+            "agent": null,
+            "agent_status": "unknown",
+            "cwd": null,
+            "focused": false,
+            "tag": null,
+            "foreground_process_group_id": null,
+            "sessions": [{
+                "session_id": "1128637-0",
+                "profile": "DS5",
+                "kind": "session",
+                "follows_chain": false,
+                "isolated": false,
+                "cwd": null,
+            }],
+        }],
     }));
 
     schema_agrees_with_type::<SwitchBody>(&serde_json::json!({"profile": "alpha"}));

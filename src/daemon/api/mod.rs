@@ -27,6 +27,7 @@
 pub(crate) mod devices;
 mod http;
 pub(crate) mod pairing;
+pub(crate) mod panes;
 pub(crate) mod routes;
 pub(crate) mod tls;
 
@@ -225,7 +226,7 @@ pub(crate) fn serve_prepared(
         .with_context(|| format!("failed to bind the REST API to {listen}"))?;
     devices::import_legacy()?;
     devices::note_at_start();
-    let ctx = ApiContext::new(config, status_path, Some(live));
+    let ctx = ApiContext::new(config, status_path, Some(live), panes::real_probe());
 
     let spawned = std::thread::Builder::new()
         .name("clauth-api-accept".into())

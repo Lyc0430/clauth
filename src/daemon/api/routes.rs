@@ -30,6 +30,7 @@ use super::devices::{self, Device, Tier};
 pub(crate) use super::http::ErrorBody;
 use super::http::{Request, Response, flatten_control_chars, sanitize_for_log};
 use super::pairing::{self, Code, Redeemed};
+use super::panes::{self, PaneProbe};
 
 /// Every route lives under this prefix, and it is spelled once.
 ///
@@ -116,6 +117,18 @@ pub(crate) static ROUTES: &[Route] = &[
         access: Access::None,
         handler: pair,
     },
+    Route {
+        method: "GET",
+        path: "/panes",
+        access: Access::View,
+        handler: panes::panes,
+    },
+    Route {
+        method: "HEAD",
+        path: "/panes",
+        access: Access::View,
+        handler: panes::panes,
+    },
 ];
 
 /// Who a handler is answering.
@@ -158,6 +171,8 @@ pub(crate) struct ApiContext {
     /// where there is no scheduler to ask — the tests that exercise a route
     /// without a daemon behind it.
     pub(crate) live: Option<crate::daemon::LiveStores>,
+    /// The seam the pane route drives herdr through; see [`super::panes`].
+    pub(crate) herdr_probe: PaneProbe,
 }
 
 impl ApiContext {
@@ -165,12 +180,14 @@ impl ApiContext {
         config: ConfigHandle,
         status_path: PathBuf,
         live: Option<crate::daemon::LiveStores>,
+        herdr_probe: PaneProbe,
     ) -> Arc<Self> {
         Arc::new(Self {
             config,
             status_path,
             switch_gate: RankedMutex::new(()),
             live,
+            herdr_probe,
         })
     }
 }
@@ -736,7 +753,7 @@ fn pair(_: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
 /// endpoint cannot ship undocumented.
 #[derive(utoipa::OpenApi)]
 #[openapi(
-    paths(health, status, switch, pair, openapi_document),
+    paths(health, status, switch, pair, openapi_document, panes::panes),
     modifiers(&BearerScheme)
 )]
 struct ApiDoc;
