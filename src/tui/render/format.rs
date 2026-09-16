@@ -435,24 +435,8 @@ fn month_label(month: u32) -> &'static str {
 pub(super) fn relative_age(epoch_ms: u64) -> String {
     let now = crate::usage::now_ms();
     let age_secs = (now.saturating_sub(epoch_ms) / 1000) as i64;
-    let mins = age_secs / 60;
-    let hours = mins / 60;
-    let days = hours / 24;
-    let weeks = days / 7;
-    if age_secs < 60 {
-        "just now".to_string()
-    } else if days < 1 {
-        if hours < 1 {
-            format!("{mins}m ago")
-        } else {
-            format!("{hours}h ago")
-        }
-    } else if days < 30 {
-        if weeks < 1 {
-            format!("{days}d ago")
-        } else {
-            format!("{weeks}w ago")
-        }
+    if age_secs < 30 * 24 * 3600 {
+        crate::format::humanize_age(age_secs.max(0) as u64)
     } else {
         // Local wall clock per the 2026-08-22 ruling: the bare UTC date read
         // as local off UTC. Same formatter as the status tab's incident

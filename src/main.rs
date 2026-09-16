@@ -183,7 +183,13 @@ fn dispatch(cli: Cli) -> Result<()> {
     };
 
     match command {
-        Command::Start(a) => cmd_start(&a.profile, &a.claude_args, a.isolation(), a.with_fallback),
+        Command::Start(a) => cmd_start(
+            &a.target(),
+            &a.passthrough(),
+            a.isolation(),
+            a.with_fallback,
+            a.explain,
+        ),
         Command::Login(a) => cmd_login(a),
         Command::Capture { profile } => cmd_capture(&profile),
         Command::Delete {
@@ -374,13 +380,62 @@ fn cmd_completions(target: &str, shell: Option<&str>) -> Result<()> {
     completions::print_script(target)
 }
 
-fn cmd_start(name: &str, rest: &[String], isolation: Isolation, follows_chain: bool) -> Result<()> {
+fn cmd_start(
+    target: &cli::StartTarget,
+    rest: &[String],
+    isolation: Isolation,
+    follows_chain: bool,
+    explain_only: bool,
+) -> Result<()> {
     platform::init();
     runtime::gc_stale_runtimes();
     let config = load_config()?;
-    let canonical = resolve_or_bail(&config, name)?;
-    refuse_if_disabled(&config, &canonical)?;
-    start::run(&config, &canonical, rest, isolation, None, follows_chain)
+
+    let (name, rows, pick, demand) = match target {
+        cli::StartTarget::Named(raw) => {
+            (resolve_or_bail(&config, raw)?, Vec::new(), None, Vec::new())
+        }
+        cli::StartTarget::Auto => {
+            anyhow::ensure!(
+                !config.state.fallback_chain.is_empty(),
+                "--auto picks from the fallback chain and it is empty; add accounts on the \
+                 fallback tab, or name one"
+            );
+            let demand = fallback::demand_from(start::launch_models(rest));
+            let families = (!demand.is_empty()).then_some(demand.as_slice());
+            let (rows, pick) = fallback::start_walk(&config, families, follows_chain);
+            let Some(pick) = pick else {
+                anyhow::bail!("{}", format::start_refusal(&demand, &rows));
+            };
+            (rows[pick].name.clone(), rows, Some(pick), demand)
+        }
+    };
+
+    if explain_only {
+        // Run the same refusals a real launch runs, so `--explain` answers what
+        // a start would do rather than naming a target it would then reject.
+        start::admit(&config, &name, isolation, follows_chain)?;
+        outln!("{}", format::start_pick_line(name.as_str(), &demand));
+        if !rows.is_empty() {
+            outln!("{}", format::render_start_walk(&rows, pick));
+        }
+        return Ok(());
+    }
+
+    let announce = match target {
+        cli::StartTarget::Auto => Some(format::start_launch_line(name.as_str(), &demand)),
+        cli::StartTarget::Named(_) => None,
+    };
+
+    start::run(
+        &config,
+        &name,
+        rest,
+        isolation,
+        None,
+        follows_chain,
+        announce.as_deref(),
+    )
 }
 
 /// Where `clauth login <name>` lands. An EXISTING profile (matched

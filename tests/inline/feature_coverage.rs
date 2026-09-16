@@ -197,6 +197,8 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
             "cross_thread_with_state_lock_serializes",
             "same_thread_reentrancy_does_not_deadlock",
             "poison_recovery_after_panicking_closure",
+            "start_walk_",
+            "start_auto_",
         ],
     ),
 ];

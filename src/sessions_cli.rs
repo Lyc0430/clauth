@@ -139,6 +139,7 @@ pub(crate) fn run_resume(target: &str, profile_flag: Option<&str>) -> Result<()>
         Isolation::Shared,
         Some(&workspace),
         false,
+        None,
     )
 }
 

@@ -277,6 +277,23 @@ impl ProfileWindows {
             }
         }
     }
+
+    /// Whether these figures carry a DATED reading no older than
+    /// [`STALE_AFTER_MS`] — pass one of the start walk's freshness PREFERENCE.
+    /// Stricter than [`Self::stale`] on purpose: an absent or undated reading
+    /// says nothing trustworthy, so it is not fresh even though `stale` may be
+    /// false for it.
+    pub(crate) fn fresh(&self) -> bool {
+        match self {
+            Self::Oauth { age, .. } => match age {
+                OauthAge::Dated(ms) => *ms <= STALE_AFTER_MS,
+                OauthAge::Absent | OauthAge::Undated => false,
+            },
+            Self::ThirdParty { age_secs, .. } => {
+                age_secs.is_some_and(|age| age.saturating_mul(1000) <= STALE_AFTER_MS)
+            }
+        }
+    }
 }
 
 /// Read one account's headroom out of whichever cache its own fetch leg writes,

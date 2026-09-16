@@ -1074,7 +1074,7 @@ fn strip_date_stamp(id: &str) -> Option<&str> {
 /// bracket, no digits, an unknown unit letter — is left alone, so an id with a
 /// bracketed segment that is NOT a context suffix still matches its row on
 /// the full string.
-fn strip_bracket_suffix(id: &str) -> &str {
+pub(crate) fn strip_bracket_suffix(id: &str) -> &str {
     let Some(body) = id.strip_suffix(']') else {
         return id;
     };

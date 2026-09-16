@@ -4296,3 +4296,30 @@ attributes:
         "a dump naming only a live dir's service collects nothing"
     );
 }
+
+/// The settings reader the start walk's demand draws from: top-level `model`,
+/// the `fallbackModel` array (non-string entries skipped), then the subagent
+/// env key, in that order — absent file, a scalar `fallbackModel`, and
+/// unreadable entries all answer empty, never an error.
+#[test]
+fn claude_settings_models_reads_model_fallbacks_and_the_subagent_key() {
+    let sb = HomeSandbox::new();
+    let dir = sb.home().join(".claude");
+    fs::create_dir_all(&dir).unwrap();
+
+    fs::write(
+        dir.join("settings.json"),
+        r#"{"model":"opus","fallbackModel":["claude-sonnet-5",7,null,"haiku"],"env":{"CLAUDE_CODE_SUBAGENT_MODEL":"claude-haiku-4-5"}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        claude_settings_models().unwrap(),
+        ["opus", "claude-sonnet-5", "haiku", "claude-haiku-4-5"]
+    );
+
+    fs::remove_file(dir.join("settings.json")).unwrap();
+    assert!(claude_settings_models().unwrap().is_empty());
+
+    fs::write(dir.join("settings.json"), r#"{"fallbackModel":"sonnet"}"#).unwrap();
+    assert!(claude_settings_models().unwrap().is_empty());
+}

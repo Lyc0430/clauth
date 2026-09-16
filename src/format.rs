@@ -10,7 +10,9 @@
 
 use chrono::{DateTime, Datelike, Local, Timelike};
 
+use crate::fallback::{StartBlock, StartCandidate};
 use crate::profile::Profile;
+use crate::profile_json::OauthAge;
 use crate::usage::{PlanTier, humanize_duration};
 
 // ── Cross-surface diagnostics ───────────────────────────────────────────────
@@ -601,6 +603,148 @@ pub(crate) fn local_stamp(epoch: i64) -> Option<String> {
         naive.minute(),
         naive.second(),
     ))
+}
+
+// ── diagnostic chip words + start-walk rendering ────────────────────────────
+
+/// Canonical `[ label ]` wording for the diagnostic states whose text pill
+/// surfaces on more than one tab, and the `--explain` row verdicts. One source
+/// so the same account state never wears two words on two tabs.
+pub(crate) const DIAG_DISABLED: &str = "disabled";
+pub(crate) const DIAG_CANCELED: &str = "canceled";
+pub(crate) const DIAG_AUTH_BROKEN: &str = "auth broken";
+pub(crate) const DIAG_BUDGET_SPENT: &str = "extra usage spent";
+pub(crate) const DIAG_KICK: &str = "claude code blocked";
+pub(crate) const DIAG_WEEKLY_SPENT: &str = "weekly spent";
+pub(crate) const DIAG_WEEKLY_SOFT: &str = "past the weekly switch line, still serving";
+pub(crate) const DIAG_STALE: &str = "stale data";
+
+/// A seconds age as the relative ladder (`4m ago`, `2h ago`, `3d ago`), open
+/// ended into weeks. The TUI's `relative_age` (`tui/render/format.rs`) calls
+/// this under its own 30-day local-stamp arm.
+pub(crate) fn humanize_age(secs: u64) -> String {
+    let mins = secs / 60;
+    let hours = mins / 60;
+    let days = hours / 24;
+    if secs < 60 {
+        "just now".to_string()
+    } else if mins < 60 {
+        format!("{mins}m ago")
+    } else if hours < 24 {
+        format!("{hours}h ago")
+    } else if days < 7 {
+        format!("{days}d ago")
+    } else {
+        format!("{}w ago", days / 7)
+    }
+}
+
+/// The one-line label for a start verdict, sharing the TUI's chip words where
+/// one exists ([`crate::fallback::StartBlock`]).
+pub(crate) fn start_block_label(block: &StartBlock) -> String {
+    match block {
+        StartBlock::Disabled => DIAG_DISABLED.to_string(),
+        StartBlock::AuthBroken => DIAG_AUTH_BROKEN.to_string(),
+        StartBlock::Canceled => DIAG_CANCELED.to_string(),
+        StartBlock::KickRejected => DIAG_KICK.to_string(),
+        StartBlock::NotOauth => "not an oauth account".to_string(),
+        StartBlock::WeeklySpent => DIAG_WEEKLY_SPENT.to_string(),
+        StartBlock::WeeklySoft { pct } => format!("weekly {}", format_pct(*pct)),
+        StartBlock::FiveHour { pct } => format!("5h {}", format_pct(*pct)),
+        StartBlock::ScopedSpent { label, pct } => {
+            format!("{label} {}, other models ok", format_pct(*pct))
+        }
+    }
+}
+
+fn start_verdict(row: &StartCandidate) -> String {
+    match &row.block {
+        Some(block) => start_block_label(block),
+        None => "ok".to_string(),
+    }
+}
+
+fn start_age_cell(row: &StartCandidate) -> String {
+    match row.age {
+        OauthAge::Dated(ms) => {
+            let cell = format!("usage {}", humanize_age(ms / 1000));
+            if row.stale {
+                format!("{cell} (stale)")
+            } else {
+                cell
+            }
+        }
+        OauthAge::Undated => "usage undated (stale)".to_string(),
+        OauthAge::Absent => "no usage yet".to_string(),
+    }
+}
+
+/// The member rows of a `--explain` start walk, one line per chain member in
+/// chain order: `*` for the pick, then the name and verdict each padded to the
+/// column's widest, then the cache-age cell. Pure, so the byte layout is pinned
+/// without capturing stdout.
+pub(crate) fn render_start_walk(rows: &[StartCandidate], pick: Option<usize>) -> String {
+    let name_w = rows
+        .iter()
+        .map(|r| r.name.as_str().len())
+        .max()
+        .unwrap_or(0);
+    let verdict_w = rows
+        .iter()
+        .map(|r| start_verdict(r).len())
+        .max()
+        .unwrap_or(0);
+    rows.iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let marker = if Some(i) == pick { '*' } else { ' ' };
+            format!(
+                "{marker} {:<name_w$}  {:<verdict_w$}   {}",
+                r.name.as_str(),
+                start_verdict(r),
+                start_age_cell(r),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn start_demand_suffix(demand: &[String]) -> String {
+    if demand.is_empty() {
+        String::new()
+    } else {
+        format!(" for {}", demand.join(" + "))
+    }
+}
+
+/// The `--explain` first line for a picked name.
+pub(crate) fn start_pick_line(name: &str, demand: &[String]) -> String {
+    format!("would start on '{name}'{}", start_demand_suffix(demand))
+}
+
+/// The stderr line a real `--auto` launch prints before `start::run`.
+pub(crate) fn start_launch_line(name: &str, demand: &[String]) -> String {
+    format!(
+        "clauth: starting on '{name}'{}",
+        start_demand_suffix(demand)
+    )
+}
+
+/// The `--auto` no-member refusal: the first line plus, when rows exist, the
+/// explain rows rendered with no `*` on any of them.
+pub(crate) fn start_refusal(demand: &[String], rows: &[StartCandidate]) -> String {
+    let rendered = render_start_walk(rows, None);
+    if rendered.is_empty() {
+        format!(
+            "--auto found no chain member with headroom{}",
+            start_demand_suffix(demand)
+        )
+    } else {
+        format!(
+            "--auto found no chain member with headroom{}\n{rendered}",
+            start_demand_suffix(demand)
+        )
+    }
 }
 
 #[cfg(test)]

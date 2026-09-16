@@ -31,12 +31,12 @@ The weekly lines are deliberately below 100. Topping out a week bricks an accoun
 
 API-key accounts are judged on the same lines, using whatever 5h / 7d windows their provider publishes — Z.ai, MiniMax and Alibaba Model Studio today. Before, only OAuth accounts could ever be exhausted, so a `fallback_threshold` on an api-key member never fired. A window a provider does not publish simply has no line to cross, and a best-effort scan of an unrecognised endpoint never counts: its numbers are guessed from the response shape, and parking an account on a guess is worse than not switching. Windows on any other schedule (z.ai's 30d ceiling) render as bars but are not judged — the chain only knows the 5h and 7d lines.
 
-Per-model weekly windows (a "7d fable" window, say) gate the same way: an account whose scoped week is past the line stays out of rotation, since a session of the capped model landed there would strand, and the walk cannot know which model your next session runs.
+Per-model weekly windows (a "7d fable" window, say) gate the same way: an account whose scoped week is past the line stays out of rotation, since a session of the capped model landed there would strand, and the walk cannot know which model your next session runs. A session that has not started yet is the one case where the model *is* knowable, which is what [`start --auto`](Auto-Switch#choosing-where-a-session-starts) uses.
 
 Two per-account toggles relax this:
 
 - **`weekly gate`** off: ignore the soft weekly line for this account. The hard cap still blocks.
-- **`scoped gate`** off: keep rotating to this account for other models, ignoring its capped per-model weeks.
+- **`scoped gate`** off: keep rotating to this account for other models, ignoring its capped per-model weeks. Blunt by nature — it drops the gate for every model, so a session of the capped model can then land here too. `start --auto` narrows the same judgment to the models a session will actually run, and needs no toggle.
 
 ## Excluded members
 
@@ -105,6 +105,25 @@ An account's 5h window opens on its first real request, so a chain member you ha
 The chain runs wherever the decision loop runs: an open TUI, or `clauth daemon` with the TUI closed ([Daemon](Daemon)). Only one of them decides at a time.
 
 `clauth start <profile> --with-fallback` gives a single session its own chain, so that session hops accounts while your global one stays put. It needs a running daemon and an OAuth account inside a chain that holds a second member to move to, and it does not work alongside `--isolated` ([Quickstart](Quickstart#rules-worth-knowing)). On macOS the swap also writes the session's per-config-dir Keychain item, so the running session follows the chain there too.
+
+## Choosing where a session starts
+
+The chain decides where a session *moves*. `clauth start --auto` decides where one **starts**: it walks the fallback chain in order and launches on the first member the chain itself would switch to, judged for the models the session is about to run.
+
+**The walk is the chain's own.** The same exclusions ([below](Auto-Switch#excluded-members)) and the same lines (the 5h threshold, the weekly line, the per-model weeks) decide, in chain order and with no ranking: the chain order is your statement of which account comes first. A member whose usage was read recently is preferred over one whose reading is stale or missing, and a chain with only stale readings still launches.
+
+**The models are the union, never the headline model.** A `Task` subagent runs inside the parent's process and spends the parent's account on whatever model it runs, so judging for the main thread alone would strand the session the moment a subagent used a capped family. The union comes from your `settings.json` `model` and `fallbackModel`, `ANTHROPIC_MODEL` and `CLAUDE_CODE_SUBAGENT_MODEL` in the environment, and any `--model` or `--fallback-model` you pass; `best` counts as both `fable` and `opus`, `opusplan` as both `opus` and `sonnet`, and a `[1m]` suffix changes nothing. A per-model week counts only when it is one of those families; with none resolved, the blanket `scoped gate` above applies unchanged. A known model outranks the toggle: an account capped on a model this session runs is skipped even with its `scoped gate` off.
+
+A real launch says which account it picked on one line before the session starts. `--explain` prints the whole walk instead and exits without launching: the pick on the first line, then every chain member with the reason it was passed over (the same words the Fallback tab shows) and how old its usage reading is. It runs the refusals a real launch runs first, so a `--with-fallback` start that would be refused is refused here too. The readings come from each account's usage cache, which an open TUI or a running daemon keeps fresh; with neither, the age tells you how much to trust them.
+
+```
+would start on 'work' for opus + sonnet
+  home   7d opus 100%, other models ok   usage 4m ago
+* work   ok                              usage 4m ago
+  spare  ok                              usage 3h ago (stale)
+```
+
+The candidate set is the fallback chain — the accounts you have already said may be entered unattended — so an empty chain refuses and names the fix, and so does a chain with no member left to start on. This never moves a running session. `--with-fallback` remains the only thing that does, and the two compose: pick the entry point, then let the chain rescue it if that account runs out.
 
 ## Mixing account types
 
