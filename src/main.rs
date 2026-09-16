@@ -66,18 +66,15 @@ use crate::out::{errln, out, outln};
 use crate::profile::{AppConfig, ProfileName, ThemeName, load_config};
 use crate::runtime::Isolation;
 
-/// The not-found half of [`resolve_or_bail`], buildable on its own for the
-/// commands that try the codex roster before giving up. A bare unrecognized
-/// word lands here as a profile name (clap's `external` subcommand), so a
-/// typo'd subcommand and a typo'd profile name are indistinguishable at this
-/// position. Either way the caller named something that isn't there: a usage
-/// error (exit 2), not a runtime failure (exit 1).
+/// The not-found refusal for the commands that try the codex roster before
+/// giving up (`switch`, `delete`, `start`), listing both rosters; the
+/// claude-only verbs refuse through [`resolve_or_bail`] instead. A bare
+/// unrecognized word lands here as a profile name (clap's `external`
+/// subcommand), so a typo'd subcommand and a typo'd profile name are
+/// indistinguishable at this position. Either way the caller named something
+/// that isn't there: a usage error (exit 2), not a runtime failure (exit 1).
 fn unknown_profile_error(config: &AppConfig, name: &str) -> anyhow::Error {
-    let mut parts = Vec::new();
-    let claude = config.names().join(", ");
-    if !claude.is_empty() {
-        parts.push(claude);
-    }
+    let mut parts = claude_roster_part(config);
     // The codex roster too — `switch` and `delete` take those names, and a
     // list that hides them turns a typo'd codex name into "no such thing".
     if let Ok(codex) = codex_profiles::CodexState::load()
@@ -86,6 +83,21 @@ fn unknown_profile_error(config: &AppConfig, name: &str) -> anyhow::Error {
         let names: Vec<&str> = codex.profiles().iter().map(|n| n.as_str()).collect();
         parts.push(format!("codex: {}", names.join(", ")));
     }
+    profile_not_found_error(name, &parts)
+}
+
+/// The claude roster as one `available:` part, or none when it is empty so the
+/// listing never opens on a dangling separator.
+fn claude_roster_part(config: &AppConfig) -> Vec<String> {
+    let claude = config.names().join(", ");
+    if claude.is_empty() {
+        Vec::new()
+    } else {
+        vec![claude]
+    }
+}
+
+fn profile_not_found_error(name: &str, parts: &[String]) -> anyhow::Error {
     usage_error(format!(
         "profile '{name}' not found\navailable: {}",
         parts.join(" · ")
@@ -94,14 +106,24 @@ fn unknown_profile_error(config: &AppConfig, name: &str) -> anyhow::Error {
 
 /// Resolve `name` to its canonical spelling against the CLAUDE roster, or bail
 /// with a [`UsageError`]. Shared by every claude-only profile-naming command:
-/// `disable`/`enable`/`rolling-token`/`static-token`. `switch`, `delete`, and
-/// `start` resolve by hand instead — a claude miss falls through to the codex
-/// roster there.
-fn resolve_or_bail(config: &AppConfig, name: &str) -> Result<ProfileName> {
-    config
-        .canonical_name(name)
-        .map(ProfileName::from)
-        .ok_or_else(|| unknown_profile_error(config, name))
+/// `disable`/`enable`/`rolling-token`/`static-token`, which pass their own
+/// `verb` so a codex name is refused as what it is (a real account on the
+/// harness this verb does not reach) and a name on neither roster lists the
+/// claude roster alone, the only one these verbs take. A roster that fails to
+/// load is a runtime failure (exit 1) like the sibling arms', never a
+/// not-found: the verdict needs the roster. `switch`, `delete`, and `start`
+/// resolve by hand instead — a claude miss falls through to the codex roster
+/// there.
+fn resolve_or_bail(config: &AppConfig, name: &str, verb: &str) -> Result<ProfileName> {
+    if let Some(canonical) = config.canonical_name(name) {
+        return Ok(ProfileName::from(canonical));
+    }
+    if let Some(codex) = codex_profiles::CodexState::load()?.canonical_name(name) {
+        return Err(usage_error(format!(
+            "'{codex}' is a codex profile; {verb} is claude-only"
+        )));
+    }
+    Err(profile_not_found_error(name, &claude_roster_part(config)))
 }
 
 fn main() {
@@ -1274,7 +1296,7 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
     platform::init();
 
     let config = load_config()?;
-    let canonical = resolve_or_bail(&config, name)?;
+    let canonical = resolve_or_bail(&config, name, "static-token")?;
     let target = &canonical;
     let profile = config
         .find(target)
@@ -1606,7 +1628,7 @@ fn refuse_if_disabled(config: &AppConfig, name: &ProfileName) -> Result<()> {
 fn cmd_disable(name: &str, yes: bool) -> Result<()> {
     platform::init();
     let mut config = load_config()?;
-    let canonical = resolve_or_bail(&config, name)?;
+    let canonical = resolve_or_bail(&config, name, "disable")?;
 
     if config.find(&canonical).is_some_and(|p| p.is_disabled()) {
         outln!("clauth: '{canonical}' is already disabled.");
@@ -1643,7 +1665,7 @@ fn cmd_disable(name: &str, yes: bool) -> Result<()> {
 fn cmd_enable(name: &str) -> Result<()> {
     platform::init();
     let mut config = load_config()?;
-    let canonical = resolve_or_bail(&config, name)?;
+    let canonical = resolve_or_bail(&config, name, "enable")?;
     if actions::enable_profile(&mut config, &canonical)? {
         outln!("clauth: enabled '{canonical}'.");
     } else {
@@ -1685,7 +1707,7 @@ fn cmd_switch(name: &str) -> Result<()> {
 /// picks the new bearer up on its next request.
 fn cmd_rolling_token(name: &str) -> Result<()> {
     let config = load_config()?;
-    let canonical = resolve_or_bail(&config, name)?;
+    let canonical = resolve_or_bail(&config, name, "rolling-token")?;
     // Same gate `start` and `switch` take. A disabled profile is off every
     // operational surface, the re-stamp timer included, so arming one produces
     // a bearer that dies in hours with nothing behind it.
@@ -1953,7 +1975,7 @@ fn report_armed_sidecar(canonical: &ProfileName, chain_is_broken: bool) -> Resul
 /// mint that needs no re-stamping is always allowed.
 fn cmd_static_token(name: &str) -> Result<()> {
     let config = load_config()?;
-    let canonical = resolve_or_bail(&config, name)?;
+    let canonical = resolve_or_bail(&config, name, "static-token")?;
     // The whole restore (flag flip + mint restore) serializes on the profile's
     // rotation guard: without it, a concurrent rotation that still sees the
     // flag set can re-stamp the sidecar AFTER the restore, leaving the flag

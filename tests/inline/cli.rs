@@ -1549,10 +1549,10 @@ mod disabled_target_refusal {
 
 // ── a bad profile name is a usage error, not a runtime failure ──────────────
 // A typo'd subcommand is clap's `external` arm (dispatch routes it to
-// `cmd_switch`); a typo'd profile name on `delete`/`start`/`disable`/`enable`
-// reaches the same `resolve_or_bail`. Both should read as "you named something
-// that isn't there" to a calling script: exit 2, distinguishable from success.
-// Mirrors `main`'s parse -> dispatch -> exit_code mapping end-to-end.
+// `cmd_switch`); a typo'd profile name on `disable`/`enable`/`rolling-token`/
+// `static-token` reaches `resolve_or_bail` while `switch`/`delete`/`start`
+// resolve by hand, so either reads as "you named something that isn't there"
+// to a calling script: exit 2, distinguishable from success.
 mod bad_profile_name_is_a_usage_error {
     use super::*;
     use crate::testutil::HomeSandbox;
@@ -3572,4 +3572,130 @@ fn cmd_start_explain_auto_runs_the_with_fallback_refusals() {
         err.to_string(),
         "'a': --with-fallback needs a second account in the fallback chain to move to; add one on the fallback tab, or start without it"
     );
+}
+
+// ── the claude-only verbs and a codex name ────────────────────────────────────
+
+/// `disable`/`enable`/`rolling-token`/`static-token` take claude names alone.
+/// A codex name is refused as what it is, a real account on the other harness,
+/// in one fixed shape naming the verb, as a usage error (exit 2); a name on
+/// neither roster lists the claude roster alone, the only one these verbs
+/// take. `switch`/`delete`/`start` keep the two-roster listing.
+#[test]
+fn the_claude_only_verbs_refuse_a_codex_name_and_list_the_claude_roster_alone() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let clauth = crate::profile::clauth_dir().expect("clauth dir");
+    crate::profile::mkdir_700(&clauth).expect("mkdir .clauth");
+    std::fs::write(clauth.join("codex-profiles.toml"), "profiles = [\"cx\"]\n")
+        .expect("write codex state");
+    let config = AppConfig {
+        state: crate::profile::AppState {
+            profiles: vec!["cl1".into()],
+            ..Default::default()
+        },
+        profiles: vec![crate::testutil::blank_profile(&ProfileName::from("cl1"))],
+    };
+
+    let err = resolve_or_bail(&config, "cx", "disable").expect_err("a codex name is refused");
+    assert!(
+        err.downcast_ref::<UsageError>().is_some(),
+        "a usage error, so the process exits 2: {err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "'cx' is a codex profile; disable is claude-only"
+    );
+    // The caller's casing resolves to the roster's spelling, as `switch` does.
+    let err = resolve_or_bail(&config, "CX", "enable").expect_err("a codex name is refused");
+    assert_eq!(
+        err.to_string(),
+        "'cx' is a codex profile; enable is claude-only"
+    );
+
+    let err = resolve_or_bail(&config, "zz", "disable").expect_err("unknown on both rosters");
+    assert!(err.downcast_ref::<UsageError>().is_some(), "{err:?}");
+    assert_eq!(err.to_string(), "profile 'zz' not found\navailable: cl1");
+
+    assert_eq!(
+        unknown_profile_error(&config, "zz").to_string(),
+        "profile 'zz' not found\navailable: cl1 · codex: cx",
+        "control: the two-roster listing `switch`/`delete`/`start` use is unchanged"
+    );
+
+    let claude = resolve_or_bail(&config, "CL1", "disable").expect("a claude name resolves");
+    assert_eq!(claude.as_str(), "cl1");
+}
+
+/// Every handler passes its own verb, so `clauth <verb> cx` names the verb the
+/// user typed; the `--clear` form of `static-token` is the same verb. Through
+/// `dispatch` the refusal maps to exit 2.
+#[test]
+fn each_claude_only_verb_names_itself_in_the_codex_refusal() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let clauth = crate::profile::clauth_dir().expect("clauth dir");
+    crate::profile::mkdir_700(&clauth).expect("mkdir .clauth");
+    std::fs::write(clauth.join("codex-profiles.toml"), "profiles = [\"cx\"]\n")
+        .expect("write codex state");
+
+    let cases = [
+        ("disable", cmd_disable("cx", true)),
+        ("enable", cmd_enable("cx")),
+        ("rolling-token", cmd_rolling_token("cx")),
+        ("static-token", cmd_static_token("cx")),
+        ("static-token", cmd_static_token_clear("cx", true)),
+    ];
+    for (verb, outcome) in cases {
+        let err = outcome.expect_err("a codex name is refused before any state moves");
+        assert!(
+            err.downcast_ref::<UsageError>().is_some(),
+            "{verb}: {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!("'cx' is a codex profile; {verb} is claude-only")
+        );
+    }
+
+    let cli = parse(&["disable", "cx", "--yes"]).expect("argv parses");
+    assert_eq!(crate::exit_code(crate::dispatch(cli)), 2);
+}
+
+/// A roster that fails to load is a runtime failure (exit 1) like `switch`'s,
+/// `delete`'s and `start`'s, never a not-found: without the roster the verdict
+/// on `cx` is unknowable, and `profile 'cx' not found` would send the user to
+/// fix the wrong file. A claude name never loads the roster, so it resolves
+/// over the same corrupt file.
+#[test]
+fn a_corrupt_codex_roster_fails_the_claude_only_verbs_as_a_runtime_error() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let clauth = crate::profile::clauth_dir().expect("clauth dir");
+    crate::profile::mkdir_700(&clauth).expect("mkdir .clauth");
+    let roster = clauth.join("codex-profiles.toml");
+    std::fs::write(&roster, "profiles = [not toml").expect("corrupt codex state");
+    let config = AppConfig {
+        state: crate::profile::AppState {
+            profiles: vec!["cl1".into()],
+            ..Default::default()
+        },
+        profiles: vec![crate::testutil::blank_profile(&ProfileName::from("cl1"))],
+    };
+
+    let err = resolve_or_bail(&config, "cx", "disable").expect_err("the roster does not load");
+    assert_eq!(
+        err.to_string(),
+        format!("failed to parse {}", roster.display())
+    );
+    assert!(
+        err.root_cause().downcast_ref::<toml::de::Error>().is_some(),
+        "the parse error is the cause, never hidden: {err:?}"
+    );
+    assert!(
+        err.downcast_ref::<UsageError>().is_none(),
+        "a runtime failure, not a usage error: {err:?}"
+    );
+    assert_eq!(crate::exit_code(Err(err)), 1);
+
+    let claude =
+        resolve_or_bail(&config, "CL1", "disable").expect("a claude name never loads the roster");
+    assert_eq!(claude.as_str(), "cl1");
 }

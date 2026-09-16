@@ -505,6 +505,15 @@ fn mark_quarantined(name: &str, kind: &str, at: &str, token: &str) {
     }
 }
 
+/// Test seam for the Overview's broken marker: plant a quarantine record
+/// against `name`'s CURRENT refresh token, so [`read_quarantine`] answers
+/// `Some` exactly as a live verdict would. `at` is a fixed stamp — the
+/// renderer reads only the record's presence.
+#[cfg(test)]
+pub(crate) fn quarantine_for_test(name: &str, kind: &str, token: &str) {
+    mark_quarantined(name, kind, "1970-01-01T00:00:00Z", token);
+}
+
 /// Retire `name`'s quarantine record — a rotation that landed, or a
 /// capture/login that installed a fresh chain the verdict has no claim on.
 pub(crate) fn clear_quarantine(name: &str) {

@@ -1511,8 +1511,10 @@ pub(crate) enum MainItemKind {
 /// Which harness the Overview shows. A VIEW filter only: selection and every
 /// action stay bound to the claude list, because a codex account has no
 /// `Profile` record for them to act on and clauth switches it through its own
-/// CLI verb. So the codex section renders READ-ONLY, and hiding the claude one
-/// hides nothing the cursor can reach.
+/// CLI verb. So the codex section renders READ-ONLY, and while the claude rows
+/// are hidden every key bound to the selection is inert
+/// ([`claude_rows_hidden`]) rather than acting on a row the screen does not
+/// show.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum HarnessFilter {
     #[default]
@@ -1547,22 +1549,27 @@ impl HarnessFilter {
     }
 }
 
-/// One codex account as the Overview renders it — name, plan, and the two
-/// windows, read from the same per-profile usage cache the codex leg writes.
-/// Deliberately NOT a `Profile`: synthesizing one would put a record with no
-/// credentials into every claude path that walks `config.profiles`.
+/// One codex account as the Overview renders it — name, plan, the two windows
+/// and whether its chain is quarantined. The windows come from the per-profile
+/// usage cache the codex leg writes; the plan from that cache, else from the
+/// store's id_token claim; `broken` from the quarantine record beside the
+/// store. Deliberately NOT a `Profile`: synthesizing one would put a record
+/// with no credentials into every claude path that walks `config.profiles`.
 #[derive(Debug, Clone)]
 pub(crate) struct CodexRow {
     pub(crate) name: ProfileName,
     pub(crate) active: bool,
+    pub(crate) broken: bool,
     pub(crate) plan: Option<String>,
     pub(crate) five_hour: Option<crate::usage::UsageWindow>,
     pub(crate) seven_day: Option<crate::usage::UsageWindow>,
 }
 
-/// Snapshot the codex roster for the Overview. Cheap and lock-free: the roster
-/// is one small TOML and each reading is the profile's own cache file, the same
-/// pair `status --json` reads with no daemon running.
+/// Read the codex roster into the [`App::codex_rows`] snapshot. Lock-free: the
+/// roster is one small TOML and each reading is the profile's own cache file
+/// plus the small files beside its store (the quarantine record, and the store
+/// itself on a cache miss for the plan), the same set `status --json` reads
+/// with no daemon running.
 pub(crate) fn codex_rows() -> Vec<CodexRow> {
     let Ok(state) = crate::codex_profiles::CodexState::load() else {
         return Vec::new();
@@ -1579,10 +1586,14 @@ pub(crate) fn codex_rows() -> Vec<CodexRow> {
             CodexRow {
                 name: name.clone(),
                 active: active.as_ref().is_some_and(|a| a == name),
-                plan: cached
-                    .as_ref()
-                    .and_then(|u| u.plan.as_ref())
-                    .and_then(|p| p.codex_plan.clone()),
+                broken: crate::codex_auth::read_quarantine(name.as_str()).is_some(),
+                plan: crate::codex_auth::plan_label(
+                    name.as_str(),
+                    cached
+                        .as_ref()
+                        .and_then(|u| u.plan.as_ref())
+                        .and_then(|p| p.codex_plan.as_deref()),
+                ),
                 five_hour: cached.as_ref().and_then(|u| u.five_hour.clone()),
                 seven_day: cached.as_ref().and_then(|u| u.seven_day.clone()),
             }
@@ -1971,6 +1982,16 @@ pub(crate) struct App {
     /// — the state a fixture writes to force a re-tally, since backdating an
     /// `Instant` panics on a host booted more recently than the interval.
     last_live_sessions_refresh: Option<Instant>,
+    /// The codex roster as the Overview lists it and the header counts it.
+    /// Cached like `live_sessions`: [`codex_rows`] is a roster read plus a few
+    /// small files per account, the header draws on every tab every frame, and
+    /// the roster moves on a human timescale (a CLI verb in another terminal).
+    /// One snapshot for both surfaces is also what keeps the header's count
+    /// equal to the rows the Overview draws.
+    pub(crate) codex_rows: Vec<CodexRow>,
+    /// Throttle for the per-tick codex re-read; same contract as
+    /// `last_live_sessions_refresh`.
+    last_codex_rows_refresh: Option<Instant>,
 }
 
 /// Read every named profile's long-lived-token status for the Overview cache.
@@ -2307,6 +2328,8 @@ impl App {
             session_tokens,
             live_sessions,
             last_live_sessions_refresh: Some(Instant::now()),
+            codex_rows: codex_rows(),
+            last_codex_rows_refresh: Some(Instant::now()),
         };
         app.refresh_unsaved_live_login();
         app
@@ -3167,17 +3190,19 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             }
             return;
         }
-        KeyCode::Char('c') => {
-            // Overview only: it is the one screen listing accounts, so the
-            // filter has nothing to mean anywhere else.
-            if app.tab == Tab::Overview {
-                app.disarm_quit();
-                app.harness_filter = app.harness_filter.next();
-            }
+        // Overview only: it is the one screen listing accounts, so the filter
+        // has nothing to mean anywhere else. Guarded rather than swallowed so
+        // `c` still reaches the per-tab dispatch (Tokens binds it too).
+        KeyCode::Char('c') if app.tab == Tab::Overview => {
+            app.disarm_quit();
+            app.harness_filter = app.harness_filter.next();
             return;
         }
         KeyCode::Char('a') => {
             app.disarm_quit();
+            if app.tab == Tab::Overview && claude_rows_hidden(app) {
+                return;
+            }
             let state = build_action_menu(app);
             if !state.items.is_empty() {
                 app.modals.push(Modal::ActionMenu(state));
@@ -3469,9 +3494,22 @@ fn step_profile_cursor(app: &mut App, delta: i32, len: usize) {
     app.profile_cursor = (app.profile_cursor as i32 + delta).rem_euclid(len as i32) as usize;
 }
 
+/// True, with a toast saying so, while the Overview's `Codex` filter hides the
+/// claude rows the cursor is bound to. Every key that reorders, steps or acts
+/// on the selection asks here first, so nothing acts on a row the screen does
+/// not show.
+fn claude_rows_hidden(app: &mut App) -> bool {
+    if app.harness_filter.shows_claude() {
+        return false;
+    }
+    app.toast(ToastKind::Info, "claude rows are hidden, press c");
+    true
+}
+
 fn handle_overview_key(app: &mut App, key: KeyEvent) {
     let count = app.profile_count();
     match key.code {
+        KeyCode::Up | KeyCode::Down | KeyCode::Enter if claude_rows_hidden(app) => {}
         KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => reorder_main_cursor(app, -1),
         KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => reorder_main_cursor(app, 1),
         KeyCode::Up => step_profile_cursor(app, -1, count),
@@ -10072,11 +10110,30 @@ pub(crate) fn on_tick(app: &mut App) {
     // Before the plugin refresh, which folds the tally into its runtime row and
     // would otherwise render this tick against the previous one's fleet.
     poll_live_sessions(app);
+    poll_codex_rows(app);
     poll_plugin_refresh(app);
     poll_daemon_health(app);
 
     update_banner(app);
     app.prune_toasts();
+}
+
+/// Re-read the codex roster for the Overview's codex section and the header's
+/// account count, at most once a second: a roster TOML plus a few small files
+/// per account is cheap but not per-frame cheap, and both a `clauth login --codex`
+/// in another terminal and a codex usage fetch land on a human timescale.
+/// Ungated by tab and by filter, so a `c` onto the codex view shows the current
+/// roster rather than the one from whenever the view last showed it.
+fn poll_codex_rows(app: &mut App) {
+    const CODEX_ROWS_INTERVAL: Duration = Duration::from_secs(1);
+    if app
+        .last_codex_rows_refresh
+        .is_some_and(|t| t.elapsed() < CODEX_ROWS_INTERVAL)
+    {
+        return;
+    }
+    app.last_codex_rows_refresh = Some(Instant::now());
+    app.codex_rows = codex_rows();
 }
 
 /// Re-probe the daemon presence + `status.json` health for the `● daemon`

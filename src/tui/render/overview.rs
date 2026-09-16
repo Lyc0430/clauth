@@ -6,7 +6,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, Paragraph};
 
-use super::super::app::{App, MainItemKind};
+use super::super::app::{App, CodexRow, MainItemKind};
 use super::super::theme;
 use super::chain::reason_marker;
 use super::format::{
@@ -71,10 +71,10 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let codex = if app.harness_filter.shows_codex() {
-        crate::tui::app::codex_rows()
+    let codex: &[CodexRow] = if app.harness_filter.shows_codex() {
+        &app.codex_rows
     } else {
-        Vec::new()
+        &[]
     };
     if app.config().profiles.is_empty() && codex.is_empty() {
         frame.render_widget(empty_state("no accounts yet", "n", "to create one"), inner);
@@ -115,15 +115,15 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
             rows.push(ListItem::new(Line::from("")));
         }
         rows.push(ListItem::new(Line::from(vec![Span::styled(
-            "  codex — switch with `clauth switch <name>`",
+            "  codex — switch with `clauth <name>`",
             theme::dim(),
         )])));
-        for row in &codex {
+        for row in codex {
             rows.push(ListItem::new(render_codex_row(row, &widths)));
         }
     }
 
-    let total = items.len();
+    let total = rows.len();
     let list = List::new(rows).style(theme::base());
     let mut state = ratatui::widgets::ListState::default();
     state.select(Some(sel));
@@ -382,34 +382,46 @@ fn overview_header(widths: &OverviewWidths, deepseek: bool) -> Line<'static> {
     Line::from(spans)
 }
 
-/// One codex account, in the claude columns: name, plan, 5h, 7d. No cursor
-/// glyph and no live/timer cells — this section is read-only, and a timer would
-/// promise a countdown the Overview cannot act on.
-fn render_codex_row(row: &crate::tui::app::CodexRow, widths: &OverviewWidths) -> Line<'static> {
+/// One codex account, in the claude columns: name, plan, 5h, 7d. The cursor
+/// and timer slots are kept blank and no live cell is drawn — this section is
+/// read-only, and a timer would promise a countdown the Overview cannot act on.
+fn render_codex_row(row: &CodexRow, widths: &OverviewWidths) -> Line<'static> {
     let name_style = if row.active {
         theme::accent().bold()
     } else {
         theme::base()
     };
+    // The same slots every list row carries — the 2-cell cursor prefix (blank:
+    // a codex row is never selected), the marker cell and its gap — so the
+    // `×` and the name sit in the claude rows' columns under the header.
     let mut spans = vec![
         Span::raw("  "),
+        if row.broken {
+            Span::styled("×", theme::danger())
+        } else {
+            Span::raw(" ")
+        },
+        Span::raw(" "),
         Span::styled(fixed(row.name.as_str(), widths.name), name_style),
         Span::raw(" ".repeat(widths.gap)),
-        Span::styled(
-            fixed(row.plan.as_deref().unwrap_or("—"), widths.kind),
-            theme::dim(),
-        ),
+        match row.plan.as_deref() {
+            Some(plan) => Span::styled(fixed(plan, widths.kind), theme::dim()),
+            None => Span::styled(fixed(NO_DATA, widths.kind), theme::faint()),
+        },
     ];
-    for (window, w) in [
-        (row.five_hour.as_ref(), widths.five_hour),
-        (row.seven_day.as_ref(), widths.seven_day),
-    ] {
-        spans.push(Span::raw(" ".repeat(widths.gap)));
-        let cell = match window {
-            Some(win) => format!("{:>w$}", format!("{:.0}%", win.utilization), w = w),
-            None => format!("{:>w$}", "—", w = w),
-        };
-        spans.push(Span::styled(cell, theme::base()));
+    // The usage cells take the claude row's lead-in (narrow gap + a blank
+    // timer slot) and its left alignment, and the 7d cell drops with its
+    // column, so a codex reading sits under `5h`/`7d` and never under `live`.
+    let cell = |window: Option<&crate::usage::UsageWindow>, w: usize| match window {
+        Some(win) => Span::styled(fixed(&format!("{:.0}%", win.utilization), w), theme::base()),
+        None => Span::styled(fixed(NO_DATA, w), theme::faint()),
+    };
+    spans.push(narrow_gap(widths));
+    spans.push(Span::raw(" ".repeat(TIMER_SLOT)));
+    spans.push(cell(row.five_hour.as_ref(), widths.five_hour));
+    if widths.seven_day > 0 {
+        spans.push(gap(widths));
+        spans.push(cell(row.seven_day.as_ref(), widths.seven_day));
     }
     Line::from(spans)
 }

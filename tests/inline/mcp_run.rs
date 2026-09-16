@@ -7739,7 +7739,7 @@ fn the_refusal_tells_a_codex_name_apart_from_an_unknown_one() {
     let real = profile_not_found_cross_harness("cx", ProfileNotFoundFix::CallProfiles);
     assert!(real.contains("CODEX account"), "{real}");
     assert!(
-        real.contains("clauth switch"),
+        real.contains("Switch it with `clauth <name>`"),
         "the fix names the surface that CAN: {real}"
     );
 
@@ -7766,5 +7766,78 @@ fn the_profile_not_found_sentence_is_composed_in_one_place() {
     assert_eq!(
         hits, 1,
         "the builder must be the one site composing the sentence: {hits} spellings in src/mcp/mod.rs"
+    );
+}
+
+/// `switch_profile` on a codex name answers the codex clause, never a bare "not
+/// found": the name is a real account on the harness this tool does not reach,
+/// and the refusal names the verb that can switch it. The caller's casing
+/// resolves the way the claude side did, and the clause names the roster's
+/// spelling.
+#[test]
+fn switch_profile_refuses_a_codex_name_as_a_codex_account() {
+    let home = crate::testutil::HomeSandbox::new();
+    let dir = home.home().join(".clauth");
+    crate::profile::mkdir_700(&dir).expect("mkdir .clauth");
+    std::fs::write(dir.join("codex-profiles.toml"), "profiles = [\"cx\"]\n")
+        .expect("write codex state");
+
+    let server = ClauthServer::new();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let first_line = |name: &str| -> String {
+        let result = rt
+            .block_on(server.switch_profile(Parameters(SwitchArgs {
+                name: name.to_string(),
+            })))
+            .expect("switch_profile returns a tool result, never a transport error");
+        assert_eq!(result.is_error, Some(true));
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .expect("first content block is text");
+        text.lines().next().expect("a first line").to_string()
+    };
+    assert_eq!(
+        first_line("cx"),
+        "switch failed: profile not found: cx; cx names a CODEX account, which these tools \
+         do not manage — they are Claude Code only. Switch it with `clauth <name>`; \
+         active profile none"
+    );
+    assert_eq!(
+        first_line("CX"),
+        "switch failed: profile not found: CX; cx names a CODEX account, which these tools \
+         do not manage — they are Claude Code only. Switch it with `clauth <name>`; \
+         active profile none"
+    );
+}
+
+/// The fan-out sibling of the single-name `delegate` refusal: a codex member in
+/// a two-plus `profiles` list is refused as what it is, never as an unknown
+/// name — the spec's copy fix ("a codex profile reaching delegate gets the
+/// corrected message") covers the fan-out arm too.
+#[test]
+fn resolve_fanout_refuses_a_codex_member_as_a_codex_account() {
+    let _home = HomeSandbox::new();
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    crate::profile::mkdir_700(&dir).expect("mkdir .clauth");
+    std::fs::write(dir.join("codex-profiles.toml"), "profiles = [\"cx\"]\n")
+        .expect("write codex state");
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: Vec::new(),
+    };
+    crate::actions::create_blank_profile(&mut config, "cl1".to_string(), None, None, None)
+        .expect("create profile");
+
+    let raw: Vec<String> = ["cl1", "cx"].iter().map(|n| (*n).to_string()).collect();
+    let err = resolve_fanout(&config, &raw).expect_err("a codex member refuses the fan-out");
+    assert_eq!(
+        err,
+        "profile not found: cx; cx names a CODEX account, which these tools do not manage — \
+         they are Claude Code only. Switch it with `clauth <name>`"
     );
 }

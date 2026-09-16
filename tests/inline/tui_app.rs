@@ -11523,3 +11523,172 @@ fn config_rows_on_the_new_form_carry_one_login_row() {
         "{rows:?}"
     );
 }
+
+// ── the global `c` arm: Overview filter, Tokens cache toggle ─────────────────
+
+/// `c` is the Tokens tab's cache-counting toggle and the Overview's harness
+/// filter. The global arm claims it for the Overview alone; on every other tab
+/// the key falls through to the per-tab dispatch, so the Tokens binding the
+/// footer and help modal advertise still runs.
+#[test]
+fn c_on_the_tokens_tab_flips_count_cache() {
+    use super::{HarnessFilter, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("a"),
+    )]);
+    app.tab = Tab::Tokens;
+    let before = app.config().state.count_cache;
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    assert_eq!(
+        app.config().state.count_cache,
+        !before,
+        "the Tokens `c` binding must still reach `toggle_count_cache`"
+    );
+    assert_eq!(
+        app.harness_filter,
+        HarnessFilter::All,
+        "the harness filter is the Overview's alone"
+    );
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    assert_eq!(
+        app.config().state.count_cache,
+        before,
+        "a second `c` flips it back"
+    );
+}
+
+/// On the Overview `c` cycles the filter both → claude → codex → both and
+/// leaves the Tokens flag alone; on a tab with no `c` binding it is a no-op.
+#[test]
+fn c_on_the_overview_cycles_the_harness_filter_and_leaves_count_cache_alone() {
+    use super::{HarnessFilter, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("a"),
+    )]);
+    app.tab = Tab::Overview;
+    let count_cache = app.config().state.count_cache;
+
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+        seen.push(app.harness_filter);
+    }
+    assert_eq!(
+        seen,
+        [
+            HarnessFilter::Claude,
+            HarnessFilter::Codex,
+            HarnessFilter::All
+        ]
+    );
+    assert_eq!(
+        app.config().state.count_cache,
+        count_cache,
+        "the Overview's `c` never touches the Tokens flag"
+    );
+
+    app.tab = Tab::Usage;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('c')));
+    assert_eq!(
+        app.harness_filter,
+        HarnessFilter::All,
+        "no `c` binding on Usage"
+    );
+    assert_eq!(app.config().state.count_cache, count_cache);
+}
+
+// ── the codex-only view disarms every key bound to the claude selection ──────
+
+/// With the claude rows hidden, reorder, cursor, switch and the action menu
+/// would act on a row the screen does not show. Each is inert with a toast
+/// saying why, and every filter that shows the claude rows (`All` and `Claude`
+/// alike) re-arms all four.
+#[test]
+fn the_codex_only_view_disarms_the_claude_selection_keys() {
+    use super::{HarnessFilter, KeyEvent, KeyModifiers, Modal, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_unlinked_profiles(vec![
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("a")),
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("b")),
+    ]);
+    app.tab = Tab::Overview;
+    app.harness_filter = HarnessFilter::Codex;
+    let order = |app: &App| -> Vec<String> {
+        app.config()
+            .profiles
+            .iter()
+            .map(|p| p.name.to_string())
+            .collect()
+    };
+    let state_order = |app: &App| -> Vec<String> {
+        app.config()
+            .state
+            .profiles
+            .iter()
+            .map(|n| n.to_string())
+            .collect()
+    };
+    let shift_down = KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT);
+
+    handle_key(&mut app, shift_down);
+    assert_eq!(
+        order(&app),
+        ["a", "b"],
+        "reorder is inert while claude rows are hidden"
+    );
+    assert_eq!(state_order(&app), ["a", "b"]);
+    assert_eq!(
+        app.toasts.back().map(|t| t.body.as_str()),
+        Some("claude rows are hidden, press c"),
+        "the inert key says why"
+    );
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.profile_cursor, 0, "the cursor does not step");
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        app.config().state.active_profile,
+        None,
+        "enter switches nothing"
+    );
+    assert!(app.modals.is_empty(), "enter pushes no confirm");
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('a')));
+    assert!(app.modals.is_empty(), "`a` opens no action menu");
+
+    // Every filter showing the claude rows re-arms all four keys; each pass
+    // reorders from cursor 0, so the order flips back and forth.
+    let re_armed = |app: &mut App, filter: HarnessFilter, reordered: [&str; 2]| {
+        app.harness_filter = filter;
+        handle_key(app, shift_down);
+        assert_eq!(order(app), reordered, "{filter:?}: reorder re-armed");
+        assert_eq!(
+            app.profile_cursor, 1,
+            "{filter:?}: the reorder carried the cursor with the row"
+        );
+
+        handle_key(app, crate::testutil::key(KeyCode::Up));
+        assert_eq!(app.profile_cursor, 0, "{filter:?}: cursor re-armed");
+
+        handle_key(app, crate::testutil::key(KeyCode::Enter));
+        assert!(
+            matches!(app.modals.last(), Some(Modal::Confirm(_))),
+            "{filter:?}: enter re-armed: the switch confirm is up"
+        );
+        app.modals.clear();
+
+        handle_key(app, crate::testutil::key(KeyCode::Char('a')));
+        assert!(
+            matches!(app.modals.last(), Some(Modal::ActionMenu(_))),
+            "{filter:?}: `a` re-armed: the action menu is up"
+        );
+        app.modals.clear();
+    };
+    re_armed(&mut app, HarnessFilter::All, ["b", "a"]);
+    re_armed(&mut app, HarnessFilter::Claude, ["a", "b"]);
+}

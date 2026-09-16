@@ -347,18 +347,11 @@ fn delegate_refusal(reason: &str) -> CallToolResult {
 
 /// The one builder for every `profile not found` refusal: the caller's spelling
 /// leads, then the fix clause. Placement rule 4's corollary makes the refusal
-/// carry the whole lesson, and the clause is a closed set composed HERE so the
-/// call sites cannot split the server's refusal vocabulary.
+/// carry the whole lesson, and the clause is a closed set composed on
+/// [`ProfileNotFoundFix`] so the call sites cannot split the server's refusal
+/// vocabulary.
 fn profile_not_found(names: &str, fix: ProfileNotFoundFix) -> String {
-    let clause = match &fix {
-        ProfileNotFoundFix::CallProfiles => "call `profiles` for valid names".to_string(),
-        ProfileNotFoundFix::OmitFilter => "omit `names` for every account".to_string(),
-        ProfileNotFoundFix::CodexAccount(held) => format!(
-            "{held} names a CODEX account, which these tools do not manage — they are Claude \
-             Code only. Switch it with `clauth switch <name>`"
-        ),
-    };
-    format!("profile not found: {names}; {clause}")
+    format!("profile not found: {names}; {}", fix.clause())
 }
 
 /// [`profile_not_found`] for the surfaces a human names a profile at, where a
@@ -366,41 +359,69 @@ fn profile_not_found(names: &str, fix: ProfileNotFoundFix) -> String {
 /// HERE and to a real account everywhere else. These tools are Claude-Code-only
 /// by construction (`load_config` builds from `profiles.toml` alone), which is a
 /// different fact from the name being unknown, and only the refusal can say
-/// which one the caller hit.
+/// which one the caller hit. The codex side resolves case-insensitively, the
+/// way the call sites already tried the claude side, and the clause names the
+/// roster's spelling. A comma list mixing both keeps the caller's fix for the
+/// names unknown on both rosters and adds the codex clause for the rest, so
+/// neither subset loses its lesson.
 ///
 /// Split from the builder rather than folded into it because the builder is a
 /// pure sentence composer — reading the codex roster is IO, and every call site
 /// that composes a refusal from a name it already validated should not pay for
 /// a state read it cannot use.
 fn profile_not_found_cross_harness(names: &str, fix: ProfileNotFoundFix) -> String {
-    let base = profile_not_found(names, fix);
     let Ok(codex) = crate::codex_profiles::CodexState::load() else {
-        return base;
+        return profile_not_found(names, fix);
     };
-    let held: Vec<&str> = names
-        .split(',')
-        .map(str::trim)
-        .filter(|n| codex.holds(n))
-        .collect();
-    if held.is_empty() {
-        return base;
+    let mut held = Vec::new();
+    let mut unknown = Vec::new();
+    for name in names.split(',').map(str::trim) {
+        match codex.canonical_name(name) {
+            Some(canonical) => held.push(canonical),
+            None => unknown.push(name),
+        }
     }
-    profile_not_found(names, ProfileNotFoundFix::CodexAccount(held.join(", ")))
+    if held.is_empty() {
+        return profile_not_found(names, fix);
+    }
+    let held = held.join(", ");
+    if unknown.is_empty() {
+        return profile_not_found(names, ProfileNotFoundFix::CodexAccount(held));
+    }
+    format!(
+        "{}; {}",
+        profile_not_found(&unknown.join(", "), fix),
+        ProfileNotFoundFix::CodexAccount(held).clause()
+    )
 }
 
 /// The fix clause a [`profile_not_found`] refusal ends with. Closed, so the
-/// vocabulary lives in the builder: a call site composing its own clause is the
-/// split the builder exists to close.
+/// vocabulary lives here: a call site composing its own clause is the split
+/// the builder exists to close.
 enum ProfileNotFoundFix {
     /// The caller is outside the roster: the `profiles` tool is the source of
     /// valid names.
     CallProfiles,
     /// The name IS a real account — on the other harness. Carries the codex
-    /// names the caller spelled, so the refusal names them back.
+    /// names in the roster's spelling, so the refusal names the account back
+    /// the way the roster holds it, whatever casing the caller used.
     CodexAccount(String),
     /// The caller is INSIDE the `profiles` tool, filtering it: dropping the
     /// filter shows every account.
     OmitFilter,
+}
+
+impl ProfileNotFoundFix {
+    fn clause(&self) -> String {
+        match self {
+            ProfileNotFoundFix::CallProfiles => "call `profiles` for valid names".to_string(),
+            ProfileNotFoundFix::OmitFilter => "omit `names` for every account".to_string(),
+            ProfileNotFoundFix::CodexAccount(held) => format!(
+                "{held} names a CODEX account, which these tools do not manage — they are Claude \
+                 Code only. Switch it with `clauth <name>`"
+            ),
+        }
+    }
 }
 
 /// The live-usage footer folded into a payload as data: which profile the
@@ -906,7 +927,7 @@ key, which delegates on that key."
                         unknown.into_iter().map(Result::unwrap_err).collect();
                     let payload = serde_json::json!({
                         "ok": false,
-                        "reason": profile_not_found(
+                        "reason": profile_not_found_cross_harness(
                             &missing.join(", "),
                             ProfileNotFoundFix::OmitFilter
                         ),
@@ -996,7 +1017,7 @@ disturbing this session, use `delegate`."
         let Some(name) = config.canonical_name(&name) else {
             let payload = serde_json::json!({
                 "ok": false,
-                "reason": profile_not_found(&name, ProfileNotFoundFix::CallProfiles)
+                "reason": profile_not_found_cross_harness(&name, ProfileNotFoundFix::CallProfiles)
             });
             // Refused before any mutation ran, so nothing of ours moved:
             // report like the session-scope roster does (`DigestMode::Report`).
@@ -3917,7 +3938,7 @@ fn resolve_fanout(config: &AppConfig, raw: &[String]) -> std::result::Result<Vec
         }
     }
     if !missing.is_empty() {
-        return Err(profile_not_found(
+        return Err(profile_not_found_cross_harness(
             &missing.join(", "),
             ProfileNotFoundFix::CallProfiles,
         ));

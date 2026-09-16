@@ -2299,6 +2299,172 @@ fn codex_rows_read_the_roster_and_its_own_cache() {
     );
 }
 
+/// The plan cell's fallback: a captured-but-never-polled account still shows
+/// its tier off the store's id_token `chatgpt_plan_type` claim, and the cached
+/// `wham/usage` plan wins the moment a poll has answered.
+#[test]
+fn codex_rows_plan_falls_back_to_the_id_token_claim() {
+    let home = crate::testutil::HomeSandbox::new();
+    let dir = home.home().join(".clauth");
+    crate::profile::mkdir_700(&dir).expect("mkdir .clauth");
+    std::fs::write(
+        dir.join("codex-profiles.toml"),
+        "profiles = [\"cx1\", \"cx2\"]\n",
+    )
+    .expect("write codex state");
+
+    let id_token = crate::testutil::codex_jwt(
+        r#"{"https://api.openai.com/auth":{"chatgpt_plan_type":"plus"}}"#,
+    );
+    for name in ["cx1", "cx2"] {
+        crate::testutil::write_codex_store(
+            name,
+            &format!(
+                r#"{{"tokens":{{"id_token":"{id_token}","access_token":"a","refresh_token":"rt","account_id":"acc"}}}}"#
+            ),
+        );
+    }
+
+    let pro = crate::usage::map_codex_usage(
+        r#"{"plan_type":"pro","rate_limit":{"primary_window":{"used_percent":42,"limit_window_seconds":18000,"reset_after_seconds":600}}}"#,
+        crate::usage::now_epoch_secs(),
+    )
+    .expect("maps");
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("cx2"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &pro,
+    );
+
+    let rows = crate::tui::app::codex_rows();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[0].plan.as_deref(),
+        Some("plus"),
+        "no cache: the id_token claim stands in"
+    );
+    assert_eq!(
+        rows[1].plan.as_deref(),
+        Some("pro"),
+        "the cached plan wins over the id_token claim"
+    );
+}
+
+/// A codex row's usage cells take the claude row's columns: the 5h value sits
+/// under the `5h` header (the same lead-in as the claude bar), the 7d value
+/// under `7d`, and when the width drops the 7d column the codex row renders no
+/// 7d cell at all, so nothing lands under `live` for a row that has no live
+/// sessions.
+#[test]
+fn a_codex_rows_usage_cells_sit_under_their_headers() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let row = CodexRow {
+        name: crate::profile::ProfileName::from("cx1"),
+        active: false,
+        broken: false,
+        plan: Some("pro".to_string()),
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 42.0,
+            resets_at: None,
+        }),
+        seven_day: None,
+    };
+    let app = App::new(config_with(vec![], None, vec![]));
+
+    let wide = OverviewWidths::new(80, &app);
+    assert!(wide.seven_day > 0, "80 columns keep the 7d column");
+    let line = render_codex_row(&row, &wide);
+    assert_eq!(
+        five_hour_cell_text(&wide, false, &line),
+        fixed("42%", wide.five_hour),
+        "the 5h value sits under the 5h header, left-aligned like the claude bar"
+    );
+    assert_eq!(
+        seven_day_cell_text(&wide, &line),
+        fixed("—", wide.seven_day),
+        "a missing window is a dash under its own header"
+    );
+
+    let narrow = OverviewWidths::new(56, &app);
+    assert_eq!(narrow.seven_day, 0, "56 columns drop the 7d column");
+    let line = render_codex_row(&row, &narrow);
+    assert_eq!(
+        five_hour_cell_text(&narrow, false, &line),
+        fixed("42%", narrow.five_hour)
+    );
+    assert_eq!(
+        live_cell_text(&narrow, &line).trim_end(),
+        "",
+        "no 7d cell is rendered where the column is gone, so nothing sits under live"
+    );
+}
+
+/// A quarantined codex chain renders the same broken-login `×` the claude row
+/// shows; a live chain keeps the blank marker cell. The quarantine read joins
+/// the once-a-second `codex_rows` snapshot, never a per-frame renderer read.
+#[test]
+fn a_quarantined_codex_row_renders_the_broken_marker() {
+    let home = crate::testutil::HomeSandbox::new();
+    let dir = home.home().join(".clauth");
+    crate::profile::mkdir_700(&dir).expect("mkdir .clauth");
+    std::fs::write(
+        dir.join("codex-profiles.toml"),
+        "active_profile = \"cx2\"\nprofiles = [\"cx1\", \"cx2\"]\n",
+    )
+    .expect("write codex state");
+
+    crate::testutil::write_codex_store(
+        "cx1",
+        &crate::testutil::codex_auth_body("acc.1", "refresh.cx1"),
+    );
+    crate::testutil::write_codex_store(
+        "cx2",
+        &crate::testutil::codex_auth_body("acc.2", "refresh.cx2"),
+    );
+    crate::codex_auth::quarantine_for_test("cx1", "reused", "refresh.cx1");
+
+    let rows = crate::tui::app::codex_rows();
+    assert_eq!(rows.len(), 2);
+    assert!(rows[0].broken, "the snapshot carries the quarantine read");
+    assert!(!rows[1].broken, "no record for cx2");
+
+    let app = App::new(config_with(vec![], None, vec![]));
+    let widths = OverviewWidths::new(80, &app);
+    let broken = render_codex_row(&rows[0], &widths);
+    let live = render_codex_row(&rows[1], &widths);
+
+    // The codex row carries the list rows' slots (blank 2-cell cursor prefix,
+    // marker cell, gap, name), so the glyph and the name sit in the claude
+    // rows' columns: the name under the header's `account`, the marker two
+    // cells before it.
+    let header = line_text(&overview_header(&widths, false));
+    let name_col = header
+        .find("account")
+        .expect("the accounts table carries an `account` header");
+    let broken_text: Vec<char> = line_text(&broken).chars().collect();
+    let live_text: Vec<char> = line_text(&live).chars().collect();
+    assert_eq!(
+        broken_text[..name_col + 3].iter().collect::<String>(),
+        "  × cx1",
+        "a quarantined chain shows the broken glyph in the marker cell"
+    );
+    assert_eq!(
+        live_text[..name_col + 3].iter().collect::<String>(),
+        "    cx2",
+        "a live chain keeps the blank marker cell"
+    );
+    let glyph = broken
+        .spans
+        .iter()
+        .find(|s| s.content.as_ref() == "×")
+        .expect("the broken glyph is its own span");
+    assert_eq!(
+        glyph.style.fg,
+        theme::danger().fg,
+        "the broken glyph carries the same danger hue as the claude marker"
+    );
+}
+
 /// The 7d cell text, padding included, under the `7d` header; empty when the
 /// column is dropped. Mirrors `five_hour_cell_text` so the pin proves the cell
 /// sits under its own header, not just that a stamp exists somewhere on the row.
@@ -2552,4 +2718,68 @@ fn no_table_no_peak_marker() {
     let text = line_text(&render_overview_row(&app, 0, &widths, false, true));
     assert!(!text.contains('▲'), "no table, no marker: {text}");
     assert!(text.contains('●'), "the active dot is untouched: {text}");
+}
+
+// ── the accounts scrollbar measures every row the panel renders ───────────────
+
+/// The accounts panel's scrollbar column, one char per list row: the padding
+/// cell right of the list (`section_box` borders + pads one cell each side, so
+/// it sits at `width - 2`), from the row under the column header down to the
+/// bottom border.
+fn accounts_scrollbar_column(app: &App, width: u16, height: u16) -> String {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+        .expect("terminal");
+    term.draw(|f| draw_overview_accounts(f, f.area(), app))
+        .expect("draw");
+    let buf = term.backend().buffer();
+    (2..height - 1)
+        .map(|y| buf.cell((width - 2, y)).expect("cell").symbol().to_string())
+        .collect()
+}
+
+/// Two claude rows never overflow a 5-row list on their own; with a codex
+/// section (a spacer, a header line, three rows) the same list holds seven
+/// rows, and the scrollbar must say so: it measures every row pushed, never
+/// the claude rows alone. Both controls render no track at all.
+#[test]
+fn the_accounts_scrollbar_counts_the_codex_rows() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let claude = || {
+        vec![
+            profile("cl1", 80.0, 10.0, 3_600),
+            profile("cl2", 80.0, 20.0, 3_600),
+        ]
+    };
+
+    let no_codex = App::new(config_with(claude(), None, vec![]));
+    assert_eq!(
+        accounts_scrollbar_column(&no_codex, 80, 8),
+        "     ",
+        "two claude rows fit a 5-row list: no track"
+    );
+
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    crate::profile::mkdir_700(&dir).expect("mkdir .clauth");
+    std::fs::write(
+        dir.join("codex-profiles.toml"),
+        "profiles = [\"cx1\", \"cx2\", \"cx3\"]\n",
+    )
+    .expect("write codex state");
+    let with_codex = App::new(config_with(claude(), None, vec![]));
+    assert_eq!(
+        with_codex.codex_rows.len(),
+        3,
+        "fixture control: the roster loaded"
+    );
+
+    assert_eq!(
+        accounts_scrollbar_column(&with_codex, 80, 12),
+        "         ",
+        "seven rows fit a 9-row list: no track"
+    );
+    assert_eq!(
+        accounts_scrollbar_column(&with_codex, 80, 8),
+        "┃┃┃┊┊",
+        "seven rows overflow a 5-row list: thumb 5*5/7 = 3 rows at offset 0, then track"
+    );
 }
