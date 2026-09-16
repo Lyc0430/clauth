@@ -38,12 +38,16 @@ pub(crate) enum HerdrProbeOut {
 /// [`real_probe`]; tests fill it with fixture-backed probes.
 pub(crate) type PaneProbe = Box<dyn Fn(&[&str]) -> HerdrProbeOut + Send + Sync>;
 
-/// The real probe: [`crate::herdr::resolved_bin`] + [`crate::herdr::bounded_output`].
+/// The real probe: [`crate::herdr::resolved_bin`] + the daemon-scoped
+/// [`crate::herdr::daemon_bounded_output`] (session env stripped).
 pub(crate) fn real_probe() -> PaneProbe {
     Box::new(|args| match crate::herdr::resolved_bin() {
         None => HerdrProbeOut::NotInstalled,
         Some(bin) => HerdrProbeOut::Ran(
-            crate::herdr::bounded_output(&bin.to_string_lossy(), args, &[]).map(|out| HerdrOut {
+            // The daemon-scoped call: the session env is stripped so a daemon
+            // started inside a herdr pane still serves the default session
+            // (owner ruling 2026-09-15, row 7; threat-model HB-4).
+            crate::herdr::daemon_bounded_output(&bin.to_string_lossy(), args).map(|out| HerdrOut {
                 success: out.status.success(),
                 stdout: out.stdout,
             }),
@@ -59,8 +63,9 @@ pub(crate) fn absent_probe() -> PaneProbe {
 }
 
 /// The one fixed sentence each absent state carries; nothing off the wire.
-const NOT_INSTALLED: &str = "herdr is not installed on this host";
-const NO_SERVER: &str = "herdr is installed but no server answered on its socket";
+/// Shared with the terminal bridge, which answers the same two states.
+pub(crate) const NOT_INSTALLED: &str = "herdr is not installed on this host";
+pub(crate) const NO_SERVER: &str = "herdr is installed but no server answered on its socket";
 
 /// `herdr pane process-info`'s JSON envelope.
 #[derive(Deserialize)]

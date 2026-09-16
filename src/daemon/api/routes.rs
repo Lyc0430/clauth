@@ -35,6 +35,7 @@ pub(crate) use super::http::ErrorBody;
 use super::http::{Request, Response, flatten_control_chars, sanitize_for_log};
 use super::pairing::{self, Code, Redeemed};
 use super::panes::{self, PaneProbe};
+use super::terminal;
 
 /// Every route lives under this prefix, and it is spelled once.
 ///
@@ -187,6 +188,10 @@ pub(crate) struct Handled {
     pub(crate) response: Response,
     /// `None` for an unauthenticated request and for the pairing redemption.
     pub(crate) device: Option<String>,
+    /// A validated WebSocket upgrade the connection loop runs itself; the
+    /// response is never written (the loop writes the `101` head). `None` for
+    /// every ordinary answer.
+    pub(crate) hijack: Option<super::terminal::Hijack>,
 }
 
 /// Everything a request handler is allowed to touch.
@@ -210,6 +215,11 @@ pub(crate) struct ApiContext {
     /// Resolves herdr's API socket for `GET /events`. The daemon passes the
     /// production resolver; a test passes an explicit path or `None`.
     pub(crate) herdr: HerdrSeam,
+    /// Spawns the `herdr terminal session …` child the WebSocket bridge
+    /// relays. The daemon passes [`super::terminal::real_terminal_spawn`]; a
+    /// test spawns a fixture script, and the default refuses so no test ever
+    /// runs a real herdr.
+    pub(crate) terminal_spawn: super::terminal::TerminalSpawn,
 }
 
 impl ApiContext {
@@ -221,6 +231,7 @@ impl ApiContext {
         live: Option<crate::daemon::LiveStores>,
         herdr_probe: PaneProbe,
         herdr: HerdrSeam,
+        terminal_spawn: super::terminal::TerminalSpawn,
     ) -> Arc<Self> {
         Arc::new(Self {
             config,
@@ -229,11 +240,13 @@ impl ApiContext {
             live,
             herdr_probe,
             herdr,
+            terminal_spawn,
         })
     }
 
     /// The test constructor: no herdr socket resolver, so a stream never probes
-    /// a real socket; the pane probe is whatever the test hands over.
+    /// a real socket; the pane probe is whatever the test hands over, and the
+    /// terminal spawn refuses rather than reach a real herdr.
     #[cfg(test)]
     pub(crate) fn for_tests(
         config: ConfigHandle,
@@ -241,7 +254,14 @@ impl ApiContext {
         live: Option<crate::daemon::LiveStores>,
         herdr_probe: PaneProbe,
     ) -> Arc<Self> {
-        Self::new(config, status_path, live, herdr_probe, Arc::new(|| None))
+        Self::new(
+            config,
+            status_path,
+            live,
+            herdr_probe,
+            Arc::new(|| None),
+            super::terminal::unspawnable_terminal(),
+        )
     }
 }
 
@@ -287,7 +307,6 @@ pub(crate) fn handle(ctx: &ApiContext, req: &Request, peer: SocketAddr) -> Handl
     // One-shot latches: the store is read per request, so an unlatched line
     // would be one line per request for the daemon's life.
     static READ_FAILED_NOTED: AtomicBool = AtomicBool::new(false);
-    static UNKNOWN_TIER_NOTED: AtomicBool = AtomicBool::new(false);
 
     let path = req.path.strip_prefix(API_PREFIX);
     let route = path.and_then(|path| {
@@ -301,6 +320,7 @@ pub(crate) fn handle(ctx: &ApiContext, req: &Request, peer: SocketAddr) -> Handl
         return Handled {
             response: (route.handler)(ctx, req, &Caller { peer, device: None }),
             device: None,
+            hijack: None,
         };
     }
 
@@ -310,6 +330,7 @@ pub(crate) fn handle(ctx: &ApiContext, req: &Request, peer: SocketAddr) -> Handl
             return Handled {
                 response: Response::unauthorized(),
                 device: None,
+                hijack: None,
             };
         }
         Err(e) => {
@@ -321,9 +342,18 @@ pub(crate) fn handle(ctx: &ApiContext, req: &Request, peer: SocketAddr) -> Handl
             return Handled {
                 response: Response::error(500, "internal"),
                 device: None,
+                hijack: None,
             };
         }
     };
+
+    // The one parametrized path, and the only route that can answer an
+    // upgrade: `/panes/<id>/stream`. It sits outside the route table because a
+    // WebSocket is not an HTTP resource — OpenAPI covers HTTP only, and the
+    // frame vocabulary is hand-written in the plan doc.
+    if let Some(pane_id) = path.and_then(terminal::pane_stream_target) {
+        return terminal::request(ctx, req, &device, pane_id);
+    }
 
     let response = match route {
         Some(route) => match authorize(&device.tier, route.access) {
@@ -336,17 +366,7 @@ pub(crate) fn handle(ctx: &ApiContext, req: &Request, peer: SocketAddr) -> Handl
                 },
             ),
             Grant::NeedsControl => Response::refused(403, "control_required", CONTROL_REQUIRED),
-            Grant::TierUnknown => {
-                if !UNKNOWN_TIER_NOTED.swap(true, Ordering::AcqRel) {
-                    logline!(
-                        "clauth api: device '{}' carries tier {:?}, which this build does not \
-                         know, so every route refuses it; run the clauth that paired it",
-                        sanitize_for_log(&device.name),
-                        sanitize_for_log(device.tier.as_str())
-                    );
-                }
-                Response::refused(403, "device_tier_unknown", TIER_UNKNOWN)
-            }
+            Grant::TierUnknown => refuse_unknown_tier(&device),
         },
         // A known path reached with the wrong method is 405, so a client with a
         // typo'd verb gets told which half is wrong.
@@ -358,7 +378,26 @@ pub(crate) fn handle(ctx: &ApiContext, req: &Request, peer: SocketAddr) -> Handl
     Handled {
         response,
         device: Some(device.name),
+        hijack: None,
     }
+}
+
+/// The one-shot latch behind [`refuse_unknown_tier`]'s log line.
+static UNKNOWN_TIER_NOTED: AtomicBool = AtomicBool::new(false);
+
+/// The refusal every route gives a device carrying a tier this build does not
+/// know, logged once per process. Shared by the route table's arm and the
+/// terminal bridge, which runs before the table.
+pub(crate) fn refuse_unknown_tier(device: &devices::Device) -> Response {
+    if !UNKNOWN_TIER_NOTED.swap(true, Ordering::AcqRel) {
+        logline!(
+            "clauth api: device '{}' carries tier {:?}, which this build does not \
+             know, so every route refuses it; run the clauth that paired it",
+            sanitize_for_log(&device.name),
+            sanitize_for_log(device.tier.as_str())
+        );
+    }
+    Response::refused(403, "device_tier_unknown", TIER_UNKNOWN)
 }
 
 /// What [`authorize`] decided.

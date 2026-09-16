@@ -91,6 +91,12 @@ httparse = "1"
 subtle = "2.6"
 # Hex for the token. Three ad-hoc `{b:02x}` loops already exist; don't add a fourth.
 hex = "0.4"
+# The WebSocket accept hash, the one thing the terminal bridge needs that no
+# other surface does: SHA-1 over `Sec-WebSocket-Key` + the RFC 6455 GUID, then
+# base64. base64 0.23 is already in the lock graph; sha1 is a new (pure-Rust)
+# entry, pinned to the sha2-compatible RustCrypto line already compiled here.
+sha1 = "0.10"
+base64 = "0.23"
 
 [build-dependencies]
 # The version guard `build.rs` runs: fails the build when `plugins/.claude-plugin/

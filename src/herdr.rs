@@ -453,6 +453,90 @@ pub(crate) fn bounded_output(bin: &str, args: &[&str], envs: &[(&str, &OsStr)]) 
     run_bounded(child, PROBE_TIMEOUT)
 }
 
+/// The `HERDR_*` vars a daemon-side herdr spawn strips (owner ruling
+/// 2026-09-15; threat-model HB-4): a daemon started
+/// inside a herdr pane must still target herdr's default session, or it serves
+/// — and for the terminal bridge, types into — whichever session its ancestor
+/// happened to be. `HERDR_BIN_PATH` is not on the list: it is the operator and
+/// test seam that names the binary, never a session selector.
+pub(crate) fn strip_session_env(cmd: &mut Command) {
+    for var in [
+        "HERDR_ENV",
+        "HERDR_SOCKET_PATH",
+        "HERDR_PANE_ID",
+        "HERDR_TAB_ID",
+        "HERDR_WORKSPACE_ID",
+    ] {
+        cmd.env_remove(var);
+    }
+}
+
+/// [`bounded_output`] plus [`strip_session_env`]: the bounded herdr call shape
+/// every daemon-side spawn uses. Pane-side callers (the T6 pane reporter, the
+/// Plugin tab) keep plain [`bounded_output`], because a call made from inside a
+/// pane must target that pane's own session.
+pub(crate) fn daemon_bounded_output(bin: &str, args: &[&str]) -> Option<Output> {
+    let mut cmd = Command::new(bin);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    strip_session_env(&mut cmd);
+    let child = cmd.spawn().ok()?;
+    run_bounded(child, PROBE_TIMEOUT)
+}
+
+/// One `panes[]` entry of `herdr api snapshot`'s rect, in cells. The snapshot
+/// is the only surface that names a pane's width: `pane list` and `pane get`
+/// carry `scroll.viewport_rows` and no column count, and a WebSocket control
+/// attach without an explicit geometry imposes herdr's 120x40 default on the
+/// real pane (measured 2026-08-13; the no-flag observe render reports the same
+/// default on 0.9.0), so the bridge reads both dimensions from here.
+#[derive(Deserialize)]
+pub(crate) struct PaneRect {
+    pub(crate) width: u16,
+    pub(crate) height: u16,
+}
+
+#[derive(Deserialize)]
+struct SnapshotEnvelope {
+    result: SnapshotResult,
+}
+
+#[derive(Deserialize)]
+struct SnapshotResult {
+    snapshot: SnapshotBody,
+}
+
+#[derive(Deserialize)]
+struct SnapshotBody {
+    panes: Vec<SnapshotPane>,
+}
+
+#[derive(Deserialize)]
+struct SnapshotPane {
+    pane_id: String,
+    #[serde(default)]
+    rect: Option<PaneRect>,
+}
+
+/// `herdr api snapshot`'s `(pane_id, rect)` pairs, or `None` when the stdout is
+/// not the envelope. A pane whose rect is missing is simply absent from the
+/// answer; the caller decides what that means for it.
+pub(crate) fn parse_snapshot_rects(stdout: &[u8]) -> Option<Vec<(String, Option<PaneRect>)>> {
+    serde_json::from_slice::<SnapshotEnvelope>(stdout)
+        .ok()
+        .map(|envelope| {
+            envelope
+                .result
+                .snapshot
+                .panes
+                .into_iter()
+                .map(|pane| (pane.pane_id, pane.rect))
+                .collect()
+        })
+}
+
 /// `herdr pane list`'s JSON envelope, trimmed to the fields the pane reporter
 /// and the TUI's knob push read. Unknown fields are ignored on purpose: herdr
 /// adds fields between releases.

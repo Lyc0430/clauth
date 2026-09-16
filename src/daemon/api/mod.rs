@@ -32,6 +32,7 @@ pub(crate) mod http;
 pub(crate) mod pairing;
 pub(crate) mod panes;
 pub(crate) mod routes;
+pub(crate) mod terminal;
 pub(crate) mod tls;
 
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -235,6 +236,7 @@ pub(crate) fn serve_prepared(
         Some(live),
         panes::real_probe(),
         events::production_herdr_resolver(),
+        terminal::real_terminal_spawn(),
     );
 
     let spawned = std::thread::Builder::new()
@@ -371,6 +373,26 @@ fn serve_connection(
         served = served.saturating_add(1);
         let summary = http::request_summary(&request.method, &request.path);
         let handled = routes::handle(ctx, &request, peer);
+
+        // A validated WebSocket upgrade takes the connection over: write the
+        // 101 head, then run the terminal bridge to the socket's end. The
+        // bridge owns everything from here — framing, the herdr child, the
+        // close — so this connection serves no further requests.
+        if let Some(hijack) = handled.hijack {
+            let device = handled
+                .device
+                .as_deref()
+                .map_or_else(|| "-".to_string(), http::sanitize_for_log);
+            logline!("clauth api: {peer} {device} {summary} -> 101");
+            if let Err(e) = http::write_upgrade_head(reader.stream_mut(), &hijack.accept) {
+                logline!("clauth api: {peer}: failed to write the upgrade head: {e}");
+                break;
+            }
+            let (stream, leftover) = reader.into_parts();
+            terminal::run(stream, leftover, hijack, &ctx.terminal_spawn, expires);
+            return;
+        }
+
         let response = if request.method == "HEAD" {
             handled.response.into_head()
         } else {
@@ -444,4 +466,4 @@ fn serve_connection(
 
 #[cfg(test)]
 #[path = "../../../tests/inline/daemon_api_server.rs"]
-mod tests;
+pub(crate) mod tests;

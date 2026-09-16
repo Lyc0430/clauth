@@ -27,8 +27,11 @@ use super::routes::{ApiContext, Caller, ErrorBody, WAIT_POLL, read_feed_tagged};
 /// environment variable.
 pub(crate) type HerdrSeam = std::sync::Arc<dyn Fn() -> Option<PathBuf> + Send + Sync>;
 
-/// The production resolver: `HERDR_SOCKET_PATH` when set and non-empty, else one
-/// `herdr status server --json` probe, else absent.
+/// The production resolver: one `herdr status server --json` probe, else
+/// absent. The probe runs with the session env stripped (owner ruling
+/// 2026-09-15, row 7), so a daemon started inside a herdr pane resolves the
+/// default session's socket, not its ancestor's — the inherited
+/// `HERDR_SOCKET_PATH` is deliberately not consulted at all.
 #[cfg(unix)]
 pub(crate) fn production_herdr_resolver() -> HerdrSeam {
     std::sync::Arc::new(resolve_herdr_socket)
@@ -41,18 +44,12 @@ pub(crate) fn production_herdr_resolver() -> HerdrSeam {
     std::sync::Arc::new(|| None)
 }
 
-/// The socket path the daemon should connect to, resolved in the order the
-/// ruling pins: the injected path first, then one bounded `herdr status server
-/// --json` probe, then nothing.
+/// The socket path the daemon should connect to: the default session's, from
+/// one bounded `herdr status server --json` probe, else nothing.
 #[cfg(unix)]
 fn resolve_herdr_socket() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("HERDR_SOCKET_PATH")
-        && !path.is_empty()
-    {
-        return Some(PathBuf::from(path));
-    }
     let bin = crate::herdr::resolved_bin()?;
-    let out = crate::herdr::bounded_output(bin.to_str()?, &["status", "server", "--json"], &[])?;
+    let out = crate::herdr::daemon_bounded_output(bin.to_str()?, &["status", "server", "--json"])?;
     if !out.status.success() {
         return None;
     }

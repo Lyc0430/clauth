@@ -1813,6 +1813,7 @@ mod route_harness {
             body: body.as_bytes().to_vec(),
             // Routing does not depend on this; the connection loop owns it.
             keep_alive: true,
+            ws: Default::default(),
         }
     }
 

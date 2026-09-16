@@ -200,6 +200,7 @@ fn ctx_with_herdr(herdr: HerdrSeam) -> Arc<ApiContext> {
         None,
         crate::daemon::api::panes::absent_probe(),
         herdr,
+        crate::daemon::api::terminal::unspawnable_terminal(),
     )
 }
 
@@ -213,6 +214,7 @@ fn req(method: &str, path: &str, bearer: Option<&str>, body: &str) -> Request {
         if_none_match: None,
         body: body.as_bytes().to_vec(),
         keep_alive: true,
+        ws: Default::default(),
     }
 }
 

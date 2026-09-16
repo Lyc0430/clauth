@@ -29,7 +29,7 @@ const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789a
 
 /// A client that trusts only the CA just generated, so a handshake succeeding
 /// means the server really presented a chain back to it.
-fn client_config(ca_crt: &Path) -> Option<std::sync::Arc<rustls::ClientConfig>> {
+pub(crate) fn client_config(ca_crt: &Path) -> Option<std::sync::Arc<rustls::ClientConfig>> {
     use rustls::pki_types::CertificateDer;
     use rustls::pki_types::pem::PemObject;
 
@@ -75,7 +75,7 @@ fn ctx() -> std::sync::Arc<ApiContext> {
 /// The name the generated certificate is issued for, and the name the client
 /// asks for. Not this host's real FQDN: the point is the handshake, not the
 /// lookup that finds the file.
-const SERVER_NAME: &str = "localhost";
+pub(crate) const SERVER_NAME: &str = "localhost";
 
 fn openssl(args: &[&str]) -> bool {
     Command::new("openssl")
@@ -121,7 +121,7 @@ fn no_tls_fixture() {
 /// CI marks as required was silently carrying zero listener coverage while
 /// reporting green — a skipped test is indistinguishable from a passing one
 /// in a summary line.
-fn generate_chain(
+pub(crate) fn generate_chain(
     dir: &Path,
 ) -> Result<Option<(crate::daemon::api::tls::CertPaths, std::path::PathBuf)>, String> {
     // Checked up front and separately from the generation below, so "no openssl
@@ -1616,6 +1616,7 @@ fn health_status(ctx: &ApiContext, bearer: &str) -> u16 {
             if_none_match: None,
             body: Vec::new(),
             keep_alive: false,
+            ws: Default::default(),
         },
         std::net::SocketAddr::from(([127, 0, 0, 1], 1)),
     )

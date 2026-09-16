@@ -46,6 +46,7 @@ fn post_pair(ctx: &ApiContext, body: &str) -> Response {
             if_none_match: None,
             body: body.as_bytes().to_vec(),
             keep_alive: true,
+            ws: Default::default(),
         },
         peer(),
     )

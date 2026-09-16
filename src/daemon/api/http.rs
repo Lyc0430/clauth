@@ -49,6 +49,20 @@ pub(crate) struct Request {
     /// it said `Connection: close`, HTTP/1.0 only if it asked for keep-alive.
     /// The server may still decide to close anyway.
     pub(crate) keep_alive: bool,
+    /// The WebSocket handshake headers, reduced to what the one upgrading
+    /// route reads. `requested` is the `Connection: Upgrade` token; the rest
+    /// are the eponymous headers, kept verbatim for the accept computation.
+    pub(crate) ws: WsHeaders,
+}
+
+/// The WebSocket half of a [`Request`]. Defaults to "no upgrade asked for", so
+/// a request built without one answers as plain HTTP.
+#[derive(Default)]
+pub(crate) struct WsHeaders {
+    pub(crate) requested: bool,
+    pub(crate) protocol: Option<String>,
+    pub(crate) key: Option<String>,
+    pub(crate) version: Option<String>,
 }
 
 impl Request {
@@ -267,6 +281,7 @@ impl<S: Read> RequestReader<S> {
         let mut content_length: Option<usize> = None;
         let mut close_requested = false;
         let mut keep_alive_requested = false;
+        let mut ws = WsHeaders::default();
         for header in parsed.headers.iter() {
             if header.name.eq_ignore_ascii_case("transfer-encoding") {
                 // Refused rather than implemented. With persistent connections
@@ -310,8 +325,28 @@ impl<S: Read> RequestReader<S> {
                         close_requested = true;
                     } else if token.eq_ignore_ascii_case("keep-alive") {
                         keep_alive_requested = true;
+                    } else if token.eq_ignore_ascii_case("upgrade") {
+                        ws.requested = true;
                     }
                 }
+            }
+            if header.name.eq_ignore_ascii_case("upgrade")
+                && ws.protocol.is_none()
+                && let Ok(value) = std::str::from_utf8(header.value)
+            {
+                ws.protocol = Some(value.trim().to_string());
+            }
+            if header.name.eq_ignore_ascii_case("sec-websocket-key")
+                && ws.key.is_none()
+                && let Ok(value) = std::str::from_utf8(header.value)
+            {
+                ws.key = Some(value.trim().to_string());
+            }
+            if header.name.eq_ignore_ascii_case("sec-websocket-version")
+                && ws.version.is_none()
+                && let Ok(value) = std::str::from_utf8(header.value)
+            {
+                ws.version = Some(value.trim().to_string());
             }
         }
 
@@ -337,7 +372,18 @@ impl<S: Read> RequestReader<S> {
             body,
             // HTTP/1.1 persists by default; HTTP/1.0 does not unless asked.
             keep_alive: !close_requested && (http_11 || keep_alive_requested),
+            ws,
         }))
+    }
+}
+
+impl<S> RequestReader<S> {
+    /// The stream plus whatever bytes were read past the last request's end —
+    /// the takeover shape for a protocol upgrade: a client may pipeline its
+    /// first upgraded frames behind the handshake, and dropping the buffer
+    /// would silently lose them.
+    pub(crate) fn into_parts(self) -> (S, Vec<u8>) {
+        (self.stream, self.buf)
     }
 }
 
@@ -618,6 +664,43 @@ pub(crate) fn write_response<W: Write>(
     head.push_str("\r\n");
     w.write_all(head.as_bytes())?;
     w.write_all(&resp.body)?;
+    w.flush()
+}
+
+/// The RFC 6455 magic GUID every accept hash appends to the client's key.
+const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+/// `Sec-WebSocket-Accept` for a client's `Sec-WebSocket-Key`: base64 of
+/// SHA-1 over the key text plus the RFC's GUID. `None` when the key is not the
+/// 16 bytes the RFC says a client sends — a key that cannot be the real thing
+/// gets the handshake refused rather than hashed anyway.
+pub(crate) fn accept_key(client_key: &str) -> Option<String> {
+    use base64::Engine as _;
+    use sha1::{Digest, Sha1};
+
+    let engine = base64::engine::general_purpose::STANDARD;
+    let raw = engine.decode(client_key.trim()).ok()?;
+    if raw.len() != 16 {
+        return None;
+    }
+    let mut hasher = Sha1::new();
+    hasher.update(client_key.trim().as_bytes());
+    hasher.update(WS_GUID.as_bytes());
+    Some(engine.encode(hasher.finalize()))
+}
+
+/// The `101 Switching Protocols` head that opens an upgraded connection. No
+/// `Content-Length` — the rest of the connection is the upgraded protocol, not
+/// a body this server could frame.
+pub(crate) fn write_upgrade_head<W: Write>(w: &mut W, accept: &str) -> std::io::Result<()> {
+    let head = format!(
+        "HTTP/1.1 101 Switching Protocols\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Accept: {accept}\r\n\
+         \r\n"
+    );
+    w.write_all(head.as_bytes())?;
     w.flush()
 }
 
