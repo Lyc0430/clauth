@@ -88,6 +88,12 @@ static LAST_SYNCED: Mutex<Option<SystemTime>> = Mutex::new(None);
 /// watchdog tick. Cleared by the next clean [`per_profile_env_keys`] read.
 static ENV_KEYS_WARNED: AtomicBool = AtomicBool::new(false);
 
+/// The same latch for an unreadable codex roster, which does NOT pause: its
+/// own line, reported once, cleared by the next clean roster read. Separate
+/// from [`ENV_KEYS_WARNED`] because that one is cleared by the walk that
+/// completes after the roster failed, which would re-arm this line every tick.
+static CODEX_ROSTER_WARNED: AtomicBool = AtomicBool::new(false);
+
 /// The single decision point for what a `settings.json` key belongs to. Every
 /// per-profile key, top-level or nested, is named here and nowhere else.
 ///
@@ -156,14 +162,22 @@ struct EnvOnlyConfig {
 /// Union of every profile's custom `[env]` keys. A missing `config.toml` is a
 /// profile with no overrides and contributes nothing.
 ///
-/// `None` when a `config.toml` cannot be read or parsed — or when the codex
-/// roster (which decides whose dirs this walk skips) cannot be: the affected
+/// `None` when a `config.toml` cannot be read or parsed: the affected
 /// profiles' env sets are then unknown, and [`sync_members`] skips the merge
 /// rather than treat their keys as shared and leak them into a sibling.
 /// Fail-closed, and self-healing — a file caught mid-edit reads cleanly on the
 /// next tick. Because that pauses settings sync entirely, the first failure is
 /// logged; the latch keeps the watchdog's ~10 Hz retry from flooding the log,
 /// and clears on the next clean read so a recurrence is reported again.
+///
+/// An unreadable codex roster is the one read that does NOT pause: the codex
+/// arm is treated as absent (an empty roster skips no dir), reported once
+/// through its own latch, and the walk proceeds. A codex dir then reads as a
+/// claude one, which is what claude-first means for a dual claim, and a
+/// pure-codex dir's `config.toml` carries no `[env]`, so it contributes
+/// nothing either way. The roster is a codex file, and the fix class this
+/// walk's codex skip belongs to exists to keep a codex file from stalling a
+/// claude subsystem.
 fn per_profile_env_keys() -> Option<BTreeSet<String>> {
     let mut keys = BTreeSet::new();
     // The union must cover every profile the MEMBER SET can contain, and the
@@ -176,17 +190,23 @@ fn per_profile_env_keys() -> Option<BTreeSet<String>> {
     // belong to this subsystem: a dir the codex roster claims is skipped — it
     // can never become a member (a codex home matches no `runtime*` stem) —
     // so a codex `[env]` can neither join the union nor, unparseable, pause a
-    // claude-only sync. An unreadable codex roster pauses: unknown
-    // membership is unknown union coverage, and fail-closed is the direction
-    // every other arm here takes.
+    // claude-only sync.
     let codex = match crate::codex_profiles::CodexState::load() {
-        Ok(state) => state,
+        Ok(state) => {
+            CODEX_ROSTER_WARNED.store(false, Ordering::Relaxed);
+            state
+        }
         Err(e) => {
-            let path = clauth_dir().ok()?.join("codex-profiles.toml");
-            return warn_paused(
-                &path,
-                &format!("did not yield the codex roster ({})", e.root_cause()),
-            );
+            if !CODEX_ROSTER_WARNED.swap(true, Ordering::Relaxed) {
+                let path = clauth_dir().ok()?.join("codex-profiles.toml");
+                logline!(
+                    "clauth: {} did not yield the codex roster ({}); settings.json sync \
+                     reads every profile dir as claude until it reads cleanly",
+                    path.display(),
+                    e.root_cause()
+                );
+            }
+            crate::codex_profiles::CodexState::default()
         }
     };
     let claude_roster: Vec<String> = crate::profile::claude_roster_names()

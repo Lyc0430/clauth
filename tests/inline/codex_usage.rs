@@ -181,3 +181,89 @@ fn a_codex_reading_never_claims_a_claude_tier() {
     assert_eq!(plan.tier.display(), None, "no fabricated Claude tier");
     assert_eq!(plan.codex_plan.as_deref(), Some("pro"));
 }
+
+/// The slot cutoff sits at exactly one day: a window of 86400 s is still the
+/// 5h slot and one of 86401 s is the weekly one, so a cutoff moved by an hour
+/// in either direction reds here where the nominal 5h/7d bodies stay green.
+#[test]
+fn the_weekly_cutoff_is_exactly_one_day() {
+    let at_cutoff = r#"{"rate_limit": {"secondary_window": {"used_percent": 21, "limit_window_seconds": 86400}}}"#;
+    let info = map_usage(at_cutoff, 1_600_000_000).expect("parses");
+    assert_eq!(info.five_hour.as_ref().map(|w| w.utilization), Some(21.0));
+    assert!(info.seven_day.is_none(), "a day is still the short slot");
+
+    let past_cutoff = r#"{"rate_limit": {"primary_window": {"used_percent": 34, "limit_window_seconds": 86401}}}"#;
+    let info = map_usage(past_cutoff, 1_600_000_000).expect("parses");
+    assert_eq!(info.seven_day.as_ref().map(|w| w.utilization), Some(34.0));
+    assert!(
+        info.five_hour.is_none(),
+        "one second past a day is the weekly slot"
+    );
+}
+
+/// The HTTP leg against a local stub: a bearer token, the account header only
+/// when an id is given, and a 200 body through the same mapping the pure
+/// tests pin.
+#[test]
+fn the_usage_fetch_sends_the_bearer_and_the_account_header_only_when_given() {
+    let body = r#"{"plan_type": "plus", "rate_limit": {"primary_window": {"used_percent": 9, "limit_window_seconds": 18000}}}"#;
+    let (addr, handle) =
+        crate::testutil::serve_endpoints_raw(4, move |_path, _i| (200, body.to_string()));
+    let url = format!("{addr}/backend-api/wham/usage");
+
+    let info =
+        fetch_codex_usage_at(&url, "at.secret", Some("acc-1"), 1_600_000_000).expect("200 maps");
+    assert_eq!(info.five_hour.as_ref().map(|w| w.utilization), Some(9.0));
+    assert_eq!(
+        info.plan.as_ref().and_then(|p| p.codex_plan.as_deref()),
+        Some("plus")
+    );
+    fetch_codex_usage_at(&url, "at.secret", None, 1_600_000_000).expect("200 maps");
+    fetch_codex_usage_at(&url, "at.secret", Some("  "), 1_600_000_000).expect("200 maps");
+
+    let seen = handle.join().expect("join stub");
+    assert_eq!(seen.len(), 3, "one request per call");
+    for raw in &seen {
+        assert_eq!(
+            crate::testutil::request_path(raw),
+            "/backend-api/wham/usage"
+        );
+        assert_eq!(
+            crate::testutil::request_header(raw, "authorization").as_deref(),
+            Some("Bearer at.secret")
+        );
+    }
+    assert_eq!(
+        crate::testutil::request_header(&seen[0], "chatgpt-account-id").as_deref(),
+        Some("acc-1"),
+        "a multi-workspace login names its account"
+    );
+    assert_eq!(
+        crate::testutil::request_header(&seen[1], "chatgpt-account-id"),
+        None,
+        "no id, no header: the server picks"
+    );
+    assert_eq!(
+        crate::testutil::request_header(&seen[2], "chatgpt-account-id"),
+        None,
+        "a blank id is no id"
+    );
+}
+
+/// A 401 is the kick signal and comes back as its status, never as a parse or
+/// network failure the caller would read as something else.
+#[test]
+fn a_401_from_the_usage_endpoint_is_reported_as_its_status() {
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(2, |_path, _i| {
+        (401, r#"{"detail":"stale"}"#.to_string())
+    });
+    let err = fetch_codex_usage_at(
+        &format!("{addr}/backend-api/wham/usage"),
+        "at.stale",
+        Some("acc-1"),
+        1_600_000_000,
+    )
+    .expect_err("a 401 is an error");
+    assert!(matches!(err, FetchError::Status(401)), "got {err:?}");
+    assert_eq!(handle.join().expect("join stub").len(), 1);
+}

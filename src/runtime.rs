@@ -5144,8 +5144,7 @@ pub(crate) fn profile_uses_fake_transport(name: &str) -> bool {
 
 /// The durable per-profile codex store, `profiles/<name>/codex-home` — the
 /// symlink target for the state that must outlive one session (the sqlite
-/// stores, `history.jsonl`), and the destination of the teardown sessions
-/// sync-back.
+/// stores, `history.jsonl`, the rollout roots).
 fn codex_global_home(name: &str) -> Result<PathBuf> {
     profile_subpath(&ProfileName::from(name), CODEX_HOME_STEM)
 }
@@ -5176,17 +5175,26 @@ const CODEX_CONFIG_STRIP_SUBKEYS: &[(&str, &str)] = &[("debug", "config_lockfile
 /// silently reshaped by a parse this function got wrong. Comments and key order
 /// are lost in the rewrite, which costs nothing — the copy is codex's to write
 /// in place and is discarded at teardown, never synced back over the original.
+///
+/// Every branch lands owner-only: the copy sits in a tree the perms sweep
+/// stops short of, so the operator's own mode would otherwise be what it keeps.
 fn copy_codex_config(src: &Path, dst: &Path) -> Result<()> {
-    let raw = match std::fs::read_to_string(src) {
-        Ok(raw) => raw,
-        Err(_) => return copy_file(src, dst),
+    let raw = std::fs::read(src).with_context(|| format!("failed to read {}", src.display()))?;
+    let bytes = match stripped_codex_config(&raw) {
+        Some(parsed) => toml::to_string(&parsed)
+            .with_context(|| format!("failed to re-render {}", src.display()))?
+            .into_bytes(),
+        None => raw,
     };
-    let Ok(mut parsed) = toml::from_str::<toml::Value>(&raw) else {
-        return copy_file(src, dst);
-    };
-    let Some(table) = parsed.as_table_mut() else {
-        return copy_file(src, dst);
-    };
+    crate::profile::atomic_write_600(dst, bytes)
+        .with_context(|| format!("failed to write {}", dst.display()))
+}
+
+/// The parsed config with the escape keys removed, or `None` when there was
+/// nothing to strip or the bytes do not parse, so the copy goes verbatim.
+fn stripped_codex_config(raw: &[u8]) -> Option<toml::Value> {
+    let mut parsed = toml::from_str::<toml::Value>(str::from_utf8(raw).ok()?).ok()?;
+    let table = parsed.as_table_mut()?;
     let mut stripped = false;
     for key in CODEX_CONFIG_STRIP_KEYS {
         stripped |= table.remove(*key).is_some();
@@ -5196,13 +5204,7 @@ fn copy_codex_config(src: &Path, dst: &Path) -> Result<()> {
             stripped |= sub.remove(*key).is_some();
         }
     }
-    if !stripped {
-        return copy_file(src, dst);
-    }
-    let rendered = toml::to_string(&parsed)
-        .with_context(|| format!("failed to re-render {}", src.display()))?;
-    crate::profile::atomic_write_600(dst, rendered.as_bytes())
-        .with_context(|| format!("failed to write {}", dst.display()))
+    stripped.then_some(parsed)
 }
 
 /// The sqlite stores (with their `-wal`/`-shm` companions, per the plan's
@@ -5214,14 +5216,6 @@ fn copy_codex_config(src: &Path, dst: &Path) -> Result<()> {
 /// betting on sqlite's symlink resolution. A store name a future codex adds
 /// stays per-session until this list learns it — a bounded, visible
 /// degradation, against silently linking anything.
-/// The rollout roots a codex home keeps side by side: live threads under
-/// `sessions/`, and the ones the operator archived under `archived_sessions/`
-/// (codex `rollout/src/lib.rs`). Archiving MOVES a rollout between them, so a
-/// sync-back that names only the first turns "archive this thread" into
-/// "delete it at teardown" — the one operation whose whole promise is that the
-/// thread is kept.
-const CODEX_ROLLOUT_ROOTS: &[&str] = &["sessions", "archived_sessions"];
-
 const CODEX_DURABLE_ENTRIES: &[&str] = &[
     "goals_1.sqlite",
     "goals_1.sqlite-wal",
@@ -5240,6 +5234,17 @@ const CODEX_DURABLE_ENTRIES: &[&str] = &[
     "thread_history_1.sqlite-shm",
     "history.jsonl",
 ];
+
+/// The rollout roots a codex home keeps side by side: live threads under
+/// `sessions/`, and the ones the operator archived under `archived_sessions/`
+/// (codex `rollout/src/lib.rs`). Both link into the profile-global home the
+/// way the durable entries do, so a rollout is in the store the moment codex
+/// writes it and every later session lists it. Archiving MOVES a rollout
+/// between them, so linking only the first would rename an archived thread
+/// out of the store into the per-session home, and "archive this thread"
+/// would mean "delete it at teardown" — the one operation whose whole promise
+/// is that the thread is kept.
+const CODEX_ROLLOUT_ROOTS: &[&str] = &["sessions", "archived_sessions"];
 
 /// The operator-`~/.codex` entries a SHARED codex session sees — instruction
 /// and extension surfaces, same reasoning as the claude shared runtime linking
@@ -5262,18 +5267,32 @@ const CODEX_OPERATOR_ENTRIES: &[&str] = &[
     "plugins",
 ];
 
-/// Converge the profile store and a fake-mode home's `auth.json` copy —
-/// newer-mtime wins, content-equal is a no-op. One direction is not enough in
-/// EITHER direction: store→copy alone means a re-capture never reaches the
-/// next session once the copy exists, and — worse — it would overwrite a
-/// chain the last session ROTATED in the copy with the store's now-SPENT
-/// refresh token, which is the permanent-death shape. Copy→store alone means
-/// a re-capture is undone at the next start. The claude fake transport solves
-/// this with a per-tick bidirectional mirror; codex has no watchdog, so its
-/// convergence points are the session boundaries — the build here, and the
-/// teardown — with mid-session divergence staying fake mode's documented
-/// cost.
-fn converge_fake_codex_auth(store: &Path, copy: &Path) -> Result<()> {
+/// Which side alone could have written since the last convergence — the
+/// tie-breaker once neither `last_refresh` nor mtime separates the two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConvergePrior {
+    /// Between sessions only the store is written (the standby leg, a
+    /// capture). A same-flavor session live beside this build writes the copy
+    /// stamped, so the stamp branch settles it first: the prior only breaks a
+    /// full tie no live writer produces.
+    Build,
+    /// The session was the only live writer (the standby leg stands down for
+    /// a live fake-transport session), and it writes the copy.
+    Teardown,
+}
+
+/// Converge the profile store and a fake-mode home's `auth.json` copy at a
+/// session boundary; content-equal is a no-op. The chain's own event decides:
+/// the later `last_refresh` wins, mtime only where a side has no parseable
+/// stamp, and a remaining tie goes to the boundary's [`ConvergePrior`]. A tie
+/// sent to the store hands a SPENT refresh token back to a copy the session
+/// just rotated — the permanent-death shape on a coarse-mtime filesystem — so
+/// which side wins a tie is a fact about who could have written, not a
+/// default. One direction is never enough: store→copy alone never carries a
+/// rotation out, copy→store alone undoes a re-capture at the next start. The
+/// claude fake transport mirrors per tick; codex has no watchdog, so the
+/// boundaries are its convergence points and mid-session divergence its cost.
+fn converge_fake_codex_auth(store: &Path, copy: &Path, prior: ConvergePrior) -> Result<()> {
     match (store.exists(), copy.exists()) {
         (false, false) => Ok(()),
         (true, false) => copy_file(store, copy),
@@ -5284,15 +5303,29 @@ fn converge_fake_codex_auth(store: &Path, copy: &Path) -> Result<()> {
             if files_match(store, copy).unwrap_or(false) {
                 return Ok(());
             }
-            let store_m = file_mtime(store);
-            let copy_m = file_mtime(copy);
-            if copy_m > store_m {
+            let copy_wins = match (last_refresh_ms_of(copy), last_refresh_ms_of(store)) {
+                (Some(c), Some(s)) if c != s => c > s,
+                _ => match (file_mtime(copy), file_mtime(store)) {
+                    (Some(c), Some(s)) if c != s => c > s,
+                    _ => prior == ConvergePrior::Teardown,
+                },
+            };
+            if copy_wins {
                 copy_file(copy, store)
             } else {
                 copy_file(store, copy)
             }
         }
     }
+}
+
+/// The `last_refresh` stamp of an `auth.json` on disk, `None` for a file that
+/// does not parse or carries none.
+fn last_refresh_ms_of(path: &Path) -> Option<i64> {
+    let bytes = std::fs::read(path).ok()?;
+    crate::codex_auth::CodexAuth::parse(&bytes)
+        .ok()?
+        .last_refresh_ms()
 }
 
 /// The per-profile codex knobs, read from the profile's own `config.toml` —
@@ -5338,8 +5371,12 @@ fn codex_profile_opts(name: &str) -> CodexProfileOpts {
 ///   symlinks: links into the profile-global home, dangling until codex
 ///   creates through them, which is the point. Isolated: per-session. Fake:
 ///   the home IS the global store, nothing to link.
-/// - `sessions/` — always a real per-home dir; the shared flavor's is synced
-///   back into the global store at teardown.
+/// - the rollout roots ([`CODEX_ROLLOUT_ROOTS`]) — shared flavor under real
+///   symlinks: links into the profile-global home, their targets created
+///   first (codex creates `sessions/<yyyy>/<mm>/<dd>/` through them, and a
+///   `create_dir_all` cannot pass a dangling dir link). Isolated: a real
+///   per-session `sessions/`, discarded by design. Fake: the home IS the
+///   global store.
 fn build_codex_home(home: &Path, name: &str, isolation: Isolation, mode: LinkMode) -> Result<()> {
     let operator = home_dir()?.join(".codex");
     let global = codex_global_home(name)?;
@@ -5368,7 +5405,7 @@ fn build_codex_home(home: &Path, name: &str, isolation: Isolation, mode: LinkMod
                 link_entry(&auth_store, &auth_dst)?;
             }
         }
-        LinkMode::Fake => converge_fake_codex_auth(&auth_store, &auth_dst)?,
+        LinkMode::Fake => converge_fake_codex_auth(&auth_store, &auth_dst, ConvergePrior::Build)?,
     }
 
     let operator_config = operator.join("config.toml");
@@ -5411,19 +5448,32 @@ fn build_codex_home(home: &Path, name: &str, isolation: Isolation, mode: LinkMod
                     link_entry(&global.join(entry), &dst)?;
                 }
             }
+            for root in CODEX_ROLLOUT_ROOTS {
+                let target = global.join(root);
+                crate::profile::mkdir_700(&target)
+                    .with_context(|| format!("failed to create {}", target.display()))?;
+                let dst = home.join(root);
+                if dst.symlink_metadata().is_err() {
+                    link_entry(&target, &dst)?;
+                }
+            }
         }
     }
 
-    crate::profile::mkdir_700(&home.join("sessions"))
-        .with_context(|| format!("failed to create {}", home.join("sessions").display()))?;
+    let sessions = home.join("sessions");
+    if sessions.symlink_metadata().is_err() {
+        crate::profile::mkdir_700(&sessions)
+            .with_context(|| format!("failed to create {}", sessions.display()))?;
+    }
     Ok(())
 }
 
-/// Live codex session guard — the codex [`ProfileRuntime`]. On drop: syncs the
-/// shared flavor's `sessions/` back into the profile-global store, drops the
-/// registry row and marker, and removes the per-session home; the bare
-/// `codex-home` (the durable store, and the fake-mode shared home) is never
-/// removed.
+/// Live codex session guard — the codex [`ProfileRuntime`]. On drop: converges
+/// a fake-mode auth copy back to the store, carries a durable store codex
+/// healed in place back into the profile-global home, drops the registry row
+/// and marker, and removes the per-session home (its rollout roots are links,
+/// so the rollouts stay in the store); the bare `codex-home` (the durable
+/// store, and the fake-mode shared home) is never removed.
 pub(crate) struct CodexRuntime {
     home: PathBuf,
     sessions: PathBuf,
@@ -5577,14 +5627,18 @@ impl Drop for CodexRuntime {
         if self.mode == LinkMode::Fake
             && let Ok(store) =
                 profile_subpath(&ProfileName::from(self.profile.as_str()), "auth.json")
-            && let Err(e) = converge_fake_codex_auth(&store, &self.home.join("auth.json"))
+            && let Err(e) = converge_fake_codex_auth(
+                &store,
+                &self.home.join("auth.json"),
+                ConvergePrior::Teardown,
+            )
         {
             logline!("clauth: codex auth converge at teardown failed: {e:#}");
         }
-        // Sync the shared flavor's sessions back into the durable store so a
-        // rollout survives its session — best-effort, never failing a
-        // completed session, and a no-op when the home IS the store (fake
-        // shared) or the flavor discards by design (isolated).
+        // Carry a durable store codex healed in place back into the
+        // profile-global home — best-effort, never failing a completed
+        // session, and a no-op when the home IS the store (fake shared) or
+        // the flavor keeps its state per-session (isolated).
         if self.isolation == Isolation::Shared
             && self.mode == LinkMode::Real
             && let Ok(global) = codex_global_home(&self.profile)
@@ -5607,21 +5661,6 @@ impl Drop for CodexRuntime {
                 }
                 if let Err(e) = copy_file(&healed, &global.join(entry)) {
                     logline!("clauth: codex {entry} recovery sync-back failed: {e:#}");
-                }
-            }
-
-            for rollout_root in CODEX_ROLLOUT_ROOTS {
-                let src = self.home.join(rollout_root);
-                if !src.is_dir() {
-                    continue;
-                }
-                // Owner-only from birth: the sweep stops at the codex-home
-                // threshold, so nothing retightens what lands loose here, and
-                // rollouts are chat content.
-                let _ = crate::profile::mkdir_700(&global);
-                let _ = crate::profile::mkdir_700(&global.join(rollout_root));
-                if let Err(e) = copy_tree(&src, &global.join(rollout_root)) {
-                    logline!("clauth: codex {rollout_root} sync-back failed: {e:#}");
                 }
             }
         }

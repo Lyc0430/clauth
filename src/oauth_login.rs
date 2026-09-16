@@ -306,7 +306,7 @@ impl AuthorizeRejection {
     /// Parse the callback's `error` param. The input is discarded here: every
     /// value any arm carries onward is one of this function's own literals, so
     /// nothing downstream can be holding browser-supplied bytes.
-    fn parse(code: &str) -> Self {
+    pub(crate) fn parse(code: &str) -> Self {
         match code {
             "access_denied" => Self::Declined,
             "server_error" => Self::Upstream("server_error"),
@@ -319,7 +319,7 @@ impl AuthorizeRejection {
         }
     }
 
-    fn user_message(&self) -> &'static str {
+    pub(crate) fn user_message(&self) -> &'static str {
         match self {
             Self::Declined => "you declined the authorization request",
             Self::Upstream(_) => "anthropic is having trouble",
@@ -329,7 +329,7 @@ impl AuthorizeRejection {
 
     /// Operator-log rendering: the spec code the user copy withholds, as our own
     /// literal rather than the browser's bytes.
-    fn log_detail(&self) -> &'static str {
+    pub(crate) fn log_detail(&self) -> &'static str {
         match self {
             Self::Declined => "access_denied",
             Self::Upstream(code) | Self::Refused(code) => code,

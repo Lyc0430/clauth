@@ -1,10 +1,248 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
-//! The codex PKCE login's pure wire facts, held against the values read from
-//! openai/codex at tag rust-v0.145.0. The network legs (exchange, api-key
-//! mint) are covered where the daemon standby tests exercise the shared agent;
-//! here the assembly and the URL/claim shapes are pinned.
+//! The codex PKCE login, held against the values read from openai/codex at
+//! tag rust-v0.145.0: the URL/claim shapes and the assembly as pure values,
+//! the loopback callback over a real socket pair (the state check and the
+//! closed-set `error` parse), the registered-port bind order, and the two
+//! network legs (the code exchange, the api-key mint) against a local stub.
 
 use super::*;
+
+use std::net::TcpStream;
+
+/// Feed one request through `handle_callback` over a real loopback socket
+/// pair; returns its verdict and the raw HTTP response the "browser" received.
+/// The request carries a complete header block, so the read loop ends at the
+/// terminator instead of at its timeout.
+fn callback_roundtrip(target: &str, expected_state: &str) -> (Result<Option<String>>, String) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr");
+    let mut client = TcpStream::connect(addr).expect("connect");
+    client
+        .write_all(format!("GET {target} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+        .expect("send request");
+    let (server, _) = listener.accept().expect("accept");
+    let verdict = handle_callback(server, expected_state);
+    let mut response = String::new();
+    client.read_to_string(&mut response).expect("read response");
+    (verdict, response)
+}
+
+#[test]
+fn the_callback_takes_the_code_only_under_the_expected_state() {
+    let (verdict, response) =
+        callback_roundtrip("/auth/callback?code=authcode-1&state=STATE", "STATE");
+    assert_eq!(
+        verdict.expect("valid callback").as_deref(),
+        Some("authcode-1")
+    );
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "got: {response}");
+
+    let (verdict, _) = callback_roundtrip("/auth/callback?code=authcode-1&state=EVIL", "STATE");
+    assert_eq!(
+        verdict.expect_err("a state mismatch aborts").to_string(),
+        "codex login state mismatch (possible CSRF); aborted"
+    );
+
+    let (verdict, _) = callback_roundtrip("/favicon.ico", "STATE");
+    assert!(
+        verdict.expect("an unrelated path keeps waiting").is_none(),
+        "not the redirect"
+    );
+}
+
+/// Bytes only the browser redirect could have supplied, shaped to forge a log
+/// line and a TUI span if they were ever echoed: the wire form the query
+/// carries, and the form `query_param` decodes it to. Neither is a string any
+/// page copy or terminal line of this module can contain, so their absence is
+/// the echo check, whichever form an echo would carry.
+const CALLBACK_CANARY: &str = "CANARY%0Aclauth:%20forged%20line%20%60rm%20-rf%60";
+const CALLBACK_CANARY_DECODED: &str = "CANARY\nclauth: forged line `rm -rf`";
+
+/// An OAuth `error` param is fatal, and its bytes reach nothing: the code is
+/// parsed into RFC 6749's closed set and the description is never read, so
+/// the terminal line and the reply page are this module's own literals.
+#[test]
+fn the_callback_parses_an_error_into_the_closed_set_and_echoes_nothing() {
+    let (verdict, response) = callback_roundtrip(
+        &format!(
+            "/auth/callback?state=STATE&error=access_denied&error_description={CALLBACK_CANARY}"
+        ),
+        "STATE",
+    );
+    let err = verdict.expect_err("an error param is fatal").to_string();
+    assert_eq!(err, "you declined the authorization request");
+    for injected in [CALLBACK_CANARY, CALLBACK_CANARY_DECODED] {
+        assert!(!err.contains(injected), "echoed into the line: {err}");
+        assert!(
+            !response.contains(injected),
+            "echoed onto the page: {response}"
+        );
+    }
+    assert!(
+        response.ends_with("close this tab; you can retry from clauth any time."),
+        "the declined arm's own page: {response}"
+    );
+
+    // A code outside the spec's set is where the bytes are least trustworthy:
+    // none are kept, not even into the line.
+    let (verdict, response) = callback_roundtrip(
+        &format!(
+            "/auth/callback?state=STATE&error=made_up_code&error_description={CALLBACK_CANARY}"
+        ),
+        "STATE",
+    );
+    let err = verdict.expect_err("an error param is fatal").to_string();
+    assert_eq!(err, "openai refused the login");
+    assert!(
+        !response.contains("made_up_code"),
+        "echoed onto the page: {response}"
+    );
+
+    let (verdict, _) = callback_roundtrip("/auth/callback?state=STATE&error=server_error", "STATE");
+    assert_eq!(
+        verdict.expect_err("an error param is fatal").to_string(),
+        "openai is having trouble"
+    );
+
+    // Neither a code nor an error: a fixed line with nothing interpolated.
+    let (verdict, _) = callback_roundtrip("/auth/callback?state=STATE", "STATE");
+    assert_eq!(
+        verdict.expect_err("no code is fatal").to_string(),
+        "codex login callback carried no code"
+    );
+}
+
+/// The registered redirect set is two fixed ports, tried in order; a free
+/// port elsewhere would not match a registered redirect_uri, so with both held
+/// the login refuses instead of binding one.
+#[test]
+fn the_login_binds_the_registered_ports_in_order_and_refuses_with_both_held() {
+    // The ports are real loopback ports: a box already holding one names the
+    // skip instead of reading a foreign holder as the fn's own choice.
+    for port in [PRIMARY_PORT, FALLBACK_PORT] {
+        if let Err(e) = TcpListener::bind(("127.0.0.1", port)) {
+            eprintln!(
+                "SKIPPED the_login_binds_the_registered_ports_in_order_and_refuses_with_both_held: \
+                 port {port} is in use on this box ({e})"
+            );
+            return;
+        }
+    }
+    let (primary, port) = bind_registered_port().expect("the primary port is free");
+    assert_eq!(port, PRIMARY_PORT);
+    let (fallback, port) = bind_registered_port().expect("the fallback port is free");
+    assert_eq!(
+        port, FALLBACK_PORT,
+        "the single fallback once the primary is held"
+    );
+    let err = bind_registered_port().expect_err("both held").to_string();
+    assert_eq!(
+        err,
+        "codex's login ports (1455 and 1457) are both in use — close whatever holds them \
+         (another codex or clauth login?) and retry"
+    );
+    drop(primary);
+    drop(fallback);
+}
+
+/// The wire shape of the code exchange against a local stub: form-urlencoded
+/// (the encoding that differs from the JSON refresh at the same endpoint),
+/// exactly the five pairs, and the three-field reply parsed back.
+#[test]
+fn the_code_exchange_sends_the_five_form_pairs_and_parses_the_three_fields() {
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(2, |_path, _i| {
+        (
+            200,
+            r#"{"id_token":"id.x","access_token":"at.x","refresh_token":"rt.x"}"#.to_string(),
+        )
+    });
+    let tok = exchange_code_at(
+        &format!("{addr}/oauth/token"),
+        "the code",
+        "the-verifier",
+        "http://localhost:1455/auth/callback",
+    )
+    .expect("exchange succeeds");
+    assert_eq!(tok.id_token, "id.x");
+    assert_eq!(tok.access_token, "at.x");
+    assert_eq!(tok.refresh_token, "rt.x");
+
+    let seen = handle.join().expect("join stub");
+    assert_eq!(seen.len(), 1, "one call");
+    let raw = &seen[0];
+    assert_eq!(crate::testutil::request_path(raw), "/oauth/token");
+    assert_eq!(
+        crate::testutil::request_header(raw, "content-type").as_deref(),
+        Some("application/x-www-form-urlencoded")
+    );
+    assert_eq!(
+        crate::testutil::request_body(raw),
+        format!(
+            "grant_type=authorization_code&code=the%20code\
+             &redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback\
+             &client_id={CODEX_CLIENT_ID}&code_verifier=the-verifier"
+        )
+    );
+}
+
+/// A non-2xx exchange is an error naming the status, never a parse of the
+/// error body.
+#[test]
+fn a_rejected_code_exchange_names_the_status() {
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(2, |_path, _i| {
+        (400, r#"{"error":"invalid_grant"}"#.to_string())
+    });
+    // No `Debug` on the token-carrying reply, so no `expect_err`.
+    let err = match exchange_code_at(
+        &format!("{addr}/oauth/token"),
+        "c",
+        "v",
+        "http://localhost:1455/auth/callback",
+    ) {
+        Ok(_) => panic!("a 400 is an error"),
+        Err(e) => e.to_string(),
+    };
+    assert_eq!(err, "codex token exchange returned HTTP 400");
+    assert_eq!(handle.join().expect("join stub").len(), 1);
+}
+
+/// The api-key mint is best-effort by contract: the key on a 2xx body that
+/// carries one, `Ok(None)` on a 4xx, so a login that only wants the ChatGPT
+/// chain still completes.
+#[test]
+fn the_api_key_exchange_is_best_effort() {
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(2, |_path, _i| {
+        (200, r#"{"access_token":"sk-minted"}"#.to_string())
+    });
+    assert_eq!(
+        exchange_api_key_at(&format!("{addr}/oauth/token"), "h.p.s").expect("2xx"),
+        Some("sk-minted".to_string())
+    );
+    let seen = handle.join().expect("join stub");
+    assert_eq!(seen.len(), 1);
+    assert_eq!(
+        crate::testutil::request_header(&seen[0], "content-type").as_deref(),
+        Some("application/x-www-form-urlencoded")
+    );
+    assert_eq!(
+        crate::testutil::request_body(&seen[0]),
+        format!(
+            "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange\
+             &client_id={CODEX_CLIENT_ID}&requested_token=openai-api-key\
+             &subject_token=h.p.s&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aid_token"
+        )
+    );
+
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(2, |_path, _i| {
+        (403, r#"{"error":"forbidden"}"#.to_string())
+    });
+    assert_eq!(
+        exchange_api_key_at(&format!("{addr}/oauth/token"), "h.p.s")
+            .expect("a 4xx is not an error"),
+        None
+    );
+    assert_eq!(handle.join().expect("join stub").len(), 1);
+}
 
 #[test]
 fn the_authorize_url_carries_the_verified_params() {

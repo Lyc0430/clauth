@@ -354,11 +354,63 @@ pub(crate) fn serve_endpoints(
 /// [`serve_endpoints`] that also hands back each request's BODY, for a leg
 /// whose correctness is in what it sent (the paste door's `redirect_uri` and
 /// `state`) rather than in which endpoint it reached. Same listener, same
-/// deadlines; `serve_endpoints` is a projection of this one.
+/// deadlines; `serve_endpoints` is a projection of this one, and this one of
+/// [`serve_endpoints_raw`].
 pub(crate) fn serve_endpoints_recording(
     max: usize,
     reply: impl Fn(&str, usize) -> (u16, String) + Send + 'static,
 ) -> (String, std::thread::JoinHandle<Vec<(String, String)>>) {
+    let (base, inner) = serve_endpoints_raw(max, reply);
+    let handle = std::thread::spawn(move || {
+        inner
+            .join()
+            .expect("raw listener")
+            .into_iter()
+            .map(|raw| (request_path(&raw), request_body(&raw)))
+            .collect()
+    });
+    (base, handle)
+}
+
+/// The request path off a raw request text, as the listener saw it.
+pub(crate) fn request_path(raw: &str) -> String {
+    raw.lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .unwrap_or("")
+        .to_string()
+}
+
+/// The body off a raw request text: everything past the header terminator.
+pub(crate) fn request_body(raw: &str) -> String {
+    raw.split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_string())
+        .unwrap_or_default()
+}
+
+/// One header's value off a raw request text, matched case-insensitively the
+/// way a server reads it; `None` when the request never sent it.
+pub(crate) fn request_header(raw: &str, name: &str) -> Option<String> {
+    raw.split_once("\r\n\r\n")
+        .map_or(raw, |(head, _)| head)
+        .lines()
+        .skip(1)
+        .find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim()
+                .eq_ignore_ascii_case(name)
+                .then(|| value.trim().to_string())
+        })
+}
+
+/// The listener under [`serve_endpoints_recording`]: hands back each request's
+/// RAW text, headers included, for a leg whose correctness is in a header it
+/// sent (a bearer token, an account id, a content type). Same deadlines as the
+/// projections above.
+pub(crate) fn serve_endpoints_raw(
+    max: usize,
+    reply: impl Fn(&str, usize) -> (u16, String) + Send + 'static,
+) -> (String, std::thread::JoinHandle<Vec<String>>) {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::time::{Duration, Instant};
@@ -374,7 +426,7 @@ pub(crate) fn serve_endpoints_recording(
         .set_nonblocking(true)
         .expect("nonblocking listener");
     let handle = std::thread::spawn(move || {
-        let mut seen: Vec<(String, String)> = Vec::new();
+        let mut seen: Vec<String> = Vec::new();
         for i in 0..max {
             let deadline = Instant::now()
                 + if seen.is_empty() {
@@ -424,17 +476,7 @@ pub(crate) fn serve_endpoints_recording(
                 }
             }
             let text = String::from_utf8_lossy(&req).into_owned();
-            let path = text
-                .lines()
-                .next()
-                .and_then(|l| l.split_whitespace().nth(1))
-                .unwrap_or("")
-                .to_string();
-            let request_body = text
-                .split_once("\r\n\r\n")
-                .map(|(_, b)| b.to_string())
-                .unwrap_or_default();
-            let (status, body) = reply(&path, i);
+            let (status, body) = reply(&request_path(&text), i);
             let _ = sock.write_all(
                 format!(
                     "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
@@ -445,7 +487,7 @@ pub(crate) fn serve_endpoints_recording(
             );
             let _ = sock.write_all(body.as_bytes());
             let _ = sock.shutdown(std::net::Shutdown::Write);
-            seen.push((path, request_body));
+            seen.push(text);
         }
         seen
     });

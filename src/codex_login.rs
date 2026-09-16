@@ -29,7 +29,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::codex_auth::{CODEX_CLIENT_ID, CODEX_TOKEN_URL};
 use crate::logline::logline;
-use crate::oauth_login::{base64url_nopad, percent_encode, query_param};
+use crate::oauth_login::{AuthorizeRejection, base64url_nopad, percent_encode, query_param};
 
 /// codex's registered loopback ports and callback path — a redirect_uri the
 /// server will accept, not a free port.
@@ -203,10 +203,45 @@ fn handle_callback(
             Ok(Some(code))
         }
         _ => {
-            let err = query_param(query, "error").unwrap_or_else(|| "no code".into());
-            write_reply(&mut stream, "codex login failed — return to your terminal");
-            bail!("codex login callback carried no code: {err}");
+            // `error` and the `error_description` beside it are uncapped
+            // browser-supplied text: the code is parsed into RFC 6749's closed
+            // set and its bytes dropped, the description never read.
+            let Some(err) = query_param(query, "error") else {
+                write_reply(&mut stream, "codex login failed — return to your terminal");
+                bail!("codex login callback carried no code");
+            };
+            let rejection = AuthorizeRejection::parse(&err);
+            let (page, line) = rejection_copy(&rejection);
+            write_reply(&mut stream, page);
+            logline!(
+                "clauth: the codex authorize callback refused the login: {}",
+                rejection.log_detail()
+            );
+            bail!("{line}");
         }
+    }
+}
+
+/// The reply page and the terminal line per rejection arm, every byte this
+/// module's own literal. The claude callback's `user_message` names anthropic
+/// in its vendor arms, so only the vendor-free declined line is shared.
+fn rejection_copy(rejection: &AuthorizeRejection) -> (&'static str, &'static str) {
+    match rejection {
+        AuthorizeRejection::Declined => (
+            "codex login canceled: you declined the authorization request. close this tab; \
+             you can retry from clauth any time.",
+            rejection.user_message(),
+        ),
+        AuthorizeRejection::Upstream(_) => (
+            "codex login failed: openai is having trouble. close this tab and retry from \
+             clauth in a moment.",
+            "openai is having trouble",
+        ),
+        AuthorizeRejection::Refused(_) | AuthorizeRejection::Unrecognized => (
+            "codex login failed: openai refused the login. close this tab and retry from \
+             clauth.",
+            "openai refused the login",
+        ),
     }
 }
 
@@ -240,12 +275,18 @@ fn code_exchange_body(code: &str, verifier: &str, redirect_uri: &str) -> String 
     )
 }
 
-/// The authorization-code exchange: `application/x-www-form-urlencoded`, the
-/// encoding that differs from the JSON refresh at the same endpoint.
-fn exchange_code(code: &str, verifier: &str, redirect_uri: &str) -> Result<CodeExchange> {
+/// The authorization-code exchange against `url`: `application/x-www-form-urlencoded`,
+/// the encoding that differs from the JSON refresh at the same endpoint. Split
+/// from [`exchange_code`] so tests drive the wire shape against a local stub.
+fn exchange_code_at(
+    url: &str,
+    code: &str,
+    verifier: &str,
+    redirect_uri: &str,
+) -> Result<CodeExchange> {
     let body = code_exchange_body(code, verifier, redirect_uri);
     let mut resp = crate::oauth::http_agent()
-        .post(CODEX_TOKEN_URL)
+        .post(url)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .send(body)
         .context("codex token exchange transport failed")?;
@@ -255,6 +296,10 @@ fn exchange_code(code: &str, verifier: &str, redirect_uri: &str) -> Result<CodeE
         bail!("codex token exchange returned HTTP {status}");
     }
     serde_json::from_str(&text).context("codex token exchange response did not parse")
+}
+
+fn exchange_code(code: &str, verifier: &str, redirect_uri: &str) -> Result<CodeExchange> {
+    exchange_code_at(CODEX_TOKEN_URL, code, verifier, redirect_uri)
 }
 
 /// Assemble the `auth.json` codex expects, performing the best-effort api-key
@@ -304,10 +349,11 @@ fn chatgpt_account_id(id_token: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The RFC-8693 token-exchange that mints an `OPENAI_API_KEY` from the
-/// id_token. Best-effort by contract: `Ok(None)` on any non-success, so a
-/// login that only wants the ChatGPT chain still completes.
-fn exchange_api_key(id_token: &str) -> Result<Option<String>> {
+/// The RFC-8693 token-exchange against `url` that mints an `OPENAI_API_KEY`
+/// from the id_token. Best-effort by contract: `Ok(None)` on any non-success,
+/// so a login that only wants the ChatGPT chain still completes. Split from
+/// [`exchange_api_key`] so tests drive both answers against a local stub.
+fn exchange_api_key_at(url: &str, id_token: &str) -> Result<Option<String>> {
     let body = format!(
         "grant_type={}&client_id={}&requested_token={}&subject_token={}&subject_token_type={}",
         percent_encode("urn:ietf:params:oauth:grant-type:token-exchange"),
@@ -317,7 +363,7 @@ fn exchange_api_key(id_token: &str) -> Result<Option<String>> {
         percent_encode("urn:ietf:params:oauth:token-type:id_token"),
     );
     let mut resp = match crate::oauth::http_agent()
-        .post(CODEX_TOKEN_URL)
+        .post(url)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .send(body)
     {
@@ -336,6 +382,10 @@ fn exchange_api_key(id_token: &str) -> Result<Option<String>> {
         .get("access_token")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string))
+}
+
+fn exchange_api_key(id_token: &str) -> Result<Option<String>> {
+    exchange_api_key_at(CODEX_TOKEN_URL, id_token)
 }
 
 fn now_rfc3339() -> String {

@@ -184,19 +184,21 @@ pub(crate) fn map_usage(body: &str, now_secs: i64) -> Result<UsageInfo, FetchErr
     })
 }
 
-/// Poll one codex account's usage. Read-only: this endpoint is the only codex
-/// HTTP surface clauth touches outside a refresh, and it neither mints nor
-/// spends anything.
+/// Poll one codex account's usage at `url`. Read-only: this endpoint is the
+/// only codex HTTP surface clauth touches outside a refresh, and it neither
+/// mints nor spends anything. Split from [`fetch_codex_usage`] so tests drive
+/// the wire shape against a local stub.
 ///
 /// A 401 is the caller's signal that the access token is stale — it feeds
 /// [`crate::codex_auth::kick_codex`], the only producer of that queue.
-pub(crate) fn fetch_codex_usage(
+pub(crate) fn fetch_codex_usage_at(
+    url: &str,
     access_token: &str,
     account_id: Option<&str>,
     now_secs: i64,
 ) -> Result<UsageInfo, FetchError> {
     let mut req = http_agent()
-        .get(CODEX_USAGE_URL)
+        .get(url)
         .header("Authorization", &format!("Bearer {access_token}"))
         .header("Accept", "application/json");
     // Multi-workspace logins answer for whichever account this header names;
@@ -214,6 +216,14 @@ pub(crate) fn fetch_codex_usage(
         .read_to_string()
         .map_err(|_| FetchError::Network)?;
     map_usage(&body, now_secs)
+}
+
+pub(crate) fn fetch_codex_usage(
+    access_token: &str,
+    account_id: Option<&str>,
+    now_secs: i64,
+) -> Result<UsageInfo, FetchError> {
+    fetch_codex_usage_at(CODEX_USAGE_URL, access_token, account_id, now_secs)
 }
 
 #[cfg(test)]

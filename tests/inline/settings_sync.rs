@@ -593,6 +593,56 @@ fn a_dual_claimed_name_stays_claude_first_here() {
     );
 }
 
+/// An unreadable codex roster is a codex file, and the codex skip exists so a
+/// codex file cannot stall this claude subsystem: the codex arm reads as
+/// absent, the walk proceeds, and the claude keys still arrive. Every other
+/// arm keeps failing closed.
+#[test]
+fn an_unreadable_codex_roster_reads_as_no_codex_arm_and_never_pauses() {
+    let home = HomeSandbox::new();
+    write_config(home.home(), "p1", "[env]\nFOO = \"1\"\n");
+    let clauth = home.home().join(".clauth");
+    fs::write(clauth.join("codex-profiles.toml"), "profiles = [\n").expect("write broken roster");
+    CODEX_ROSTER_WARNED.store(false, Ordering::Relaxed);
+
+    assert_eq!(
+        per_profile_env_keys().expect("the roster is not a claude file: never a pause"),
+        BTreeSet::from(["FOO".to_string()])
+    );
+    assert!(
+        CODEX_ROSTER_WARNED.load(Ordering::Relaxed),
+        "the roster failure is reported once"
+    );
+    assert!(
+        sync_members(&known_paths().expect("known paths")).expect("sync"),
+        "the merge runs"
+    );
+
+    // A valid roster naming a codex dir whose own config.toml does not parse:
+    // the dir is skipped by membership, the claude keys still arrive.
+    fs::write(clauth.join("codex-profiles.toml"), "profiles = [\"cx\"]\n").expect("write roster");
+    let cx = clauth.join("profiles").join("cx");
+    fs::create_dir_all(&cx).expect("mkdir codex profile");
+    fs::write(cx.join("config.toml"), "[env\nBROKEN = ").expect("write broken codex config");
+    assert_eq!(
+        per_profile_env_keys().expect("a codex config is never read here"),
+        BTreeSet::from(["FOO".to_string()])
+    );
+    assert!(
+        !CODEX_ROSTER_WARNED.load(Ordering::Relaxed),
+        "a clean roster read clears the latch so a recurrence is reported again"
+    );
+
+    // A claude config.toml that does not parse still pauses.
+    write_config(home.home(), "p2", "[env\nBROKEN = ");
+    ENV_KEYS_WARNED.store(false, Ordering::Relaxed);
+    assert!(
+        per_profile_env_keys().is_none(),
+        "the claude arm keeps failing closed"
+    );
+    ENV_KEYS_WARNED.store(false, Ordering::Relaxed);
+}
+
 #[test]
 fn a_config_that_does_not_parse_aborts_the_tick() {
     let home = HomeSandbox::new();

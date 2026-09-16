@@ -797,6 +797,131 @@ fn the_spawn_pins_the_state_db_home_past_a_copied_config_key() {
     );
 }
 
+/// codex layers its managed config ABOVE the session's `-c` flags, so a key
+/// set there defeats the forced store and state-DB home the spawn pins, and
+/// nothing clauth passes can outrank it. The two keys that kill the chain
+/// refuse the spawn with a line naming the file, the key, its value and the
+/// fix; the moved state-DB home warns; anything else, absent or unparseable
+/// included, is clear.
+#[test]
+fn the_managed_config_verdict_refuses_the_chain_killers_and_warns_on_the_rest() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("managed_config.toml");
+    let file = path.display();
+
+    assert_eq!(
+        managed_config_verdict(&path),
+        ManagedConfigVerdict::Clear,
+        "absent"
+    );
+
+    fs::write(
+        &path,
+        "model = \"o3\"\ncli_auth_credentials_store = \"keyring\"\n",
+    )
+    .expect("write");
+    assert_eq!(
+        managed_config_verdict(&path),
+        ManagedConfigVerdict::Refuse(format!(
+            "{file} sets cli_auth_credentials_store = \"keyring\", and a managed config outranks \
+             the file store clauth forces at spawn, so codex would ignore this session's \
+             linked auth.json. ask whoever manages this machine to remove the key or set it \
+             to \"file\"; clauth cannot override a managed config"
+        ))
+    );
+
+    fs::write(&path, "cli_auth_credentials_store = \"file\"\n").expect("write");
+    assert_eq!(
+        managed_config_verdict(&path),
+        ManagedConfigVerdict::Clear,
+        "the file store is what the spawn forces anyway"
+    );
+
+    fs::write(&path, "[debug]\nconfig_lockfile = { load_path = \"/x\" }\n").expect("write");
+    assert_eq!(
+        managed_config_verdict(&path),
+        ManagedConfigVerdict::Refuse(format!(
+            "{file} sets debug.config_lockfile.load_path = \"/x\", and a managed config \
+             outranks the flags clauth passes at spawn, so codex would replay that lockfile \
+             as its whole config and drop the file store this session's linked auth.json \
+             depends on. ask whoever manages this machine to remove the key; clauth cannot \
+             override a managed config"
+        ))
+    );
+
+    fs::write(
+        &path,
+        "[debug]\nconfig_lockfile = { export_dir = \"/e\" }\n",
+    )
+    .expect("write");
+    assert_eq!(
+        managed_config_verdict(&path),
+        ManagedConfigVerdict::Clear,
+        "an export dir writes lockfiles and replays none"
+    );
+
+    fs::write(&path, "sqlite_home = \"/y\"\n").expect("write");
+    assert_eq!(
+        managed_config_verdict(&path),
+        ManagedConfigVerdict::Warn(format!(
+            "{file} sets sqlite_home = \"/y\", which outranks the per-session home \
+             clauth pins at spawn, so every profile's state dbs land in that one directory"
+        ))
+    );
+
+    fs::write(
+        &path,
+        "sqlite_home = \"/y\"\ncli_auth_credentials_store = \"auto\"\n",
+    )
+    .expect("write");
+    assert!(
+        matches!(
+            managed_config_verdict(&path),
+            ManagedConfigVerdict::Refuse(_)
+        ),
+        "a chain killer outranks a warning"
+    );
+
+    fs::write(&path, "model = \"o3\"\n[unclosed\n").expect("write");
+    assert_eq!(
+        managed_config_verdict(&path),
+        ManagedConfigVerdict::Clear,
+        "a file codex cannot parse is codex's own refusal"
+    );
+}
+
+/// The spawn site consults the verdict before anything else: a refusing
+/// managed config ends `run_codex` with the verdict's own line. The profile
+/// root is walled off with a file so a spawn-site regression fails on the
+/// wall (`acquire` cannot create the profile dir) instead of launching
+/// whatever `codex` is on PATH.
+#[test]
+fn run_codex_refuses_on_the_managed_config_before_building_a_home() {
+    let sb = HomeSandbox::new();
+    fs::create_dir_all(sb.home().join(".clauth")).expect("mkdir .clauth");
+    fs::write(sb.home().join(".clauth/profiles"), b"").expect("wall off the profile root");
+    let managed = sb.home().join("managed_config.toml");
+    fs::write(&managed, "cli_auth_credentials_store = \"keyring\"\n").expect("write managed");
+    let _managed = ManagedConfigSandbox::new(&sb, &managed);
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+
+    let err = run_codex(&config, "cx", &[], Isolation::Shared)
+        .expect_err("a managed keyring store refuses the spawn");
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "{} sets cli_auth_credentials_store = \"keyring\", and a managed config outranks \
+             the file store clauth forces at spawn, so codex would ignore this session's \
+             linked auth.json. ask whoever manages this machine to remove the key or set it \
+             to \"file\"; clauth cannot override a managed config",
+            managed.display()
+        )
+    );
+}
+
 /// A home whose path carries an apostrophe cannot ride a TOML literal string,
 /// so the override falls back to a basic string rather than emitting a value
 /// codex's `-c` parser would read as truncated.
