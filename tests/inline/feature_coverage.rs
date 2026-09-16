@@ -201,6 +201,30 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
             "start_auto_",
         ],
     ),
+    (
+        // the codex harness: capture + browser login, the per-session home,
+        // the standby refresh with its no-replay memo and quarantine, the
+        // usage leg, the chain walk, and the Overview's codex section.
+        "Codex too",
+        &[
+            "codex_capture_",
+            "codex_browser_",
+            "the_callback_parses_an_error_into_the_closed_set",
+            "the_code_exchange_sends_the_five_form_pairs",
+            "a_shared_codex_home_links_the_table",
+            "a_rollout_written_through_the_linked_root",
+            "the_managed_config_verdict_refuses_the_chain_killers",
+            "a_terminal_verdict_leaves_a_quarantine_record",
+            "an_unwritable_memo_sends_nothing_and_keeps_the_kick",
+            "standby_tick_rotates_every_due_chain_through_the_wire",
+            "the_usage_fetch_sends_the_bearer",
+            "a_quarantined_codex_member_is_walked_around",
+            "apply_codex_switch_",
+            "delete_codex_",
+            "c_on_the_overview_cycles_the_harness_filter",
+            "a_quarantined_codex_row_renders_the_broken_marker",
+        ],
+    ),
 ];
 
 #[test]
