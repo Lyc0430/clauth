@@ -108,21 +108,22 @@ The chain runs wherever the decision loop runs: an open TUI, or `clauth daemon` 
 
 ## Choosing where a session starts
 
-The chain decides where a session *moves*. `clauth start --auto` decides where one **starts**, and it is the only place in clauth that knows which models a session is about to run.
+The chain decides where a session *moves*. `clauth start --auto` decides where one **starts**: it walks the fallback chain in order and launches on the first member the chain itself would switch to, judged for the models the session is about to run.
 
-It weighs the chain and launches on the best member that can serve every model family the session may run, printing the choice and the numbers behind it. `--explain` prints that and exits without launching.
+**The walk is the chain's own.** The same exclusions ([below](Auto-Switch#excluded-members)) and the same lines (the 5h threshold, the weekly line, the per-model weeks) decide, in chain order and with no ranking: the chain order is your statement of which account comes first. A member whose usage was read recently is preferred over one whose reading is stale or missing, and a chain with only stale readings still launches.
 
-**It is the union of families, never the headline model.** A `Task` subagent runs inside the parent's process and spends the parent's account on whatever model it runs, so choosing for the main thread alone would strand the session the moment a subagent used a capped family. The union comes from your `settings.json` model, `CLAUDE_CODE_SUBAGENT_MODEL`, and any `--model` you pass. When none of those resolves, the demand is empty and the blanket `scoped gate` above applies unchanged — precision only where there is information.
+**The models are the union, never the headline model.** A `Task` subagent runs inside the parent's process and spends the parent's account on whatever model it runs, so judging for the main thread alone would strand the session the moment a subagent used a capped family. The union comes from your `settings.json` `model` and `fallbackModel`, `ANTHROPIC_MODEL` and `CLAUDE_CODE_SUBAGENT_MODEL` in the environment, and any `--model` or `--fallback-model` you pass; `best` counts as both `fable` and `opus`, `opusplan` as both `opus` and `sonnet`, and a `[1m]` suffix changes nothing. A per-model week counts only when it is one of those families; with none resolved, the blanket `scoped gate` above applies unchanged. A known model outranks the toggle: an account capped on a model this session runs is skipped even with its `scoped gate` off.
 
-**Feasibility is runway, not utilization.** A member with minutes left strands one turn in and the chain then swaps it, which costs the whole context re-read: cache entries do not cross accounts. So headroom is divided by the same burn rate [burn-aware switching](Auto-Switch#burn-aware-switching) fits, and the result is minutes. No burn samples means unbounded, never zero — an idle account has none *because* it is idle. A member whose binding window resets within the grace is feasible however thin, since a stall until the reset is not a strand.
+A real launch says which account it picked on one line before the session starts. `--explain` prints the whole walk instead and exits without launching: the pick on the first line, then every chain member with the reason it was passed over (the same words the Fallback tab shows) and how old its usage reading is. It runs the refusals a real launch runs first, so a `--with-fallback` start that would be refused is refused here too. The readings come from each account's usage cache, which an open TUI or a running daemon keeps fresh; with neither, the age tells you how much to trust them.
 
-**Ranking.** Feasible first, then the `last_resort` member last, then a member clauth has numbers for over one it does not, then fewest live sessions, then most runway, then `preferred`. Live sessions outrank runway deliberately: launching several sessions at once would otherwise send them all to the same member, and usage polling cannot see the launches until its next refresh.
+```
+would start on 'work' for opus + sonnet
+  home   7d opus 100%, other models ok   usage 4m ago
+* work   ok                              usage 4m ago
+  spare  ok                              usage 3h ago (stale)
+```
 
-When nothing is feasible it launches on the best of a bad set and says so, rather than refusing. The candidate set is the fallback chain — the accounts you have already said may be entered unattended — so an empty chain refuses and names the fix.
-
-This never moves a running session. `--with-fallback` remains the only thing that does, and the two compose: pick the entry point, then let the chain rescue it if that account runs out.
-
-The floor and the grace are `selection_min_runway_mins` and `selection_reset_grace_mins` ([Configuration](Configuration#profilestoml)).
+The candidate set is the fallback chain — the accounts you have already said may be entered unattended — so an empty chain refuses and names the fix, and so does a chain with no member left to start on. This never moves a running session. `--with-fallback` remains the only thing that does, and the two compose: pick the entry point, then let the chain rescue it if that account runs out.
 
 ## Mixing account types
 
