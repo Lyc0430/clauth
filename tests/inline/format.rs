@@ -580,3 +580,115 @@ fn the_split_state_sentences_render_their_ruled_bytes() {
          (run `clauth login qwen` to re-capture the console; the api key still serves inference)"
     );
 }
+
+// ── start-walk rendering ───────────────────────────────────────────────────
+
+#[test]
+fn start_block_labels_are_the_tui_chip_words() {
+    assert_eq!(start_block_label(&StartBlock::Disabled), "disabled");
+    assert_eq!(start_block_label(&StartBlock::AuthBroken), "auth broken");
+    assert_eq!(start_block_label(&StartBlock::Canceled), "canceled");
+    assert_eq!(
+        start_block_label(&StartBlock::KickRejected),
+        "claude code blocked"
+    );
+    assert_eq!(
+        start_block_label(&StartBlock::NotOauth),
+        "not an oauth account"
+    );
+    assert_eq!(start_block_label(&StartBlock::WeeklySpent), "weekly spent");
+    assert_eq!(
+        start_block_label(&StartBlock::WeeklySoft { pct: 99.0 }),
+        "weekly 99%"
+    );
+    assert_eq!(
+        start_block_label(&StartBlock::FiveHour { pct: 100.0 }),
+        "5h 100%"
+    );
+    assert_eq!(
+        start_block_label(&StartBlock::ScopedSpent {
+            label: "7d opus".to_owned(),
+            pct: 100.0,
+        }),
+        "7d opus 100%, other models ok"
+    );
+}
+
+#[test]
+fn render_start_walk_matches_the_approved_layout() {
+    let rows = vec![
+        StartCandidate {
+            name: crate::profile::ProfileName::from("D1"),
+            block: Some(StartBlock::ScopedSpent {
+                label: "7d opus".to_owned(),
+                pct: 100.0,
+            }),
+            age: OauthAge::Dated(240_000),
+            stale: false,
+            fresh: true,
+        },
+        StartCandidate {
+            name: crate::profile::ProfileName::from("D2"),
+            block: None,
+            age: OauthAge::Dated(240_000),
+            stale: false,
+            fresh: true,
+        },
+        StartCandidate {
+            name: crate::profile::ProfileName::from("D3"),
+            block: None,
+            age: OauthAge::Dated(10_800_000),
+            stale: true,
+            fresh: false,
+        },
+    ];
+    assert_eq!(
+        render_start_walk(&rows, Some(1)),
+        "  D1  7d opus 100%, other models ok   usage 4m ago\n* D2  ok                              usage 4m ago\n  D3  ok                              usage 3h ago (stale)"
+    );
+}
+
+#[test]
+fn start_lines_match_the_approved_copy() {
+    let rows = vec![
+        StartCandidate {
+            name: crate::profile::ProfileName::from("D1"),
+            block: Some(StartBlock::ScopedSpent {
+                label: "7d opus".to_owned(),
+                pct: 100.0,
+            }),
+            age: OauthAge::Dated(240_000),
+            stale: false,
+            fresh: true,
+        },
+        StartCandidate {
+            name: crate::profile::ProfileName::from("D2"),
+            block: None,
+            age: OauthAge::Dated(240_000),
+            stale: false,
+            fresh: true,
+        },
+    ];
+    let two = ["opus".to_owned(), "sonnet".to_owned()];
+    let one = ["opus".to_owned()];
+    let none: [String; 0] = [];
+    assert_eq!(
+        start_pick_line("D2", &two),
+        "would start on 'D2' for opus + sonnet"
+    );
+    assert_eq!(start_pick_line("D1", &one), "would start on 'D1' for opus");
+    assert_eq!(start_pick_line("D1", &none), "would start on 'D1'");
+    assert_eq!(
+        start_launch_line("D2", &two),
+        "clauth: starting on 'D2' for opus + sonnet"
+    );
+    assert_eq!(start_launch_line("D1", &none), "clauth: starting on 'D1'");
+    assert_eq!(
+        start_refusal(&one, &rows),
+        "--auto found no chain member with headroom for opus\n  D1  7d opus 100%, other models ok   usage 4m ago\n  D2  ok                              usage 4m ago"
+    );
+    assert_eq!(
+        start_refusal(&none, &[]),
+        "--auto found no chain member with headroom"
+    );
+}

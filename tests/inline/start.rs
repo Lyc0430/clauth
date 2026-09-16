@@ -601,6 +601,7 @@ fn run_applies_the_chain_gate_only_to_an_opted_in_start() {
         Isolation::Shared,
         None,
         true,
+        None,
     )
     .expect_err("an opted-in start must be gated");
     assert_eq!(
@@ -616,6 +617,7 @@ fn run_applies_the_chain_gate_only_to_an_opted_in_start() {
         Isolation::Shared,
         None,
         false,
+        None,
     )
     .expect_err("the sandbox has no ~/.claude to launch against");
     assert_eq!(
@@ -690,6 +692,7 @@ fn start_heals_the_plugin_registry_only_when_it_is_broken() {
         Isolation::Shared,
         None,
         false,
+        None,
     )
     .expect("healthy start");
     assert!(
@@ -708,6 +711,7 @@ fn start_heals_the_plugin_registry_only_when_it_is_broken() {
         Isolation::Shared,
         None,
         false,
+        None,
     )
     .expect("broken start");
     assert!(
@@ -798,6 +802,7 @@ fn a_start_after_a_switch_off_does_not_pair_the_departed_key_with_the_started_en
         Isolation::Shared,
         None,
         false,
+        None,
     )
     .expect("start");
     let settings = observer
@@ -817,4 +822,85 @@ fn a_start_after_a_switch_off_does_not_pair_the_departed_key_with_the_started_en
         "a departed account's env key must not survive in front of the started \
          account's endpoint: {settings}"
     );
+}
+
+// ── start-time model demand + the extracted admit ───────────────────────────
+
+#[test]
+fn models_from_args_reads_both_spellings() {
+    let split = vec!["--model".to_owned(), "claude-fable-5-1".to_owned()];
+    assert_eq!(models_from_args(&split), ["claude-fable-5-1"]);
+    let joined = vec!["--model=opus".to_owned()];
+    assert_eq!(models_from_args(&joined), ["opus"]);
+    let none = vec!["-p".to_owned(), "hi".to_owned()];
+    assert!(models_from_args(&none).is_empty());
+    let fb_split = vec!["--fallback-model".to_owned(), "sonnet,haiku".to_owned()];
+    assert_eq!(models_from_args(&fb_split), ["sonnet", "haiku"]);
+    let fb_joined = vec!["--fallback-model=opus, sonnet".to_owned()];
+    assert_eq!(models_from_args(&fb_joined), ["opus", "sonnet"]);
+    assert!(models_from_args(&["--fallback-model".to_owned()]).is_empty());
+}
+
+#[test]
+fn a_dangling_model_flag_yields_nothing() {
+    assert!(models_from_args(&["--model".to_owned()]).is_empty());
+}
+
+#[test]
+fn launch_models_unions_the_settings_models_and_the_model_args() {
+    let settings = vec![
+        "opus".to_owned(),
+        "claude-sonnet-5".to_owned(),
+        "claude-haiku-4-5".to_owned(),
+        "haiku".to_owned(),
+    ];
+    let args = vec!["--model".to_owned(), "claude-fable-5-1".to_owned()];
+    assert_eq!(
+        launch_models_from(settings, [Some("gemini".to_owned()), None], &args),
+        [
+            "opus",
+            "claude-sonnet-5",
+            "claude-haiku-4-5",
+            "haiku",
+            "gemini",
+            "claude-fable-5-1",
+        ]
+    );
+    assert!(
+        launch_models_from(Vec::new(), [None, Some("".to_owned())], &[]).is_empty(),
+        "an empty env value is dropped, never a family"
+    );
+}
+
+/// The refusals `run` runs are the same ones `cmd_start` runs before printing:
+/// `admit` is what `--explain` shares with a real launch, so a `--with-fallback`
+/// target a launch would refuse is refused here too, and the same member clears
+/// without the flag.
+#[test]
+fn admit_runs_the_with_fallback_refusals_and_clears_without_the_flag() {
+    let _sb = HomeSandbox::new();
+    let _daemon = crate::daemon::hold_daemon_lock();
+    let mut third_party = chain_ready_config("thirdparty");
+    third_party.profiles[0].base_url = Some("https://api.example.com".to_owned());
+
+    let err = admit(
+        &third_party,
+        &crate::profile::ProfileName::from("thirdparty"),
+        Isolation::Shared,
+        true,
+    )
+    .expect_err("a custom endpoint must refuse under --with-fallback");
+    assert_eq!(
+        err.to_string(),
+        "'thirdparty': --with-fallback needs an OAuth account, but this one carries \
+         a custom endpoint; start without it"
+    );
+
+    admit(
+        &third_party,
+        &crate::profile::ProfileName::from("thirdparty"),
+        Isolation::Shared,
+        false,
+    )
+    .expect("no flag, no refusal");
 }

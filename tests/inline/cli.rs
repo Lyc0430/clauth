@@ -1526,6 +1526,25 @@ mod disabled_target_refusal {
             "the refusal must happen before any runtime is acquired"
         );
     }
+
+    #[test]
+    fn cmd_start_explain_refuses_a_disabled_target() {
+        let _home = HomeSandbox::new();
+        seed_disabled_profile("off");
+
+        let err = cmd_start(
+            &crate::cli::StartTarget::Named("off".to_owned()),
+            &[],
+            crate::runtime::Isolation::Shared,
+            false,
+            true,
+        )
+        .expect_err("explain must run the same refusals as a launch");
+        assert_eq!(
+            err.to_string(),
+            "'off': account is disabled, run `clauth enable off`"
+        );
+    }
 }
 
 // ── a bad profile name is a usage error, not a runtime failure ──────────────
@@ -3294,5 +3313,114 @@ fn login_rejects_the_removed_manual_flag() {
         parse_exit_code(&["login", "acme", "--manual"]),
         2,
         "a removed flag must be a usage error, not silently ignored"
+    );
+}
+
+// ── cmd_start's --auto / --explain wiring ──────────────────────────────────
+
+fn cmd_start_usage() -> crate::usage::UsageInfo {
+    crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 5.0,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(
+                crate::usage::now_epoch_secs() + 3600,
+            )),
+        }),
+        seven_day: Some(crate::usage::UsageWindow {
+            utilization: 10.0,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(
+                crate::usage::now_epoch_secs() + 3600,
+            )),
+        }),
+        fetched_at: Some(crate::usage::now_ms() - 240_000),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn cmd_start_explain_launches_nothing() {
+    let _sb = crate::testutil::HomeSandbox::new();
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: vec!["a".into(), "b".into()],
+        fallback_chain: vec!["a".into(), "b".into()],
+        ..crate::profile::AppState::default()
+    })
+    .unwrap();
+    for name in ["a", "b"] {
+        crate::profile_cache::write_profile_cache(
+            &crate::profile::ProfileName::from(name),
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &cmd_start_usage(),
+        );
+    }
+
+    cmd_start(
+        &crate::cli::StartTarget::Auto,
+        &[],
+        Isolation::Shared,
+        false,
+        true,
+    )
+    .unwrap();
+
+    let a_runtime = crate::profile::profile_dir(&crate::profile::ProfileName::from("a"))
+        .unwrap()
+        .join("runtime");
+    let b_runtime = crate::profile::profile_dir(&crate::profile::ProfileName::from("b"))
+        .unwrap()
+        .join("runtime");
+    assert!(
+        !a_runtime.exists(),
+        "explain must not materialize a runtime for a"
+    );
+    assert!(
+        !b_runtime.exists(),
+        "explain must not materialize a runtime for b"
+    );
+}
+
+#[test]
+fn cmd_start_auto_refuses_an_empty_chain() {
+    let _sb = crate::testutil::HomeSandbox::new();
+    let err = cmd_start(
+        &crate::cli::StartTarget::Auto,
+        &[],
+        Isolation::Shared,
+        false,
+        false,
+    )
+    .expect_err("an empty fallback chain must refuse --auto");
+    assert_eq!(
+        err.to_string(),
+        "--auto picks from the fallback chain and it is empty; add accounts on the fallback tab, or name one"
+    );
+}
+
+#[test]
+fn cmd_start_explain_auto_runs_the_with_fallback_refusals() {
+    let _sb = crate::testutil::HomeSandbox::new();
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: vec!["a".into()],
+        fallback_chain: vec!["a".into()],
+        ..crate::profile::AppState::default()
+    })
+    .unwrap();
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("a"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &cmd_start_usage(),
+    );
+
+    let err = cmd_start(
+        &crate::cli::StartTarget::Auto,
+        &[],
+        Isolation::Shared,
+        true,
+        true,
+    )
+    .expect_err("--with-fallback under --auto --explain must run the chain refusals");
+    assert_eq!(
+        err.to_string(),
+        "'a': --with-fallback needs a second account in the fallback chain to move to; add one on the fallback tab, or start without it"
     );
 }

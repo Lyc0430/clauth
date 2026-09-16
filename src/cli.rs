@@ -443,12 +443,9 @@ pub(crate) struct StartArgs {
     /// by name at launch.
     #[arg(long, conflicts_with = "isolated")]
     pub(crate) with_fallback: bool,
-    /// Pick the account automatically instead of naming one.
-    ///
-    /// Weighs every fallback-chain member against the models this session may
-    /// run — the `--model` you pass, the model in your settings, and the
-    /// subagent model — and starts on the one with the most runway that can
-    /// actually serve all of them.
+    /// Pick the account instead of naming one: the first fallback-chain member
+    /// with headroom for the models this session will run (`--model`, the model
+    /// in your settings, the subagent model).
     ///
     /// It takes the place of the profile name, so separate `claude`'s own args
     /// with `--` whenever the first of them starts with a hyphen:
@@ -457,10 +454,7 @@ pub(crate) struct StartArgs {
     /// guessing would silently eat one of them.
     #[arg(long)]
     pub(crate) auto: bool,
-    /// Print the account that would be launched, and why, without launching it.
-    ///
-    /// The selector reads live usage and burn history, so this is how an
-    /// operator sees the decision before spending a window on it.
+    /// Print the account a start would launch on, and why, without launching it.
     #[arg(long)]
     pub(crate) explain: bool,
     /// Profile to launch under.
@@ -476,7 +470,7 @@ pub(crate) struct StartArgs {
 }
 
 /// Which account a `clauth start` runs under: the name the operator typed, or
-/// the one [`crate::selection`] picks for the models the session may run.
+/// the one the fallback-chain walk picks for the models the session may run.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum StartTarget {
     Named(String),
@@ -494,9 +488,9 @@ impl StartArgs {
         }
     }
 
-    /// The account to start on. `--auto` defers it to selection; without it the
-    /// positional is required, so the `unwrap_or_default` is unreachable rather
-    /// than a fallback.
+    /// The account to start on. `--auto` defers it to the fallback-chain walk;
+    /// without it the positional is required, so the `unwrap_or_default` is
+    /// unreachable rather than a fallback.
     pub(crate) fn target(&self) -> StartTarget {
         if self.auto {
             StartTarget::Auto

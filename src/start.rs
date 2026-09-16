@@ -19,7 +19,8 @@ use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::{Handle as SignalHandle, Signals};
 
 use crate::logline::logline;
-use crate::profile::{AppConfig, ProfileName};
+use crate::out::errln;
+use crate::profile::{AppConfig, Profile, ProfileName};
 use crate::runtime::{Isolation, ProfileRuntime};
 use crate::spinner::Spinner;
 
@@ -141,6 +142,91 @@ fn refuse_unless_chain_eligible(
     Ok(())
 }
 
+/// The refusals every start runs before any side effect, shared by [`run`] and
+/// `cmd_start`'s explain/launch paths so `--explain` answers what a real launch
+/// would do. The disabled gate is the authoritative one: every caller inherits
+/// it here, before runtime acquire or spawn, so no caller can forget to check.
+pub(crate) fn admit<'a>(
+    config: &'a AppConfig,
+    name: &ProfileName,
+    isolation: Isolation,
+    follows_chain: bool,
+) -> Result<&'a Profile> {
+    crate::refuse_if_disabled(config, name)?;
+    let profile = config.find(name).context("profile not found")?;
+    if follows_chain {
+        refuse_unless_chain_eligible(config, profile, isolation)?;
+    }
+    Ok(profile)
+}
+
+/// The model strings a launch may run, from every source a launcher can see
+/// before the session exists: the live `settings.json`, the process environment,
+/// and an explicit `--model` passthrough. A UNION, not a resolution — a `Task`
+/// subagent shares the parent's process-wide credential memo, so it spends the
+/// same account on whatever model it runs, and selecting for the headline model
+/// alone strands it (see [`crate::fallback::start_walk`]).
+pub(crate) fn launch_models(claude_args: &[String]) -> Vec<String> {
+    launch_models_from(
+        crate::claude::claude_settings_models().unwrap_or_default(),
+        [
+            std::env::var("ANTHROPIC_MODEL").ok(),
+            std::env::var("CLAUDE_CODE_SUBAGENT_MODEL").ok(),
+        ],
+        claude_args,
+    )
+}
+
+/// The union of the three model sources a launcher can see, held here so the
+/// union is testable without a home or a process environment: the live
+/// `settings.json` strings, the two process-env strings (in order), and the
+/// passthrough args. An empty env value is dropped, never a family.
+pub(crate) fn launch_models_from(
+    settings: Vec<String>,
+    env: [Option<String>; 2],
+    args: &[String],
+) -> Vec<String> {
+    let mut out = settings;
+    out.extend(env.into_iter().flatten().filter(|v| !v.trim().is_empty()));
+    out.extend(models_from_args(args));
+    out
+}
+
+/// The `--model` and `--fallback-model` values in a passthrough arg list, in
+/// both spellings. A `--fallback-model` value is a comma-separated list of
+/// models, split and trimmed here. Split out of [`launch_models`] so the
+/// parsing is testable without a home (its siblings read `settings.json` and
+/// the environment, which resolve the operator's real home outside a sandbox).
+pub(crate) fn models_from_args(claude_args: &[String]) -> Vec<String> {
+    fn comma_list(out: &mut Vec<String>, v: &str) {
+        out.extend(
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
+        );
+    }
+
+    let mut out = Vec::new();
+    let mut args = claude_args.iter();
+    while let Some(a) = args.next() {
+        if let Some(v) = a.strip_prefix("--model=") {
+            out.push(v.to_owned());
+        } else if let Some(v) = a.strip_prefix("--fallback-model=") {
+            comma_list(&mut out, v);
+        } else if a == "--model"
+            && let Some(v) = args.next()
+        {
+            out.push(v.clone());
+        } else if a == "--fallback-model"
+            && let Some(v) = args.next()
+        {
+            comma_list(&mut out, v);
+        }
+    }
+    out
+}
+
 pub(crate) fn run(
     config: &AppConfig,
     name: &ProfileName,
@@ -148,16 +234,14 @@ pub(crate) fn run(
     isolation: Isolation,
     workspace: Option<&Path>,
     follows_chain: bool,
+    announce: Option<&str>,
 ) -> Result<()> {
-    // Authoritative "never a live session for a disabled account" gate — every
-    // caller (`cmd_start`, `sessions_cli::run_resume`) inherits it here, before
-    // any side effect (runtime acquire, spawn). A wrapper's own pre-check is a
-    // friendly early error at best; this one can't be bypassed by adding a new
-    // caller that forgets to check.
-    crate::refuse_if_disabled(config, name)?;
-    let profile = config.find(name).context("profile not found")?;
-    if follows_chain {
-        refuse_unless_chain_eligible(config, profile, isolation)?;
+    let profile = admit(config, name, isolation, follows_chain)?;
+
+    // Announced after the refusals, so a start that `admit` refuses never
+    // announces first.
+    if let Some(line) = announce {
+        errln!("{line}");
     }
 
     // The plugin-migration pre-flight: heal a broken or divergent clauth

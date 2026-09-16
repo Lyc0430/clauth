@@ -211,14 +211,14 @@ impl QueueView {
 /// the explanation, so the label itself stays short. The hint layer stays
 /// per-surface on purpose: `chain::reason_fix` and `usage::diag_fix` map
 /// different enums with different config context.
-pub(super) const DIAG_DISABLED: &str = "disabled";
-pub(super) const DIAG_CANCELED: &str = "canceled";
-pub(super) const DIAG_AUTH_BROKEN: &str = "auth broken";
-pub(super) const DIAG_BUDGET_SPENT: &str = "extra usage spent";
-pub(super) const DIAG_KICK: &str = "claude code blocked";
-pub(super) const DIAG_WEEKLY_SPENT: &str = "weekly spent";
-pub(super) const DIAG_WEEKLY_SOFT: &str = "past the weekly switch line, still serving";
-pub(super) const DIAG_STALE: &str = "stale data";
+///
+/// The words themselves live in [`crate::format`] beside every other
+/// cross-surface spelling; re-exported here so the tab-local `use super::panes::`
+/// imports stay put.
+pub(super) use crate::format::{
+    DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK, DIAG_STALE,
+    DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT,
+};
 
 /// cloudy-tui status pill `[ label ]`: brackets in `TEXT_DIM`, the label in the
 /// caller's semantic style (bold for a charged state). Returns the three spans

@@ -1927,10 +1927,11 @@ pub(crate) fn claude_settings_env_keys() -> Result<Vec<String>> {
 }
 
 /// The model strings the live `~/.claude/settings.json` puts in effect: the
-/// top-level `model` and the subagent override in its `env` block.
+/// top-level `model`, the top-level `fallbackModel` array, and the subagent
+/// override in its `env` block.
 ///
-/// Read rather than resolved — [`crate::selection`] wants every family the next
-/// session MAY run, and both of these are separately reachable inside one
+/// Read rather than resolved — [`crate::start::launch_models`] wants every family the next
+/// session MAY run, and all of these are separately reachable inside one
 /// session. Absent file, absent keys and unreadable JSON all answer empty: a
 /// launcher must never fail over a settings file it only wanted a hint from.
 pub(crate) fn claude_settings_models() -> Result<Vec<String>> {
@@ -1944,6 +1945,9 @@ pub(crate) fn claude_settings_models() -> Result<Vec<String>> {
     let mut out = Vec::new();
     if let Some(m) = settings["model"].as_str() {
         out.push(m.to_owned());
+    }
+    if let Some(fb) = settings["fallbackModel"].as_array() {
+        out.extend(fb.iter().filter_map(|v| v.as_str()).map(str::to_owned));
     }
     if let Some(m) = settings["env"]["CLAUDE_CODE_SUBAGENT_MODEL"].as_str() {
         out.push(m.to_owned());

@@ -36,7 +36,6 @@ mod profile_cache;
 mod profile_json;
 mod providers;
 mod runtime;
-mod selection;
 mod sessions;
 mod sessions_cli;
 mod settings_sync;
@@ -391,53 +390,52 @@ fn cmd_start(
     platform::init();
     runtime::gc_stale_runtimes();
     let config = load_config()?;
-    let canonical = match target {
-        cli::StartTarget::Named(name) => resolve_or_bail(&config, name)?,
-        cli::StartTarget::Auto => auto_select(&config, rest)?,
+
+    let (name, rows, pick, demand) = match target {
+        cli::StartTarget::Named(raw) => {
+            (resolve_or_bail(&config, raw)?, Vec::new(), None, Vec::new())
+        }
+        cli::StartTarget::Auto => {
+            anyhow::ensure!(
+                !config.state.fallback_chain.is_empty(),
+                "--auto picks from the fallback chain and it is empty; add accounts on the \
+                 fallback tab, or name one"
+            );
+            let demand = fallback::demand_from(start::launch_models(rest));
+            let families = (!demand.is_empty()).then_some(demand.as_slice());
+            let (rows, pick) = fallback::start_walk(&config, families, follows_chain);
+            let Some(pick) = pick else {
+                anyhow::bail!("{}", format::start_refusal(&demand, &rows));
+            };
+            (rows[pick].name.clone(), rows, Some(pick), demand)
+        }
     };
-    refuse_if_disabled(&config, &canonical)?;
-    // After the refusals, so `--explain` answers what a real start would do
-    // rather than naming a target the launch would then reject.
+
     if explain_only {
-        outln!("dry run: would start on `{}`", canonical.as_str());
+        // Run the same refusals a real launch runs, so `--explain` answers what
+        // a start would do rather than naming a target it would then reject.
+        start::admit(&config, &name, isolation, follows_chain)?;
+        outln!("{}", format::start_pick_line(name.as_str(), &demand));
+        if !rows.is_empty() {
+            outln!("{}", format::render_start_walk(&rows, pick));
+        }
         return Ok(());
     }
-    start::run(&config, &canonical, rest, isolation, None, follows_chain)
-}
 
-/// `clauth start --auto`: pick the chain member with the most runway that can
-/// serve every model this session may run, and say so on the way in.
-///
-/// The candidate set is the fallback chain, so an empty one refuses with the
-/// fix named rather than reaching for an account the operator never put in
-/// rotation — the same contract `--with-fallback` refuses under.
-fn auto_select(config: &profile::AppConfig, claude_args: &[String]) -> Result<ProfileName> {
-    anyhow::ensure!(
-        !config.state.fallback_chain.is_empty(),
-        "--auto picks from the fallback chain and it is empty; add members on the Fallback tab, \
-         or name a profile instead"
-    );
-    let demand = selection::demand_from(selection::launch_models(claude_args));
-    let outcome = selection::select(config, &demand, config.state.selection_limits());
-    let chosen = outcome.chosen.ok_or_else(|| {
-        let why = outcome
-            .rejected
-            .iter()
-            .map(|(name, r)| match r {
-                selection::Rejected::ScopedSpent { label } => {
-                    format!("{}: {label} spent", name.as_str())
-                }
-                selection::Rejected::WeeklySpent => format!("{}: weekly spent", name.as_str()),
-                selection::Rejected::Canceled => {
-                    format!("{}: subscription canceled", name.as_str())
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
-        anyhow::anyhow!("--auto found no chain member that can serve this session ({why})")
-    })?;
-    crate::outln!("{}", selection::explain(&chosen, &demand));
-    Ok(chosen.name)
+    let announce = match target {
+        cli::StartTarget::Auto => Some(format::start_launch_line(name.as_str(), &demand)),
+        cli::StartTarget::Named(_) => None,
+    };
+
+    start::run(
+        &config,
+        &name,
+        rest,
+        isolation,
+        None,
+        follows_chain,
+        announce.as_deref(),
+    )
 }
 
 /// Where `clauth login <name>` lands. An EXISTING profile (matched
