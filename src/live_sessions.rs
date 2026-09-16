@@ -16,7 +16,7 @@
 //!   and written after would silently revert whatever the other writer put there
 //!   in between.
 //! - **Field ownership is a type, not a comment.** The daemon reaches its two
-//!   fields through [`DaemonFields`] and the session its two through
+//!   fields through [`DaemonFields`] and the session its three through
 //!   [`SessionFields`]; neither view can name the other's. Each still stores the
 //!   whole freshly-loaded row, so writing one side preserves the other's.
 //!
@@ -77,9 +77,13 @@ pub(crate) struct LiveSession {
     /// Session-owned: when this session last executed a swap.
     #[serde(default)]
     pub(crate) last_swap_at: Option<u64>,
-    /// The credential source this session LAUNCHED on, as an absolute path.
-    /// Set once at registration from the same value the runtime tree was built
-    /// from, never mutated.
+    /// The credential store this session's rotation verdict reads, as an
+    /// absolute path. Seeded at registration from the same value the runtime
+    /// tree was built from, then repointed by every swap onto the member the
+    /// session then reads (on macOS, only once the swap's keychain legs have
+    /// landed): the verdict must answer for the member the session HOLDS, or a
+    /// session swapped onto a refreshless member keeps refusing the launch
+    /// member's rotations.
     ///
     /// A path rather than a decoded verdict, deliberately. What the rotation
     /// gate needs to know is whether this session is holding something
@@ -152,6 +156,24 @@ impl SessionFields<'_> {
 
     pub(crate) fn set_last_swap_at(&mut self, at: u64) {
         self.0.last_swap_at = Some(at);
+    }
+
+    /// Point the row's rotation verdict at the store the session reads now.
+    /// The swap executor calls this once that is settled — inside its state-flock
+    /// row update off macOS, after the keychain legs on macOS (the session's
+    /// Claude Code resolves the item first, so the store it reads moves only
+    /// when those legs land).
+    pub(crate) fn set_launch_store(&mut self, store: PathBuf) {
+        self.0.launch_store = Some(store);
+    }
+
+    /// Re-key the row onto the process that IS the session. A delegate's row is
+    /// registered by the `clauth mcp` that spawns it — `std::process::id()` at
+    /// register time reads the mcp, not the delegate child — and the herdr
+    /// pane-tag walk joins rows to processes by pid, so a row keyed on the mcp
+    /// names a delegate's account for the pane hosting its parent session.
+    pub(crate) fn set_pid(&mut self, pid: u32) {
+        self.0.pid = pid;
     }
 }
 

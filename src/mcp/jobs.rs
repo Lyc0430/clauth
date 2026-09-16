@@ -2,9 +2,9 @@
 //!
 //! A background delegate returns a `job_id` at once and finishes on a detached
 //! blocking task. The result must outlive the originating tool call AND be
-//! readable by a separate process (the `mcp-await-job` PostToolUse hook), so it
-//! lands on disk at `~/.clauth/jobs/<job_id>.json` rather than an in-memory
-//! registry. Writes are atomic (tmp + rename) so a concurrent reader never sees
+//! collectable later, so it lands on disk at `~/.clauth/jobs/<job_id>.json`
+//! rather than an in-memory registry. Writes are atomic (tmp + rename) so a
+//! concurrent reader never sees
 //! a torn file. No lock is taken: the path is keyed by a unique `job_id` and the
 //! finalizing task is the sole writer for its own file — a leaf with no ordering
 //! against the runtime/state locks.
@@ -27,12 +27,14 @@
 //! spelling here, `<job_id>.live.json` ([`RecordKind::Liveness`]) — the same
 //! bytes, heartbeat and all, under a filename no reader can name. It exists so
 //! an operator can see a run whose model-facing result is still travelling back
-//! through the join; nothing collects it, and [`RecordKind`] documents why that
-//! is structural rather than a convention. It ends one of two ways: renamed to
-//! the collectable spelling when the caller walks away, or deleted when the run
-//! finishes with its caller still there.
+//! through the join. [`RecordKind`] documents why no id resolves that
+//! spelling, so nothing collects the liveness file itself. It ends one of
+//! three ways. Renamed to the collectable spelling when the caller walks away.
+//! Deleted when the run finishes with its caller still there. Converted to a
+//! tombstone when the server dies with the caller gone; the tombstone is a
+//! collectable record `monitor` then answers and removes.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
@@ -50,21 +52,18 @@ pub(super) const DONE_TTL_MS: u64 = 24 * 60 * 60 * 1000; // 24h
 /// A `running` file SILENT this long is orphaned (its server died mid-job); reap
 /// it.
 ///
-/// Silence rather than age, because a streaming delegate has no wall clock and
-/// so no maximum lifetime to sit above: a run still healthy at any age would
-/// have had its file deleted under it, and answered `unknown job_id` while its
-/// child kept spending the account.
+/// Silence rather than age, because a delegate has no wall clock and so no
+/// maximum lifetime to sit above: a run still healthy at any age would have had
+/// its file deleted under it, and answered `unknown job_id` while its child kept
+/// spending the account.
 ///
 /// The window is a day plus a 600 s grace, and the day is the point rather than
 /// a deadline derivation: a record whose server died — crash, kill, reboot —
 /// stays resolvable for a day, so the `session_id` it carries can still be
 /// collected and resumed the next morning. Nothing a healthy run does comes
-/// near it: a streaming run is killed by its own idle guard (≤ 3600 s,
-/// `mcp`'s `MAX_RUN_TIMEOUT_SECS`) once silent, and a pinned-`--output-format`
-/// one by its wall clock (also ≤ 3600 s), so once a run has spawned, only a
-/// dead server keeps its record silent for anything close to a day. The 600 s
-/// grace, carried over from the old 3600+600 s window, covers the heartbeat
-/// throttle, the kill and the teardown before `write_done` lands.
+/// near it: a delegate is unbounded, so once a run has spawned, only a dead
+/// server keeps its record silent for anything close to a day. The 600 s grace
+/// covers the heartbeat throttle and the teardown before `write_done` lands.
 ///
 /// "Silent" is measured from the record's own mint (`recorded_at`), not the
 /// run's birth. A blocking delegate handed off mid-flight keeps a `started_at`
@@ -73,21 +72,17 @@ pub(super) const DONE_TTL_MS: u64 = 24 * 60 * 60 * 1000; // 24h
 /// heartbeats at all, would be reaped by every reader for the rest of its life.
 ///
 /// What CAN sit silent that long under a server that is still alive is the
-/// pre-spawn delay: `ProfileRuntime::acquire` blocks behind a `clauth start`
-/// session on the same profile, for as long as that session lasts, and the
-/// reader thread that writes the beats has not spawned yet. Both background
-/// shapes spend that delay silent-since-mint — a streaming run is still inside
-/// the acquire with no child, while a pinned-format one can be well past it,
-/// since the same block plus its 3600 s wall already sits a long run past the
-/// old window with the child spending. The day covers both where 3600+600 s
-/// could not, for a block under roughly a day; `acquire` blocks for as long as
-/// that session lasts, so a block past the day can still overrun it and a live
-/// run's record then reads as a corpse. A blocking run's
-/// [`RecordKind::Liveness`] record is minted at
-/// the spawn, so the delay is outside its clock entirely and its silence is
-/// bounded by the run's own guards. A handed-off run adds no third exposure:
-/// its clock starts at the crossing, which is strictly after the spawn, so it
-/// is bounded by whichever of the two shapes it already is.
+/// pre-spawn delay: `ProfileRuntime::acquire` waits out a same-profile rotation
+/// or sibling session start, and the reader thread that writes the beats has not
+/// spawned yet. Both background shapes spend that delay silent-since-mint. The
+/// delay's two legs are the wait for another holder's rotation lock, bounded by
+/// `runtime::ROTATION_LOCK_TIMEOUT` at tens of seconds, and this acquire's OWN
+/// recursive `~/.claude` copy, which runs inside its own hold and is bounded by
+/// nothing but the disk — so a wait past the day reads a live run's record as a
+/// corpse. A blocking run's [`RecordKind::Liveness`] record is minted at the
+/// spawn, so the delay is outside its clock entirely. A handed-off run adds no
+/// third exposure: its clock starts at the crossing, which is strictly after
+/// the spawn.
 pub(crate) const RUNNING_TTL_MS: u64 = (24 * 60 * 60 + 600) * 1000;
 /// The bound on one `monitor` `job_ids` list, keeping one response from growing
 /// without limit.
@@ -123,9 +118,9 @@ pub(crate) enum JobState {
 /// mechanisms hold it up, and both are needed because neither covers the other:
 ///
 /// - An **id-keyed** reader returns content only through [`read`], which joins
-///   `Collectable` and nothing else. `monitor`'s collect and wait paths and
-///   `mcp::await_job` all go through it, and each also filters the id through
-///   [`is_safe_job_id`], which refuses the `.` a `Liveness` name needs.
+///   `Collectable` and nothing else. `monitor`'s collect path goes through it,
+///   and filters the id through [`is_safe_job_id`], which refuses the `.` a
+///   `Liveness` name needs.
 ///   [`liveness_exists`] names the other spelling but answers a bool rather than
 ///   content, and guards its own id.
 /// - [`list`] DOES return `Liveness` content — the pane draws that record's
@@ -137,6 +132,13 @@ pub(crate) enum JobState {
 /// j.record.job_id == id)` reads correct, returns a blocking run's record under
 /// a caller's string, and reopens exactly what this type closes. An id-keyed
 /// lookup belongs on `read`.
+///
+/// The sweep's conversion is the one place a caller's id resolves content that
+/// started as a `Liveness` record, and it does not reopen this: [`sweep`]
+/// rewrites the silent run onto the COLLECTABLE spelling first, so its
+/// `session_id`, `isolated`, `profile` and `tail` then live in a `Collectable`
+/// record, the spelling `read` resolves by design. The `.live.json` file itself
+/// stays unreachable under any caller-supplied id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RecordKind {
     /// `<id>.json` — a result a `monitor` call may collect.
@@ -160,34 +162,50 @@ pub(crate) struct JobRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) envelope: Option<serde_json::Value>,
     /// Which endpoint this run's requests went to, in the roster's own host
-    /// spelling (`anthropic`, or the host the stored endpoint names). The
-    /// CALL's answer, resolved once when the call was made, because a caller
-    /// `env` override retargets one run without touching the profile and no
-    /// later name-keyed read can recover it. `None` on a record an older
-    /// server wrote or on one whose endpoint could not be resolved at the
-    /// call: the fold reads it as "cannot say" rather than asserting the
-    /// managed field's answer for a call that may have gone elsewhere.
+    /// spelling, as `delegate_call_endpoint` resolved it once at the call:
+    /// stored rather than re-derived because a caller `env` override retargets
+    /// one run without touching the profile, and no later name-keyed read can
+    /// recover it. `None` on a record an older server wrote and on one whose
+    /// endpoint could not be resolved at the call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) endpoint: Option<String>,
+    /// Which provider actually served this run, resolved once at the call the
+    /// same way and at the same precedence `endpoint` is: a caller `env`
+    /// override first, then the profile's stored endpoint. The label, not the
+    /// endpoint: `Provider::from_base_url`'s display name on a recognised
+    /// third-party origin, `generic` on any unrecognised origin, `anthropic`
+    /// for Anthropic's own origin and for an account with no endpoint of its
+    /// own. `None` on a record an older server wrote and on one the resolver
+    /// could not answer, where the fold omits the key like `endpoint`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) provider: Option<String>,
+    /// Whether this run launched isolated (`delegate({isolated: true})`): its
+    /// transcript lived in a throwaway tree that dies with the run, so a
+    /// `session_id` on such a record is NOT a handle `delegate({session_id})`
+    /// accepts — only `rescue_teardown` lifts an isolated store, and a crash
+    /// skips it. `false` on a record an older server wrote: shared is the
+    /// delegate default either way, and the serde default keeps those records
+    /// parseable without a migration.
+    #[serde(default)]
+    pub(crate) isolated: bool,
     /// The child's own session id, off the first streamed event that carried
     /// one: the resume handle a crashed run's record must outlive its server
     /// for. The stdout reader captures it long before any crash and the
     /// heartbeat writes it, so a `running` record a killed server left behind
-    /// carries the exact value a `delegate({resume})` accepts. `None` before
+    /// carries the exact value a `delegate({session_id})` accepts. `None` before
     /// the first event names one, on a record an older server wrote (the
     /// `default`), and on a `done` record — a killed run's salvage envelope
     /// carries the handle inside the envelope instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) session_id: Option<String>,
-    /// The wall-clock ceiling this run actually launched under, resolved once by
-    /// `resolve_deadlines`. `0` is never a run about to be killed: it means this
-    /// run HAS no wall clock, which is the normal streaming case, or — paired
-    /// with an absent `idle_secs` — that the server which wrote the record
-    /// predates these fields. `idle_secs` is what tells those two apart.
+    /// Dead fields on new records: a delegate has no wall clock or idle ceiling
+    /// anymore, so the producer writes `0`/`None` here. Kept with serde defaults
+    /// because a record an OLDER server wrote still carries a real deadline pair,
+    /// and [`running_liveness`] still reads that pair back for those records.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub(crate) timeout_secs: u64,
-    /// The idle ceiling, `None` when the idle leg is off entirely (a
-    /// caller-pinned `--output-format` leaves silence carrying no information).
+    /// See [`Self::timeout_secs`]: written `None` on new records, read back only
+    /// from records an older server wrote.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) idle_secs: Option<u64>,
     /// Epoch ms of the most recent stdout line — the same anchor `started_at`
@@ -227,14 +245,20 @@ pub(crate) struct JobRecord {
     /// behaviour.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub(crate) done_at: u64,
+    /// Whether this `done` record is the sweep's tombstone for a blocking run
+    /// whose server died without finishing it: `state` is `Done`, `envelope` is
+    /// `None`, and the handle `session_id` kept is the only thing a shared run
+    /// leaves to resume from. `false` on a normal finish and on a record an
+    /// older server wrote, so the default keeps those parseable.
+    #[serde(default)]
+    pub(crate) crashed: bool,
 }
 
 /// What one job's `running` record carries from its mint through every
-/// heartbeat: identity, the spelling it lands under, and the deadlines the run
-/// launched under. Grouped
-/// so the reserve resolves them once and the heartbeat cannot re-derive them
-/// differently — `resolve_deadlines` applies defaults, clamps and a streaming
-/// fork, and a second derivation goes wrong the first time that fork changes.
+/// heartbeat: identity, the spelling it lands under, and the record's
+/// deadline pair. Grouped so the reserve resolves them once and the heartbeat
+/// cannot re-derive them differently. New records write `0`/`None` here; the
+/// fields stay so a test can still mint the shape an OLDER server wrote.
 #[derive(Debug, Clone)]
 pub(crate) struct RunningSpec {
     pub(crate) job_id: String,
@@ -251,6 +275,14 @@ pub(crate) struct RunningSpec {
     /// hand-off and the final [`write_done`] record the same answer the mint
     /// resolved once.
     pub(crate) endpoint: Option<String>,
+    /// The call's resolved serving provider, carried the same way and for the
+    /// same reason: a heartbeat rewrites the whole record, and a hand-off must
+    /// keep the label the mint resolved once.
+    pub(crate) provider: Option<String>,
+    /// Whether the run launched isolated, carried the same way and for the
+    /// same reason: a heartbeat rewrites the whole record, and a hand-off
+    /// must keep the answer the mint resolved once.
+    pub(crate) isolated: bool,
     /// Which spelling every write of this record lands under. A background job
     /// is `Collectable` from its reserve; a blocking one is `Liveness` until its
     /// caller walks away and [`promote`] renames it.
@@ -295,7 +327,7 @@ pub(crate) fn new_job_id(started_at: u64) -> String {
 }
 
 /// True iff `id` is safe as a single path component (no separators, no
-/// traversal). Job ids reaching `monitor` / `mcp-await-job` come from
+/// traversal). Job ids reaching `monitor` come from
 /// tool input, so this guards the path join.
 pub(crate) fn is_safe_job_id(id: &str) -> bool {
     !id.is_empty()
@@ -316,9 +348,19 @@ fn job_path(job_id: &str, kind: RecordKind) -> Result<PathBuf> {
     Ok(jobs_dir()?.join(name))
 }
 
+/// Which [`RecordKind`] a store path names, off the filename tail. Shared by
+/// [`list`] and [`sweep`] so the two derivations cannot drift.
+fn record_kind(path: &Path) -> RecordKind {
+    match path.file_name().and_then(|n| n.to_str()) {
+        Some(name) if name.ends_with(LIVE_SUFFIX) => RecordKind::Liveness,
+        _ => RecordKind::Collectable,
+    }
+}
+
 /// The filename tail marking a [`RecordKind::Liveness`] record. It still ends
-/// `.json`, so [`gc`] and [`gc_running_corpses`] already retain and reap one on
-/// the same rules as any other running record, with no arm of their own.
+/// `.json`, so [`gc`] and [`gc_running_corpses`] reach one on the same silence
+/// rule as any other running record. A silent one is CONVERTED into a
+/// tombstone instead of reaped (see [`sweep`]).
 const LIVE_SUFFIX: &str = ".live.json";
 
 /// Persist a record atomically (tmp + rename, so a reader sees either the old
@@ -342,14 +384,15 @@ pub(crate) fn write_running(spec: &RunningSpec) -> Result<()> {
 /// Rewrite a running job's record with its freshest liveness: the epoch ms of
 /// its last stdout line, and the bounded tail of what it has said.
 ///
-/// Lock-free against [`write_done`] because the two cannot interleave: the
-/// stdout reader thread is this function's only caller, and `run_delegate` joins
-/// that thread on every exit path before it builds any envelope, while
-/// `Handoff::finalize` — the sole `write_done` caller for a job — runs only
-/// after `run_delegate` returns.
-/// `run_delegate_never_returns_between_spawning_the_reader_and_joining_it`
-/// is what holds the single-exit half of that up, since a `return` in between
-/// would orphan a thread that then overwrites the finalized record.
+/// Lock-free against [`write_done`] by `Handoff`'s in-flight beat counter:
+/// every caller counts itself in flight under the state lock, in the same hold
+/// that resolved its destination, and `Handoff::finalize` sets `Finished`
+/// under that lock and then waits for the count to drain before any of its own
+/// writes. A beat that resolved its destination after `Finished` writes
+/// nothing; one that resolved before it lands before the finalize's first file
+/// write — so the two cannot interleave, however the reader thread outlives
+/// `run_delegate` (a grandchild holding the child's stdout pipe can park it in
+/// `read` past the finalize).
 ///
 /// A run handed off mid-flight does not widen that: the record it starts
 /// heartbeating into is minted before its first beat resolves one, and the same
@@ -380,11 +423,14 @@ pub(crate) fn write_heartbeat_with_session(
             timeout_secs: spec.timeout_secs,
             idle_secs: spec.idle_secs,
             endpoint: spec.endpoint.clone(),
+            provider: spec.provider.clone(),
+            isolated: spec.isolated,
             session_id: session_id.map(str::to_string),
             last_output_at,
             recorded_at: spec.recorded_at,
             tail: tail.to_string(),
             done_at: 0,
+            crashed: false,
         },
         spec.kind,
     )
@@ -424,6 +470,8 @@ pub(crate) fn write_done(
     profile: &str,
     started_at: u64,
     endpoint: Option<String>,
+    provider: Option<String>,
+    isolated: bool,
     envelope: serde_json::Value,
 ) -> Result<()> {
     write_atomic(
@@ -434,6 +482,8 @@ pub(crate) fn write_done(
             started_at,
             envelope: Some(envelope),
             endpoint,
+            provider,
+            isolated,
             session_id: None,
             timeout_secs: 0,
             idle_secs: None,
@@ -441,6 +491,7 @@ pub(crate) fn write_done(
             recorded_at: 0,
             tail: String::new(),
             done_at: crate::usage::now_ms(),
+            crashed: false,
         },
         // A result is always collectable: the one run that finalizes with a
         // liveness record still open is a blocking one, and its caller already
@@ -457,28 +508,84 @@ pub(crate) fn read(job_id: &str) -> Option<JobRecord> {
     serde_json::from_slice(&bytes).ok()
 }
 
-/// The collectable record's mtime, in epoch ms: the moment that record was
-/// finalized, since a Done file's only writer is [`write_atomic`]'s rename and
-/// everything after it removes the file rather than rewriting it. The cancel
-/// verdict dates a kill off this rather than the record's own `done_at`, which
-/// a file written by an older server may not carry.
-pub(crate) fn collectable_mtime_ms(job_id: &str) -> Option<u64> {
-    let path = job_path(job_id, RecordKind::Collectable).ok()?;
-    let mtime = std::fs::metadata(path).ok()?.modified().ok()?;
-    mtime
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_millis()
-        .try_into()
-        .ok()
-}
-
-/// Delete a job file (best-effort). Called after a fallback `monitor` collect
-/// hands the envelope back.
+/// Delete a job file (best-effort). No delivery path calls this any more:
+/// a collect evicts through [`claim`]. The remaining caller gives a reserved
+/// running job's record back on abandon.
 pub(crate) fn remove(job_id: &str) {
     if let Ok(path) = job_path(job_id, RecordKind::Collectable) {
         let _ = std::fs::remove_file(path);
     }
+}
+
+/// Who owns the delivery after a [`claim`] attempt.
+pub(crate) enum Claim {
+    /// The rename won: this record is the one delivery of the job, and its
+    /// file is consumed.
+    Owned(JobRecord),
+    /// The stored `job_id` disagrees with the path: the record was renamed
+    /// back, so the caller may render it but nothing was evicted.
+    Refused(JobRecord),
+    /// The source was already gone: another claimant owns the delivery, and
+    /// the caller answers the hedged unknown copy whose "already collected"
+    /// clause names exactly this.
+    Lost,
+}
+
+/// Claim the done record under `job_id` for exactly one delivery, whichever
+/// process delivers it. The rename is the whole serialization: the `monitor`
+/// wait and the auto-delivery hook both poll a finished record, and a
+/// read-then-remove pair would let both read `Done`, both deliver, and both
+/// evict — the double delivery this exists to end.
+///
+/// Contract: claim only a record a read just reported `Done`. A running
+/// record is rewritten by its heartbeat, and renaming one would evict a live
+/// job's file from under its waiter.
+///
+/// A record whose stored `job_id` disagrees with the path is renamed back
+/// and refused, never claimed: eviction follows the stored id, so an id the
+/// caller supplied must not collect a file another id's record owns. The
+/// rename-back cannot clobber anything — ids mint exactly once, and a `Done`
+/// file is never rewritten. The claimed spelling is invisible to [`list`]
+/// (its extension is not `json`) and a leftover from a crash is removed by
+/// the startup sweep's foreign-file arm; that crash also loses the record's
+/// only copy, since nothing reads the claimed spelling — the accepted cost
+/// of serializing before the render.
+pub(crate) fn claim(job_id: &str) -> Claim {
+    let from = job_path(job_id, RecordKind::Collectable).ok();
+    let Some(from) = from else {
+        return Claim::Lost;
+    };
+    let claimed = from.with_extension("json.claim");
+    // The `from.exists()` gate is the exactly-once guard: a rename that failed
+    // because the source is gone lost the race, and the claimed spelling then
+    // holds the WINNER's bytes, never a stale file to unlink.
+    //
+    // The retry past it covers one measured state: a stale claimed file
+    // carrying the read-only attribute refuses the rename on Windows with os
+    // error 5, and `remove_file` clears that attribute on its way past, so the
+    // second rename lands. Against a peer holding the file open the remove
+    // fails 32 and both renames lose, which is the `Lost` this returns anyway.
+    // A Windows rename does replace an existing destination, so an ordinary
+    // closed leftover is handled by the first rename and never reaches here.
+    if std::fs::rename(&from, &claimed).is_err() && from.exists() {
+        let _ = std::fs::remove_file(&claimed);
+        if std::fs::rename(&from, &claimed).is_err() {
+            return Claim::Lost;
+        }
+    }
+    let record = std::fs::read(&claimed)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<JobRecord>(&bytes).ok());
+    let Some(record) = record else {
+        let _ = std::fs::remove_file(&claimed);
+        return Claim::Lost;
+    };
+    if record.job_id != job_id {
+        let _ = std::fs::rename(&claimed, &from);
+        return Claim::Refused(record);
+    }
+    let _ = std::fs::remove_file(&claimed);
+    Claim::Owned(record)
 }
 
 /// Whether a blocking run's liveness record stands under this id.
@@ -513,15 +620,17 @@ pub(crate) fn gc(now: u64) {
     sweep(now, Scope::Everything);
 }
 
-/// The narrower sweep a `monitor` collect runs: `running` files a dead server
-/// orphaned, and nothing else.
+/// The narrower sweep a `monitor` collect runs: reaps the corpses a dead server
+/// orphaned, and touches nothing else.
 ///
 /// A reader must never destroy what it came for. The Done TTL and the `.tmp`
 /// sweep buy nothing before a read and can only delete a result the caller is
 /// asking for, so they stay at startup. What DOES belong here is the corpse:
 /// [`RUNNING_TTL_MS`] already knows a file whose server died mid-job is dead,
 /// and until now `serve()` was the only place that knowledge was ever applied,
-/// so a corpse polled `running` forever.
+/// so a corpse polled `running` forever. One corpse shape is CONVERTED instead
+/// of reaped: a silent blocking run's liveness record becomes the sweep's
+/// tombstone, which keeps the handle for a later resume (see [`sweep`]).
 pub(crate) fn gc_running_corpses(now: u64) {
     sweep(now, Scope::RunningCorpses);
 }
@@ -570,8 +679,10 @@ fn retention_anchor(record: &JobRecord) -> u64 {
 /// Whether a `running` record has been SILENT past [`RUNNING_TTL_MS`] — the one
 /// question [`gc_running_corpses`] reaps on. [`list`] classifies with it too, so
 /// a reader drawing a corpse and the sweep destroying one cannot disagree about
-/// which records are dead.
-fn running_is_silent(record: &JobRecord, now: u64) -> bool {
+/// which records are dead, and the `monitor` arms read the SAME predicate on the
+/// record they captured before the sweep, so the answer they give about it is
+/// the sweep's own verdict rather than a re-derivation that can drift.
+pub(crate) fn running_is_silent(record: &JobRecord, now: u64) -> bool {
     now.saturating_sub(retention_anchor(record)) > RUNNING_TTL_MS
 }
 
@@ -624,9 +735,13 @@ impl JobPhase {
         }
     }
 
-    /// Whether a `monitor` call naming this record's id could collect a result
+    /// Whether a `monitor` call naming this record's id could collect a RESULT
     /// from it. False for a blocking run by construction (see [`RecordKind`])
-    /// and for an orphan, whose result died with its server.
+    /// and for an orphan, whose result died with its server. A tombstone, an
+    /// orphan whose collectable record still sits on disk, is the exception:
+    /// `monitor` naming its id answers it with the crash copy and then removes
+    /// it. `collectable: false` there names the absence of a result, never the
+    /// absence of an answer.
     pub(crate) fn is_collectable(self) -> bool {
         matches!(self, Self::Running | Self::Done)
     }
@@ -689,6 +804,9 @@ impl StoredJob {
     /// record is in.
     pub(crate) fn phase(&self) -> JobPhase {
         match self.liveness {
+            // A crashed blocking run's record is `Done` on disk but carries no
+            // envelope; it is the sweep's tombstone, not a result to collect.
+            JobLiveness::Done if self.record.crashed => JobPhase::Orphaned,
             JobLiveness::Done => JobPhase::Done,
             JobLiveness::Corpse => JobPhase::Orphaned,
             JobLiveness::Running => match self.kind {
@@ -741,10 +859,7 @@ pub(crate) fn list(now: u64) -> Vec<StoredJob> {
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        let kind = match path.file_name().and_then(|n| n.to_str()) {
-            Some(name) if name.ends_with(LIVE_SUFFIX) => RecordKind::Liveness,
-            _ => RecordKind::Collectable,
-        };
+        let kind = record_kind(&path);
         let record = std::fs::read(&path)
             .ok()
             .and_then(|b| serde_json::from_slice::<JobRecord>(&b).ok());
@@ -810,10 +925,6 @@ pub(crate) fn list_banded(now: u64) -> Vec<StoredJob> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RunningLiveness {
     pub(crate) elapsed_secs: u64,
-    /// `false` on a record written before these fields existed, where every
-    /// figure below is absent rather than zero. A wall-less streaming run is the
-    /// other zero-`timeout_secs` shape, and `idle_secs` is what tells them apart.
-    pub(crate) recorded: bool,
     pub(crate) last_output_secs_ago: Option<u64>,
     pub(crate) idle_kill_in_secs: Option<u64>,
     pub(crate) wall_kill_in_secs: Option<u64>,
@@ -827,15 +938,6 @@ pub(crate) struct RunningLiveness {
 /// than this file, so the two never have to agree exactly.
 pub(crate) fn running_liveness(record: &JobRecord, now: u64) -> RunningLiveness {
     let elapsed_secs = now.saturating_sub(record.started_at) / 1000;
-    if record.timeout_secs == 0 && record.idle_secs.is_none() {
-        return RunningLiveness {
-            elapsed_secs,
-            recorded: false,
-            last_output_secs_ago: None,
-            idle_kill_in_secs: None,
-            wall_kill_in_secs: None,
-        };
-    }
     // A run that has said nothing has been idle for its whole life, which is
     // also how the kill path counts it.
     let idle_for_secs = if record.last_output_at == 0 {
@@ -845,7 +947,6 @@ pub(crate) fn running_liveness(record: &JobRecord, now: u64) -> RunningLiveness 
     };
     RunningLiveness {
         elapsed_secs,
-        recorded: true,
         last_output_secs_ago: (record.last_output_at > 0).then_some(idle_for_secs),
         idle_kill_in_secs: record.idle_secs.map(|i| i.saturating_sub(idle_for_secs)),
         wall_kill_in_secs: (record.timeout_secs > 0)
@@ -880,11 +981,39 @@ fn sweep(now: u64, scope: Scope) {
             }
             continue;
         };
+        let kind = record_kind(&path);
         let expired = match record.state {
             JobState::Done => full && now.saturating_sub(retention_anchor(&record)) > DONE_TTL_MS,
             JobState::Running => running_is_silent(&record, now),
         };
-        if expired {
+        if !expired {
+            continue;
+        }
+        // A silent blocking run's liveness record is CONVERTED rather than
+        // deleted: the caller holding the join is gone, and the run's handle is
+        // the only thing it left to resume from. The collectable spelling keeps
+        // being deleted, since its server dying means its result died with it.
+        if record.state == JobState::Running && kind == RecordKind::Liveness {
+            // The conversion writes to the COLLECTABLE spelling, a file this
+            // sweep has not read. Never overwrite a record that carries an
+            // envelope: a finish whose liveness leftover is the stale file here
+            // must keep its result.
+            if read(&record.job_id).is_some_and(|existing| existing.envelope.is_some()) {
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+            let mut crashed = record;
+            crashed.state = JobState::Done;
+            crashed.done_at = now;
+            crashed.envelope = None;
+            crashed.crashed = true;
+            // Drop the source only once the tombstone landed: a failed write
+            // (ENOSPC, read-only dir) leaves the liveness record as the
+            // surviving carrier of the handle.
+            if write_atomic(&crashed, RecordKind::Collectable).is_ok() {
+                let _ = std::fs::remove_file(&path);
+            }
+        } else {
             let _ = std::fs::remove_file(&path);
         }
     }

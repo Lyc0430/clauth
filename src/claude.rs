@@ -1,7 +1,9 @@
+use std::collections::BTreeSet;
 use std::env;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 
 use crate::lock::{StateLockHeld, with_state_lock};
 use crate::logline::logline;
@@ -131,12 +133,20 @@ pub(crate) fn clear_static_backup(name: &ProfileName) -> Result<bool> {
     })
 }
 
+/// Where `name`'s preserved mint backup sits. One derivation for both readers,
+/// so they cannot disagree about WHICH file answers the question. They differ
+/// only on an unresolvable home, deliberately: the restore verb propagates that
+/// as a failure, the render paths below cannot fail and take the absence.
+pub(crate) fn static_backup_path(name: &ProfileName) -> Result<PathBuf> {
+    Ok(profile_dir(name)?.join("session-token.static.json"))
+}
+
 /// Whether `name` holds a preserved mint backup (`session-token.static.json`).
 /// A single stat: the Setup tab's clear row uses it to DISCLOSE that the
 /// backup goes with a clear, and to stay reachable while the backup is the
 /// only long-lived piece left.
 pub(crate) fn has_static_backup(name: &ProfileName) -> bool {
-    profile_dir(name).is_ok_and(|d| d.join("session-token.static.json").exists())
+    static_backup_path(name).is_ok_and(|p| p.exists())
 }
 
 /// A cheap identity of `name`'s on-disk credential state: (mtime, length) of
@@ -293,6 +303,7 @@ pub(crate) fn write_session_token(name: &ProfileName, token: &str, now_ms: i64) 
             expires_at: Some(expires_at),
             scopes: Some(SETUP_TOKEN_SCOPES.iter().map(|s| s.to_string()).collect()),
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
     let bytes = serde_json::to_vec_pretty(&sidecar).context("serialize session token")?;
@@ -357,6 +368,11 @@ pub(crate) fn rolling_projection(chain: &crate::profile::OAuthToken) -> crate::p
         expires_at: chain.expires_at,
         scopes: chain.scopes.clone(),
         subscription_type: chain.subscription_type.clone(),
+        // A fresh mint from clauth's own chain, not a rewrite over a prior
+        // store, so it starts with no outside-written keys to keep. Claude
+        // Code adds its own on its first save into the sidecar, and the
+        // rolling re-stamp replaces them until that next save.
+        ..crate::profile::OAuthToken::default_extra()
     }
 }
 
@@ -471,6 +487,7 @@ pub(crate) fn write_session_token_with_backup(
             expires_at: Some(expires_at),
             scopes: Some(SETUP_TOKEN_SCOPES.iter().map(|s| s.to_string()).collect()),
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
     let bytes = serde_json::to_vec_pretty(&sidecar).context("serialize session token")?;
@@ -1151,13 +1168,243 @@ fn keychain_mirror_source(path: &Path, absent: AbsentSource) -> Result<()> {
             AbsentSource::Leave => Ok(()),
         };
     }
+    let store = checked_store_at(path)?;
+    crate::keychain::keychain_install(&store)
+}
+
+/// macOS: install the store `path` holds into the NAMESPACED Keychain item for
+/// `config_dir` — the multi-session swap executor's Keychain half. The executor
+/// repoints the session's credential link and this writes what a session's CC
+/// actually reads (it resolves the Keychain first, namespaced per
+/// `CLAUDE_CONFIG_DIR`). Same typed boundary check as the bare-item mirror
+/// ([`keychain_mirror_source`]); no absent-source arm, because the swap's own
+/// precondition already refused a member with no credential store.
+///
+/// Runs AFTER the state-flock hold that moved the link (a `security` subprocess
+/// must never span the flock) and is loud-not-fatal on failure: the file layer
+/// is swapped and the write is idempotent, and only a later swap onto ANOTHER
+/// member re-runs it — the executor refuses `AlreadyCurrent`, so there is no
+/// same-member retry. Callers pair it with [`carry_session_item_into`] first.
+#[cfg(target_os = "macos")]
+pub(crate) fn keychain_mirror_source_for_config_dir(path: &Path, config_dir: &Path) -> Result<()> {
+    let store = checked_store_at(path)?;
+    crate::keychain::keychain_install_for_config_dir(&store, config_dir)
+}
+
+/// macOS: carry the pair the session's Claude Code left in its per-config-dir
+/// Keychain item back into `store`, the install source of the member the
+/// session is leaving — the Keychain twin of the file drain
+/// (`sync_credentials_unlocked`), run before a swap overwrites that item. CC
+/// keeps its refreshed pair ONLY in the item: it deletes the runtime file once
+/// it has migrated, so the swap's item write would otherwise destroy the
+/// outgoing member's only live pair.
+///
+/// The item is not unconditionally fresher: the STORE moves too (a `clauth
+/// login` recapture, a switch-away snapshot), so the winner is the side whose
+/// login expires later — CC's refresh and a recapture both advance expiry —
+/// and a tie keeps the store. The compare and the write share ONE state-flock
+/// hold, so a store write landing between them cannot be reverted. The file
+/// drain's CLA-SPLIT guard carries over unchanged: a differing item over a
+/// static session token is a session-side re-login, never adopted over the
+/// token. An unparseable item carries nothing and heals instead: the swap's
+/// write replaces the truncated bytes rather than skipping inertly.
+///
+/// The read (a `security` subprocess) runs OUTSIDE the state flock.
+///
+/// Ownership of the item's login is never proven first: neither clauth-written
+/// stores nor CC-written items carry a top-level account anchor on real blobs,
+/// and a skipped rescue overwrites the account's only live refresh token — so
+/// any item whose login expires later is adopted.
+#[cfg(target_os = "macos")]
+pub(crate) fn carry_session_item_into(store: &Path, config_dir: &Path) -> Result<()> {
+    let blob = match crate::keychain::read_config_dir_item(config_dir) {
+        Ok(Some(blob)) => blob,
+        Ok(None) => return Ok(()),
+        Err(e) if crate::keychain::read_failed_unparseable(&e) => {
+            logline!(
+                "clauth: the per-session Keychain item is not valid JSON; the swap's write \
+                 replaces it rather than carrying its bytes"
+            );
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
+    let bytes = serde_json::to_vec(&blob).context("failed to serialize the Keychain item")?;
+    let parsed: ClaudeCredentials = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "the Keychain item for {} is not Claude credentials",
+            config_dir.display()
+        )
+    })?;
+    if parsed.claude_ai_oauth.is_none() {
+        return Ok(());
+    }
+    crate::lock::with_state_lock(|_held| {
+        let store_bytes = std::fs::read(store).ok();
+        if store_bytes.as_deref() == Some(bytes.as_slice()) {
+            return Ok(());
+        }
+        if store.file_name().is_some_and(|f| f == "session-token.json") {
+            logline!(
+                "clauth: kept the static session token (a session-side re-login \
+                 found in the per-session Keychain item is never adopted over it)"
+            );
+            return Ok(());
+        }
+        let store_value = store_bytes
+            .as_deref()
+            .and_then(|sb| serde_json::from_slice::<serde_json::Value>(sb).ok());
+        if !item_login_outranks_store(&blob, store_value.as_ref()) {
+            // The store moved after the item was last written (a recapture, a
+            // switch-away snapshot): keep it, the carry must not revert it.
+            return Ok(());
+        }
+        crate::profile::atomic_write_600(store, &bytes)
+            .with_context(|| format!("failed to write {}", store.display()))
+    })
+}
+
+/// Whether the per-session Keychain item's login outranks the store's for the
+/// carry: strictly-later expiry decides alone — no real blob carries a
+/// top-level account anchor to gate on, and rescue wins over wrong-account
+/// refusal — so a side that parses to no login or no expiry reads as zero,
+/// which the other side beats. PURE so the rule is pinned on every platform;
+/// the gated carry that consults it is macOS-only.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only caller is the macOS session-item carry; the rule is pinned on every platform"
+    )
+)]
+pub(crate) fn item_login_outranks_store(
+    item: &serde_json::Value,
+    store: Option<&serde_json::Value>,
+) -> bool {
+    let expiry = |side: Option<&serde_json::Value>| {
+        side.and_then(|v| serde_json::from_value::<ClaudeCredentials>(v.clone()).ok())
+            .and_then(|c| c.claude_ai_oauth)
+            .and_then(|o| o.expires_at)
+            .unwrap_or(0)
+    };
+    expiry(Some(item)) > expiry(store)
+}
+
+/// The Keychain service name Claude Code reads its OAuth login from on macOS:
+/// the bare `Claude Code-credentials` item a global `claude` resolves, because
+/// its config dir IS `~/.claude`. The macOS keychain module aliases this as its
+/// `SERVICE` constant; the literal lives here so the pure naming rules beside
+/// it — which derive and recognize the per-config-dir twins from this name —
+/// stay cross-platform, where they can be pinned (the
+/// `item_login_outranks_store` split: the module that shells out against
+/// these names compiles on macOS alone).
+pub(crate) const CLAUDE_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
+
+/// The namespaced Keychain service Claude Code derives for a config dir it
+/// runs under (`CLAUDE_CONFIG_DIR`): [`CLAUDE_KEYCHAIN_SERVICE`], a `-`, then
+/// the first 8 hex chars of the SHA-256 of the dir's path — CC's own
+/// `sha256(configDir).toString('hex').slice(0, 8)`, which is why a `clauth
+/// start` session's CC reads this twin and never the bare item. The session
+/// seed, the swap executor and the stale-runtime GC all derive the same name
+/// for one runtime tree through this rule.
+///
+/// PURE over its input — no canonicalize, no subprocess — so the naming rule
+/// is pinned on every platform; the macOS derivation is canonicalize plus
+/// this fn, and its subprocess callers are unreachable under `cfg(test)`.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only production caller is the macOS Keychain layer; the naming rule is pinned on every platform"
+    )
+)]
+pub(crate) fn namespaced_keychain_service(canonical_config_dir: &Path) -> String {
+    let path_str = canonical_config_dir.to_string_lossy();
+    let hash = Sha256::digest(path_str.as_bytes());
+    format!(
+        "{CLAUDE_KEYCHAIN_SERVICE}-{:02x}{:02x}{:02x}{:02x}",
+        hash[0], hash[1], hash[2], hash[3]
+    )
+}
+
+/// Whether `service` names a per-config-dir twin: the bare service, a `-`,
+/// then EXACTLY eight LOWERCASE hex digits — the only shape
+/// [`namespaced_keychain_service`] produces (node's `toString('hex')` and
+/// Rust's `{:02x}` are both lowercase-only). The stale-runtime GC's delete
+/// refuses everything else, the bare item itself (the operator's global
+/// `claude` login, which no GC decision explains) most importantly, so a
+/// caller handing over a name it derived nowhere cannot reach an item it
+/// cannot account for. PURE so the guard is pinned on every platform.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only production caller is the macOS Keychain layer; the guard is pinned on every platform"
+    )
+)]
+pub(crate) fn is_namespaced_keychain_service(service: &str) -> bool {
+    let Some(suffix) = service.strip_prefix(CLAUDE_KEYCHAIN_SERVICE) else {
+        return false;
+    };
+    let Some(hex) = suffix.strip_prefix('-') else {
+        return false;
+    };
+    hex.len() == 8 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The census decision over one `security dump-keychain` text: the NAMESPACED
+/// services it lists that no live dir explains. Fed the live set
+/// [`crate::runtime::live_namespaced_keychain_services`] derives from the dirs
+/// it enumerates, it collects exactly the orphans the walk-derived sweep
+/// cannot reach — a clean teardown's `Drop`, a profile deletion, the sweep's
+/// own stranding inputs — and never a service an existing dir derives. A live
+/// foreign `CLAUDE_CONFIG_DIR` item elsewhere in the dump is accepted
+/// collateral (ruled 2026-09-12): the service is a one-way hash of the dir, so
+/// a census cannot tell it apart.
+///
+/// The only lines it reads are the generic-password service attribute, the
+/// shape `security dump-keychain` prints as `0x00000007 <blob>="<name>"` for a
+/// printable value and `0x00000007 <blob>=0x<hex>  "<name>"` when the tool
+/// adds the hex form; the first quoted span is the service either way. A
+/// `<NULL>` value, the account attribute (`0x00000008`) and every other line
+/// contribute nothing. PURE over text so the decision is pinned on every
+/// platform; the `security` I/O it feeds is macOS-only
+/// (`keychain::census_namespaced_items`).
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only production caller is the macOS Keychain census; the decision is pinned on every platform"
+    )
+)]
+pub(crate) fn census_orphan_keychain_services(dump: &str, live: &BTreeSet<String>) -> Vec<String> {
+    let mut orphans = BTreeSet::new();
+    for line in dump.lines() {
+        let Some(value) = line.trim_start().strip_prefix("0x00000007 <blob>=") else {
+            continue;
+        };
+        let Some(service) = value
+            .split_once('"')
+            .and_then(|(_, rest)| rest.split_once('"').map(|(name, _)| name))
+        else {
+            continue;
+        };
+        if is_namespaced_keychain_service(service) && !live.contains(service) {
+            orphans.insert(service.to_string());
+        }
+    }
+    orphans.into_iter().collect()
+}
+
+/// Typed check at the boundary, then hand the untyped object to the installer:
+/// the login must be PRESENT and parse as a login, or CC is handed a credential
+/// it cannot read and nothing here would have said so. Presence is its own
+/// clause because the field is an `Option`, so `{}` and a store holding only
+/// `mcpOAuth` parse clean. The Value is what gets written, since the typed
+/// shape models the login alone and would drop the store's siblings.
+#[cfg(target_os = "macos")]
+fn checked_store_at(path: &Path) -> Result<serde_json::Value> {
     let store: serde_json::Value = read_json_file(path)?;
-    // Typed check at the boundary, then install the untyped object: the login
-    // must be PRESENT and parse as a login, or CC is handed a credential it
-    // cannot read and nothing here would have said so. Presence is its own
-    // clause because the field is an `Option`, so `{}` and a store holding only
-    // `mcpOAuth` parse clean. The Value is what gets written, since the typed
-    // shape models the login alone and would drop the store's siblings.
     let parsed = serde_json::from_value::<ClaudeCredentials>(store.clone()).with_context(|| {
         format!(
             "install source is not Claude credentials: {}",
@@ -1169,7 +1416,7 @@ fn keychain_mirror_source(path: &Path, absent: AbsentSource) -> Result<()> {
         "refusing to install a credential store that holds no login: {}",
         path.display()
     );
-    crate::keychain::keychain_install(&store)
+    Ok(store)
 }
 
 #[cfg(unix)]
@@ -1192,6 +1439,63 @@ pub(crate) fn create_symlink(target: &Path, link: &Path) -> Result<()> {
     std::fs::copy(target, link)
         .map(|_| ())
         .context("failed to copy credentials")
+}
+
+/// Point `link` at `target` without ever leaving the path absent: stage the
+/// pointer at a staging sibling, then rename it over whatever is there.
+///
+/// The unlink-then-create this replaced left `~/.claude/.credentials.json`
+/// missing whenever the create failed after the unlink had landed, which is
+/// reachable on Windows: [`create_symlink`] falls back to copying `target`
+/// there, and a copy loses to anyone holding `target` open for writing. Staging
+/// first moves that failure ahead of the swap, where it costs nothing.
+pub(crate) fn publish_credential_link(link: &Path, target: &Path) -> Result<()> {
+    if let Some(parent) = link.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = crate::profile::tmp_sibling(link);
+    let _ = std::fs::remove_file(&tmp);
+    create_symlink(target, &tmp)?;
+    let mut renamed = std::fs::rename(&tmp, link);
+    if renamed.is_err() && clear_readonly(link) {
+        renamed = std::fs::rename(&tmp, link);
+    }
+    match renamed {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e).with_context(|| format!("failed to publish {}", link.display()))
+        }
+    }
+}
+
+/// Drop a read-only attribute from `path`, reporting whether it dropped one.
+///
+/// Windows only. It keeps [`publish_credential_link`] from refusing a switch
+/// that the unlink-then-create before it would have completed: a read-only
+/// destination refuses `rename` there with os error 5, while `remove_file`
+/// clears the attribute on its way past. Nothing clauth writes is read-only, so
+/// the operator or a backup tool is what sets it.
+#[cfg(windows)]
+#[expect(
+    clippy::permissions_set_readonly_false,
+    reason = "the lint is about unix, where clearing readonly grants group and other write; this arm is windows-only, where it clears one file attribute"
+)]
+fn clear_readonly(path: &Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    let mut perms = meta.permissions();
+    if !perms.readonly() {
+        return false;
+    }
+    perms.set_readonly(false);
+    std::fs::set_permissions(path, perms).is_ok()
+}
+
+#[cfg(not(windows))]
+fn clear_readonly(_path: &Path) -> bool {
+    false
 }
 
 /// Credential-store keys a switch carries forward onto the incoming profile.
@@ -1474,14 +1778,12 @@ pub(crate) fn link_profile_credentials(name: &ProfileName) -> Result<()> {
             // Preserve the live MCP-server logins onto the incoming profile
             // before the swap, so switching accounts keeps them intact.
             carry_live_extra_best_effort(&link, &target, name);
-            std::fs::remove_file(&link).context("failed to remove old .credentials.json")?;
         }
 
         if target.exists() {
-            if let Some(parent) = link.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            create_symlink(&target, &link)?;
+            publish_credential_link(&link, &target)?;
+        } else if link.symlink_metadata().is_ok() {
+            std::fs::remove_file(&link).context("failed to remove old .credentials.json")?;
         }
         // macOS: make the switch real, since Claude Code reads the Keychain.
         // `Leave` because this is the GUARDED relink: it is also what a rename,
@@ -1624,6 +1926,35 @@ pub(crate) fn claude_settings_env_keys() -> Result<Vec<String>> {
         .unwrap_or_default())
 }
 
+/// The model strings the live `~/.claude/settings.json` puts in effect: the
+/// top-level `model`, the top-level `fallbackModel` array, and the subagent
+/// override in its `env` block.
+///
+/// Read rather than resolved — [`crate::start::launch_models`] wants every family the next
+/// session MAY run, and all of these are separately reachable inside one
+/// session. Absent file, absent keys and unreadable JSON all answer empty: a
+/// launcher must never fail over a settings file it only wanted a hint from.
+pub(crate) fn claude_settings_models() -> Result<Vec<String>> {
+    let path = claude_settings_path()?;
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let Ok(settings) = read_json_file::<serde_json::Value>(&path) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    if let Some(m) = settings["model"].as_str() {
+        out.push(m.to_owned());
+    }
+    if let Some(fb) = settings["fallbackModel"].as_array() {
+        out.extend(fb.iter().filter_map(|v| v.as_str()).map(str::to_owned));
+    }
+    if let Some(m) = settings["env"]["CLAUDE_CODE_SUBAGENT_MODEL"].as_str() {
+        out.push(m.to_owned());
+    }
+    Ok(out)
+}
+
 /// Patch `settings.json` `env` with profile's endpoint keys and env map;
 /// strip `prev_env_keys` the new profile doesn't carry to clear stale entries.
 pub(crate) fn apply_profile_to_claude_settings(
@@ -1752,7 +2083,10 @@ fn shell_quote(s: &str) -> String {
 /// whitespace/control chars. Hoisted from [`build_claude_settings_json`], which
 /// gates its `apiKeyHelper` wiring on exactly this test — sharing the function
 /// keeps the delegate guard from drifting from the real wiring.
-fn has_usable_api_key(profile: &Profile) -> bool {
+/// [`crate::oauth::third_party_dead_chain_copy`] shares it: the split sentence
+/// claims the key still works, and a profile this returns false for with no
+/// env-carried key has no key it could.
+pub(crate) fn has_usable_api_key(profile: &Profile) -> bool {
     profile
         .api_key
         .as_deref()
@@ -1773,12 +2107,43 @@ fn has_usable_api_key(profile: &Profile) -> bool {
 /// fetch predicate: that one treats Alibaba's console session as a credential,
 /// and the console session authenticates the quota gateway only, never
 /// inference. A keyless Alibaba profile fails THIS test.
+///
+/// The load boundary reads the same env half:
+/// `crate::profile`'s `effective_base_url` keeps a managed `base_url` behind a
+/// stored pair when an `[env]` auth entry is present, so an endpoint the
+/// preserve arm keeps (`has_own_inference_endpoint` below) survives the next
+/// `load_profile`. Change one and the other must follow.
 pub(crate) fn has_inference_auth(profile: &Profile) -> bool {
     has_usable_api_key(profile)
         || profile.env.iter().any(|(k, v)| {
             matches!(k.as_str(), "ANTHROPIC_AUTH_TOKEN" | "ANTHROPIC_API_KEY")
                 && !v.trim().is_empty()
         })
+}
+
+/// Whether this account's inference runs on its OWN endpoint and credential,
+/// independent of any stored OAuth chain: it routes somewhere
+/// ([`Profile::routing_endpoint`], so an `[env] ANTHROPIC_BASE_URL` counts like
+/// a managed `base_url`) and has something to authenticate there with.
+///
+/// The single predicate behind two decisions the owner ruled on the same day,
+/// deliberately shared so they cannot drift apart: a browser re-login PRESERVES
+/// such an account's endpoint + key instead of wiping them
+/// (`actions::overwrite_captured_profile`), and a dead OAuth chain does NOT
+/// refuse its `delegate` (`mcp::preflight_target`), because the chain it lost
+/// feeds usage polling and nothing else.
+///
+/// Never keyed on a RECOGNISED provider: whether clauth has a usage integration
+/// for a host says nothing about whether inference works against it, and most
+/// endpoints in use resolve to `provider: None`. The keyless refusal is a
+/// different question and keeps its own `is_third_party` scope — an
+/// unrecognised endpoint may be a local model that needs no key at all.
+pub(crate) fn has_own_inference_endpoint(profile: &Profile) -> bool {
+    profile
+        .routing_endpoint()
+        .map(str::trim)
+        .is_some_and(|u| !u.is_empty())
+        && has_inference_auth(profile)
 }
 
 /// Build the merged settings.json content. `prev_env_keys` are stripped before
@@ -1999,13 +2364,11 @@ pub(crate) fn force_link_profile_credentials(name: &ProfileName) -> Result<()> {
             // Preserve the live MCP-server logins onto the incoming profile
             // before the swap, so switching accounts keeps them intact.
             carry_live_extra_best_effort(&link, &target, name);
-            std::fs::remove_file(&link).context("failed to remove .credentials.json")?;
         }
         if target.exists() {
-            if let Some(parent) = link.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            create_symlink(&target, &link)?;
+            publish_credential_link(&link, &target)?;
+        } else if link.symlink_metadata().is_ok() {
+            std::fs::remove_file(&link).context("failed to remove .credentials.json")?;
         }
         // macOS: make the switch real, since Claude Code reads the Keychain.
         // `SignOut` because this is the FORCING relink, which every switch path
@@ -2047,9 +2410,12 @@ pub(crate) fn detach_credentials_link() -> Result<()> {
         if !meta.file_type().is_symlink() {
             return Ok(());
         }
+        // No unlink first: `atomic_write_600` publishes through a staging
+        // sibling and a rename, and a rename REPLACES a symlink destination
+        // rather than following it. Unlinking beforehand only opened a window
+        // where a failed write left the path with nothing in it.
         let content =
             std::fs::read(&path).context("failed to read .credentials.json before detach")?;
-        std::fs::remove_file(&path).context("failed to remove .credentials.json symlink")?;
         atomic_write_600(&path, content).context("failed to write detached .credentials.json")?;
         Ok(())
     })

@@ -84,6 +84,7 @@ fn profile_with_usage(name: &str, threshold: Option<f64>, usage: Option<UsageInf
         fetch_status: None,
         provider: None,
         third_party_usage: None,
+        usage_stale: false,
     }
 }
 
@@ -5374,4 +5375,516 @@ fn a_spent_codex_active_moves_to_the_next_member() {
         crate::fallback::next_auto_switch_target_for_test(&snap, &store),
         Some(crate::fallback::SwitchAction::To("cx2".to_string()))
     );
+}
+
+// ── start_walk: the `--auto` selection walk over the on-disk caches ─────────
+//
+// `start_walk` reads usage off `profile_json::profile_windows` (the on-disk
+// `usage_cache.json`), never `Profile.usage` (which only the UI thread fills),
+// so these fixtures write the cache under a sandbox rather than the in-memory
+// field the pure `next_target` tests use.
+
+fn start_walk_profile(name: &str) -> Profile {
+    Profile::new(name.to_string(), None, None)
+}
+
+fn start_walk_sandbox(names: &[&str]) -> crate::testutil::HomeSandbox {
+    let sb = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(names);
+    sb
+}
+
+fn start_walk_usage(age_secs: u64, five: f64, seven: f64) -> UsageInfo {
+    UsageInfo {
+        five_hour: Some(window(five, Some(live_reset()))),
+        seven_day: Some(window(seven, Some(live_reset()))),
+        fetched_at: Some(crate::usage::now_ms() - age_secs * 1000),
+        ..Default::default()
+    }
+}
+
+fn start_walk_write_usage(name: &str, usage: &UsageInfo) {
+    crate::profile_cache::write_profile_cache(
+        &ProfileName::from(name),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        usage,
+    );
+}
+
+fn start_walk_write_kick(name: &str) {
+    let far_ahead = now_epoch_secs() + 3600;
+    crate::profile_cache::write_profile_cache(
+        &ProfileName::from(name),
+        crate::profile_cache::KICK_BLOCK_CACHE_FILE,
+        &crate::usage::KickBlock {
+            streak: 2,
+            rejected: true,
+            until: Some(far_ahead),
+            next_retry: far_ahead,
+        },
+    );
+}
+
+#[test]
+fn model_family_keeps_every_claude_family() {
+    assert_eq!(
+        model_family("claude-3-5-haiku-20241022").as_deref(),
+        Some("haiku")
+    );
+    assert_eq!(model_family("claude-3-7-sonnet").as_deref(), Some("sonnet"));
+    assert_eq!(
+        model_family("claude-3-opus-20240229").as_deref(),
+        Some("opus")
+    );
+    assert_eq!(model_family("claude-opus-4-8").as_deref(), Some("opus"));
+    assert_eq!(
+        model_family("claude-sonnet-4-5-20250929").as_deref(),
+        Some("sonnet")
+    );
+    assert_eq!(model_family("claude-opus-4-1[1m]").as_deref(), Some("opus"));
+    assert_eq!(
+        model_family("claude-opus-4-6-thinking").as_deref(),
+        Some("opus")
+    );
+    assert_eq!(model_family("opus").as_deref(), Some("opus"));
+    assert_eq!(model_family("sonnet").as_deref(), Some("sonnet"));
+    assert_eq!(model_family("haiku").as_deref(), Some("haiku"));
+    assert_eq!(model_family("fable").as_deref(), Some("fable"));
+    assert_eq!(model_family("opus[1m]").as_deref(), Some("opus"));
+    assert_eq!(model_family("sonnet[1m]").as_deref(), Some("sonnet"));
+    assert_eq!(model_family("Sonnet[1M]").as_deref(), Some("sonnet"));
+    assert_eq!(model_family("fable[1m]").as_deref(), Some("fable"));
+    assert_eq!(model_family("deepseek-v4-pro"), None);
+    assert_eq!(model_family(""), None);
+    assert_eq!(model_family("claude-2.1"), None);
+}
+
+#[test]
+fn demand_from_expands_opusplan_and_dedupes() {
+    assert_eq!(demand_from(["opusplan"]), vec!["opus", "sonnet"]);
+    assert_eq!(demand_from(["best"]), vec!["fable", "opus"]);
+    assert_eq!(demand_from(["best", "opus"]), vec!["fable", "opus"]);
+    assert_eq!(demand_from(["opusplan[1m]"]), vec!["opus", "sonnet"]);
+    assert_eq!(demand_from(["best[1m]"]), vec!["fable", "opus"]);
+    assert_eq!(demand_from(["default"]).len(), 0);
+    assert_eq!(
+        demand_from(["claude-opus-5", "opus", "gpt-4o"]),
+        vec!["opus"]
+    );
+    assert_eq!(demand_from(["claude-sonnet-4-5", "sonnet"]), vec!["sonnet"]);
+}
+
+#[test]
+fn scoped_label_is_matches_any_word_of_the_label() {
+    assert!(scoped_label_is("7d fable", "fable"));
+    assert!(!scoped_label_is("7d fable", "opus"));
+    assert!(!scoped_label_is("7d", "fable"));
+    assert!(scoped_label_is("7d sonnet 4.5", "sonnet"));
+    assert!(!scoped_label_is("7d sonnet 4.5", "opus"));
+}
+
+#[test]
+fn worst_scoped_window_for_narrows_to_the_demanded_families() {
+    let now = now_epoch_secs();
+    let usage = UsageInfo {
+        weekly_scoped: vec![crate::usage::ScopedWindow {
+            label: "7d fable".to_owned(),
+            window: window(100.0, Some(live_reset())),
+        }],
+        ..Default::default()
+    };
+    let opus = ["opus".to_owned()];
+    assert!(
+        worst_scoped_window_for(&usage, now, 98.0, Some(&opus)).is_none(),
+        "a member capped on fable is clear for an opus launch"
+    );
+    let fable = ["fable".to_owned()];
+    assert_eq!(
+        worst_scoped_window_for(&usage, now, 98.0, Some(&fable)).map(|w| w.label.as_str()),
+        Some("7d fable"),
+        "the demanded family is the one capped"
+    );
+    let lapsed = UsageInfo {
+        weekly_scoped: vec![crate::usage::ScopedWindow {
+            label: "7d fable".to_owned(),
+            window: window(100.0, Some(expired_reset())),
+        }],
+        ..Default::default()
+    };
+    assert!(
+        worst_scoped_window_for(&lapsed, now, 98.0, Some(&fable)).is_none(),
+        "a scoped window past its reset carries stale numbers and must not gate"
+    );
+}
+
+#[test]
+fn start_walk_takes_chain_order_over_headroom() {
+    let _sb = start_walk_sandbox(&["a", "b"]);
+    start_walk_write_usage("a", &start_walk_usage(240, 80.0, 10.0));
+    start_walk_write_usage("b", &start_walk_usage(240, 5.0, 10.0));
+    let config = config_with_chain(vec![start_walk_profile("a"), start_walk_profile("b")], "a");
+    let (rows, pick) = start_walk(&config, None, false);
+    assert_eq!(pick, Some(0), "chain order, not headroom, is the pick");
+    assert_eq!(rows[0].block, None);
+    assert_eq!(rows[1].block, None);
+}
+
+#[test]
+fn start_walk_skips_a_member_capped_on_a_demanded_family() {
+    let _sb = start_walk_sandbox(&["capped"]);
+    let mut usage = start_walk_usage(240, 5.0, 10.0);
+    usage.weekly_scoped = vec![crate::usage::ScopedWindow {
+        label: "7d opus".to_owned(),
+        window: window(100.0, Some(live_reset())),
+    }];
+    start_walk_write_usage("capped", &usage);
+    let config = config_with_chain(vec![start_walk_profile("capped")], "capped");
+    let demand = ["opus".to_owned()];
+    let (rows, pick) = start_walk(&config, Some(&demand), false);
+    assert_eq!(pick, None);
+    assert_eq!(
+        rows[0].block,
+        Some(StartBlock::ScopedSpent {
+            label: "7d opus".to_owned(),
+            pct: 100.0,
+        })
+    );
+}
+
+#[test]
+fn start_walk_keeps_a_member_capped_on_another_family() {
+    let _sb = start_walk_sandbox(&["capped"]);
+    let mut usage = start_walk_usage(240, 5.0, 10.0);
+    usage.weekly_scoped = vec![crate::usage::ScopedWindow {
+        label: "7d opus".to_owned(),
+        window: window(100.0, Some(live_reset())),
+    }];
+    start_walk_write_usage("capped", &usage);
+    let config = config_with_chain(vec![start_walk_profile("capped")], "capped");
+    let demand = ["sonnet".to_owned()];
+    let (rows, pick) = start_walk(&config, Some(&demand), false);
+    assert_eq!(pick, Some(0));
+    assert_eq!(rows[0].block, None);
+}
+
+#[test]
+fn start_walk_with_no_demand_keeps_the_blanket_check_scoped_gate() {
+    let _sb = start_walk_sandbox(&["capped"]);
+    let mut usage = start_walk_usage(240, 5.0, 10.0);
+    usage.weekly_scoped = vec![crate::usage::ScopedWindow {
+        label: "7d fable".to_owned(),
+        window: window(100.0, Some(live_reset())),
+    }];
+    start_walk_write_usage("capped", &usage);
+
+    let mut gated = start_walk_profile("capped");
+    gated.check_scoped = true;
+    let gated_config = config_with_chain(vec![gated], "capped");
+    let (rows, pick) = start_walk(&gated_config, None, false);
+    assert_eq!(pick, None, "no demand keeps the blanket check_scoped gate");
+    assert!(matches!(
+        rows[0].block,
+        Some(StartBlock::ScopedSpent { .. })
+    ));
+
+    let mut ungated = start_walk_profile("capped");
+    ungated.check_scoped = false;
+    let ungated_config = config_with_chain(vec![ungated], "capped");
+    let (rows, pick) = start_walk(&ungated_config, None, false);
+    assert_eq!(pick, Some(0));
+    assert_eq!(rows[0].block, None);
+}
+
+#[test]
+fn start_walk_a_known_demand_overrides_check_scoped_off() {
+    let _sb = start_walk_sandbox(&["capped"]);
+    let mut usage = start_walk_usage(240, 5.0, 10.0);
+    usage.weekly_scoped = vec![crate::usage::ScopedWindow {
+        label: "7d opus".to_owned(),
+        window: window(100.0, Some(live_reset())),
+    }];
+    start_walk_write_usage("capped", &usage);
+    let mut profile = start_walk_profile("capped");
+    profile.check_scoped = false;
+    let config = config_with_chain(vec![profile], "capped");
+    let demand = ["opus".to_owned()];
+    let (rows, pick) = start_walk(&config, Some(&demand), false);
+    assert_eq!(pick, None, "a known demand supersedes the blanket gate");
+    assert!(matches!(
+        rows[0].block,
+        Some(StartBlock::ScopedSpent { .. })
+    ));
+}
+
+#[test]
+fn start_walk_skips_what_the_switch_walk_skips() {
+    let _sb = start_walk_sandbox(&[
+        "disabled",
+        "authbroken",
+        "canceled",
+        "kickrejected",
+        "fivehour",
+        "weeklyspent",
+        "weeklysoft",
+    ]);
+
+    let mut disabled = start_walk_profile("disabled");
+    disabled.disabled = true;
+
+    let mut canceled_usage = start_walk_usage(240, 5.0, 10.0);
+    canceled_usage.plan = Some(PlanInfo {
+        tier: PlanTier::Free,
+        subscription_status: Some("canceled".to_owned()),
+        codex_plan: None,
+    });
+    start_walk_write_usage("canceled", &canceled_usage);
+
+    start_walk_write_usage("fivehour", &start_walk_usage(240, 100.0, 10.0));
+    start_walk_write_usage("weeklyspent", &start_walk_usage(240, 5.0, 100.0));
+    let mut weeklysoft = start_walk_profile("weeklysoft");
+    weeklysoft.weekly_threshold = Some(98.0);
+    start_walk_write_usage("weeklysoft", &start_walk_usage(240, 5.0, 99.0));
+
+    start_walk_write_kick("kickrejected");
+
+    let mut config = config_with_chain(
+        vec![
+            disabled,
+            start_walk_profile("authbroken"),
+            start_walk_profile("canceled"),
+            start_walk_profile("kickrejected"),
+            start_walk_profile("fivehour"),
+            start_walk_profile("weeklyspent"),
+            weeklysoft,
+        ],
+        "disabled",
+    );
+    config.state.auth_broken.push("authbroken".into());
+
+    let (rows, pick) = start_walk(&config, None, false);
+    assert_eq!(pick, None);
+    assert_eq!(rows[0].block, Some(StartBlock::Disabled));
+    assert_eq!(rows[1].block, Some(StartBlock::AuthBroken));
+    assert_eq!(rows[2].block, Some(StartBlock::Canceled));
+    assert_eq!(rows[3].block, Some(StartBlock::KickRejected));
+    assert_eq!(rows[4].block, Some(StartBlock::FiveHour { pct: 100.0 }));
+    assert_eq!(rows[5].block, Some(StartBlock::WeeklySpent));
+    assert_eq!(rows[6].block, Some(StartBlock::WeeklySoft { pct: 99.0 }));
+}
+
+#[test]
+fn start_walk_refuses_a_non_oauth_member_only_under_with_fallback() {
+    let _sb = start_walk_sandbox(&["thirdparty"]);
+    let mut third_party = start_walk_profile("thirdparty");
+    third_party.base_url = Some("https://api.example.com".to_owned());
+    let config = config_with_chain(vec![third_party], "thirdparty");
+
+    let (rows, pick) = start_walk(&config, None, true);
+    assert_eq!(pick, None, "--with-fallback refuses a non-OAuth member");
+    assert_eq!(rows[0].block, Some(StartBlock::NotOauth));
+
+    let (rows, pick) = start_walk(&config, None, false);
+    assert_eq!(pick, Some(0));
+    assert_eq!(rows[0].block, None);
+}
+
+#[test]
+fn start_walk_prefers_a_fresh_reading_but_still_launches_on_a_stale_one() {
+    let _sb = start_walk_sandbox(&["a", "b", "c", "d"]);
+    start_walk_write_usage("a", &start_walk_usage(10_800, 5.0, 10.0));
+    start_walk_write_usage("b", &start_walk_usage(240, 5.0, 10.0));
+    start_walk_write_usage("c", &start_walk_usage(10_800, 5.0, 10.0));
+
+    let two = config_with_chain(vec![start_walk_profile("a"), start_walk_profile("b")], "a");
+    let (rows, pick) = start_walk(&two, None, false);
+    assert_eq!(
+        pick,
+        Some(1),
+        "a stale first member loses to a fresh second"
+    );
+    assert!(rows[0].stale && !rows[1].stale);
+
+    let one = config_with_chain(vec![start_walk_profile("c")], "c");
+    let (rows, pick) = start_walk(&one, None, false);
+    assert_eq!(pick, Some(0), "the only clear member still launches stale");
+    assert!(rows[0].stale);
+
+    // A never-fetched member is not fresh either, and a stale reading still
+    // outranks no reading at all in the any-freshness pass.
+    let stale_then_unread =
+        config_with_chain(vec![start_walk_profile("a"), start_walk_profile("d")], "a");
+    let (rows, pick) = start_walk(&stale_then_unread, None, false);
+    assert_eq!(
+        pick,
+        Some(0),
+        "a stale reading outranks a member clauth knows nothing about"
+    );
+    assert!(rows[0].stale && !rows[0].fresh && !rows[1].fresh);
+
+    let only_unread = config_with_chain(vec![start_walk_profile("d")], "d");
+    let (rows, pick) = start_walk(&only_unread, None, false);
+    assert_eq!(pick, Some(0), "the only member still launches unread");
+    assert!(!rows[0].fresh);
+}
+
+#[test]
+fn start_walk_with_nothing_startable_returns_no_pick_and_every_verdict() {
+    let _sb = start_walk_sandbox(&["a", "b", "c"]);
+    let mut a = start_walk_profile("a");
+    a.disabled = true;
+    start_walk_write_usage("b", &start_walk_usage(240, 100.0, 10.0));
+    start_walk_write_usage("c", &start_walk_usage(240, 5.0, 100.0));
+    let config = config_with_chain(
+        vec![a, start_walk_profile("b"), start_walk_profile("c")],
+        "a",
+    );
+    let (rows, pick) = start_walk(&config, None, false);
+    assert_eq!(pick, None);
+    assert_eq!(rows.len(), 3);
+    assert!(
+        rows.iter().all(|r| r.block.is_some()),
+        "every member's verdict is rendered for the refusal"
+    );
+    assert_eq!(rows[0].block, Some(StartBlock::Disabled));
+    assert_eq!(rows[1].block, Some(StartBlock::FiveHour { pct: 100.0 }));
+    assert_eq!(rows[2].block, Some(StartBlock::WeeklySpent));
+}
+
+/// The scoped half of the start walk's accept, spelled from the walk's own
+/// predicates so the equivalence pin below can't drift from the real judgment.
+fn start_walk_scoped_clear(
+    member: &ChainMember,
+    usage: Option<&UsageInfo>,
+    families: Option<&[String]>,
+) -> bool {
+    let now = now_epoch_secs();
+    match families {
+        Some(fams) => usage.is_none_or(|info| {
+            worst_scoped_window_for(info, now, member.scoped_line, Some(fams)).is_none()
+        }),
+        None if member.check_scoped => usage.is_none_or(|info| {
+            worst_scoped_window_for(info, now, member.scoped_line, None).is_none()
+        }),
+        None => true,
+    }
+}
+
+#[test]
+fn start_block_is_none_exactly_when_the_switch_walk_accepts() {
+    let on_config = config_with_chain(vec![start_walk_profile("p")], "p");
+    let on_member = chain_member(
+        &on_config,
+        &ProfileName::from("p"),
+        on_config.state.weekly_switch_threshold_pct(),
+    );
+    let on_profile = on_config
+        .find(&ProfileName::from("p"))
+        .expect("fixture profile");
+
+    let mut off_profile = start_walk_profile("p");
+    off_profile.check_scoped = false;
+    let off_config = config_with_chain(vec![off_profile], "p");
+    let off_member = chain_member(
+        &off_config,
+        &ProfileName::from("p"),
+        off_config.state.weekly_switch_threshold_pct(),
+    );
+    let off_profile = off_config
+        .find(&ProfileName::from("p"))
+        .expect("fixture profile");
+
+    let check = |config: &AppConfig,
+                 member: &ChainMember,
+                 profile: &Profile,
+                 usage: Option<UsageInfo>,
+                 families: Option<&[String]>| {
+        let expected =
+            !is_exhausted_from_info(member, usage.as_ref(), member.weekly_line, now_epoch_secs())
+                && start_walk_scoped_clear(member, usage.as_ref(), families);
+        assert_eq!(
+            start_block(
+                config,
+                member,
+                profile,
+                usage.as_ref(),
+                false,
+                false,
+                families
+            )
+            .is_none(),
+            expected,
+            "usage={usage:?} check_scoped={} families={families:?}",
+            member.check_scoped
+        );
+    };
+
+    let live = Some(live_reset());
+    let lapsed = Some(expired_reset());
+
+    check(&on_config, &on_member, on_profile, None, None);
+
+    // 5h at the threshold exactly, one below, 100 — each live and lapsed.
+    for resets_at in [live.clone(), lapsed.clone()] {
+        for five in [DEFAULT_THRESHOLD, DEFAULT_THRESHOLD - 1.0, 100.0] {
+            check(
+                &on_config,
+                &on_member,
+                on_profile,
+                Some(UsageInfo {
+                    five_hour: Some(window(five, resets_at.clone())),
+                    seven_day: Some(window(0.0, live.clone())),
+                    ..Default::default()
+                }),
+                None,
+            );
+        }
+    }
+
+    // 7d at the soft line exactly, one below, 100 — each live and lapsed.
+    for resets_at in [live.clone(), lapsed.clone()] {
+        for seven in [on_member.weekly_line, on_member.weekly_line - 1.0, 100.0] {
+            check(
+                &on_config,
+                &on_member,
+                on_profile,
+                Some(UsageInfo {
+                    five_hour: Some(window(0.0, live.clone())),
+                    seven_day: Some(window(seven, resets_at.clone())),
+                    ..Default::default()
+                }),
+                None,
+            );
+        }
+    }
+
+    // A scoped window at the scoped line exactly, over each family/check arm.
+    let demanded = ["fable".to_owned()];
+    let other = ["opus".to_owned()];
+    for (config, member, profile, families) in [
+        (&on_config, &on_member, on_profile, None),
+        (&off_config, &off_member, off_profile, None),
+        (
+            &on_config,
+            &on_member,
+            on_profile,
+            Some(demanded.as_slice()),
+        ),
+        (&on_config, &on_member, on_profile, Some(other.as_slice())),
+    ] {
+        check(
+            config,
+            member,
+            profile,
+            Some(UsageInfo {
+                five_hour: Some(window(0.0, live.clone())),
+                seven_day: Some(window(0.0, live.clone())),
+                weekly_scoped: vec![crate::usage::ScopedWindow {
+                    label: "7d fable".to_owned(),
+                    window: window(member.scoped_line, live.clone()),
+                }],
+                ..Default::default()
+            }),
+            families,
+        );
+    }
 }

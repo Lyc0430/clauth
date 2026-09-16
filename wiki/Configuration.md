@@ -5,7 +5,7 @@ Two files, both TOML, both safe to hand-edit while clauth runs (it reloads on ex
 - `~/.clauth/profiles.toml` for everything program-wide: profile order, the active marker, the fallback chain, appearance, the scheduler.
 - `~/.clauth/profiles/<name>/config.toml` for one account: endpoint, key, env, model routing, its chain settings.
 
-Every key below has a TUI equivalent on the Setup, Fallback, or Config tab ([Interface and keys](Interface-And-Keys#config-tab-rows)).
+Most keys below have a TUI equivalent on the Setup, Fallback, Config or Plugin tab ([Interface and keys](Interface-And-Keys#config-tab-rows)). A few are written only by a command or by clauth itself; those cells say which.
 
 ## Account types
 
@@ -21,7 +21,7 @@ A mint is a narrower credential than a `/login` session: it carries `user:infere
 
 ### Third-party usage data
 
-Four providers get typed usage panels:
+Five providers get typed usage panels:
 
 | Provider | Base URL | Shows |
 |----------|----------|-------|
@@ -29,18 +29,20 @@ Four providers get typed usage panels:
 | Z.ai | `https://api.z.ai` | percentage bars per limit window (5h / 7d / 30d), per-tool rows, plan level, 7-day per-model token totals |
 | OpenRouter | `https://openrouter.ai` | wallet rows from the credits endpoint: api balance (remaining credits, red when overdrawn), used, purchased; then today / this week / this month usage, per-key cap rows when set, free-tier flag |
 | Alibaba Model Studio | the four Qwen preset endpoints below | a 7d bar carrying your tier's absolute allowance, a 5h bar when the API reports one, plan tier, subscription status and days left |
+| MiniMax | `https://api.minimax.io` | Token Plan bars for the 5h interval and the 7d window, plus a remaining row per plan bucket. The bars follow `general`, the bucket Claude Code bills against — or the lone bucket when the account has exactly one; with more than one bucket and no `general`, no bars are drawn. `video` and any other bucket ride as rows only. The mainland-China endpoint is not covered — it is a separate account on a different host, so it falls to the best-effort scan below |
 
-Any other endpoint is scanned best-effort: clauth probes a short list of usage paths on the origin your key already authorizes, and renders whatever percentage or balance shapes come back. Those panels carry a "looks wrong? report it" line, since the shape is guessed. An endpoint that returns nothing usable stops being polled until you press <kbd>r</kbd>. A dead api key stops polling the same way, on any endpoint: the provider answered 401, so the Usage tab reads `api key rejected, re-enter it on the setup tab` (a `[ key rejected ]` chip beside cached numbers instead) and `clauth list` marks the account `(key rejected)`.
+Any other endpoint is scanned best-effort: clauth probes a short list of usage paths on the origin your key already authorizes, and renders whatever percentage, fraction-left window, or balance shapes come back. Those panels carry a "looks wrong? report it" line, since the shape is guessed. An endpoint that returns nothing usable is rescanned at most once every five minutes (or once per refresh interval, whichever is longer), and <kbd>r</kbd> forces a rescan immediately. A dead api key stops polling the same way, on any endpoint: the provider rejected it — a 401 on most endpoints, an in-band code inside an HTTP 200 on MiniMax — so the Usage tab reads `api key rejected, re-enter it on the setup tab` (a `[ key rejected ]` chip beside cached numbers instead) and `clauth list` marks the account `(key rejected)`.
 
 #### Where the keys come from
 
-For those four, `open provider console` in the TUI action menu ([Interface and keys](Interface-And-Keys#action-menus)) opens the page the account's key is minted on. The pages, if you would rather go directly:
+For those five, `open provider console` in the TUI action menu ([Interface and keys](Interface-And-Keys#action-menus)) opens the page the account's key is minted on. The pages, if you would rather go directly:
 
 | Endpoint | Page |
 |----------|------|
 | DeepSeek | <https://platform.deepseek.com/api_keys> |
 | Z.ai | <https://z.ai/manage-apikey/apikey-list> |
 | OpenRouter | <https://openrouter.ai/settings/keys> |
+| MiniMax | <https://platform.minimax.io/user-center/payment/token-plan> |
 | Alibaba Token Plan, international | <https://modelstudio.console.alibabacloud.com/ap-southeast-1?tab=plan#/efm/subscription/overview> |
 | Alibaba Token Plan, mainland China | <https://bailian.console.aliyun.com/cn-beijing?tab=plan#/efm/subscription/overview> |
 | Alibaba Coding Plan, international | <https://modelstudio.console.alibabacloud.com/ap-southeast-1/?tab=globalset#/efm/coding_plan> |
@@ -78,19 +80,20 @@ subagent = "claude-sonnet-4-5-20250929"   # CLAUDE_CODE_SUBAGENT_MODEL
 
 ## Presets
 
-A preset is a named `base_url` + `[models]` pair you can stamp onto any account from the Setup tab's <kbd>a</kbd> menu. Seven ship built in:
+A preset is a named `base_url` + `[models]` pair you can stamp onto any account from the Setup tab's <kbd>a</kbd> menu. Eight ship built in:
 
 | Preset | Endpoint |
 |---|---|
 | `DeepSeek` | `https://api.deepseek.com/anthropic` |
 | `Z.ai` | `https://api.z.ai/api/anthropic` |
 | `OpenRouter` | `https://openrouter.ai/api` |
+| `MiniMax` | `https://api.minimax.io/anthropic` |
 | `Qwen-TokenPlan-Intl` | `https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic` |
 | `Qwen-TokenPlan-CN` | `https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic` |
 | `Qwen-CodingPlan-Intl` | `https://coding-intl.dashscope.aliyuncs.com/apps/anthropic` |
 | `Qwen-CodingPlan-CN` | `https://coding.dashscope.aliyuncs.com/apps/anthropic` |
 
-`DeepSeek`, `Z.ai` and `OpenRouter` set the endpoint plus a base model, leaving the tier rows yours to pin afterwards. The four Alibaba ones fill every row instead, because those endpoints reject a Claude model id outright rather than serving something for it, so any alias left unpinned fails on use. All seven leave the api key alone; pick the region your plan was bought in, since a key issued for one is not accepted by the other. Once a preset is stamped on, `open provider console` in the same menu opens that endpoint's own key page ([above](Configuration#where-the-keys-come-from)).
+`DeepSeek`, `Z.ai`, `OpenRouter` and `MiniMax` set the endpoint plus a base model, leaving the tier rows yours to pin afterwards. The four Alibaba ones fill every row instead, because those endpoints reject a Claude model id outright rather than serving something for it, so any alias left unpinned fails on use. All eight leave the api key alone; pick the region your plan was bought in, since a key issued for one is not accepted by the other. Once a preset is stamped on, `open provider console` in the same menu opens that endpoint's own key page ([above](Configuration#where-the-keys-come-from)).
 
 `save as preset` stores the focused account's own endpoint and models under a name you type, in `~/.clauth/presets/<name>.json`:
 
@@ -110,7 +113,17 @@ auto_start = true    # per profile; older spelling kick_timer still reads
 
 clauth then sends a 1-token Haiku ping on launch and on each refresh tick while no window is running. On a cold start it fetches usage before the first ping, so it never fires over a window that might already be live. That costs a fraction of a cent and it is a real billed `/v1/messages` call under your own token. Default off, OAuth accounts only.
 
-If the messages limiter is blocking Claude Code, a live 5h window will not clear it. clauth re-tests with the same ping on the poll cadence and can rotate the chain around an account whose ping keeps getting rejected.
+If the messages limiter is blocking Claude Code, a live 5h window will not clear it. clauth re-tests with the same ping on the poll cadence and can rotate the chain around an account whose ping keeps getting rejected. The weekly (7d) window gets the same treatment at its own boundary: when an account's week was fully spent and its 7d window resets with the 5h window still live, clauth pings once to prove the account serves again, so the chain can return to it without waiting for a failed request.
+
+### Interleaving it across accounts
+
+With several accounts on `auto_start`, every window reopens the instant it lapses — so they stay in whatever phase they started in and all reset together, leaving you with everything at once and then nothing for five hours. `auto_start_queue` (off by default, Config tab `auto-start queue`) spaces them instead: a member may open a window only when no other member opened one in the last `5h / N`, so a freshly reset account comes within reach every `5h / N` — 2h30m with two accounts, 1h40m with three.
+
+The spacing is self-organising. Accounts that all lapse together are spread across the first cycle and stay spread, because every window is exactly five hours. Nothing needs configuring beyond turning `auto_start` on per account; `N` counts the accounts that can actually open a window, so a quarantined, kick-rejected or credential-less one does not hold a slot open.
+
+What it promises is **spacing of at least `5h / N`, converging on that figure** — not a reset on a fixed clock. After a lapse a member can wait up to `(N-1) x 5h / N` for its turn, and an account you actually use opens its window on demand regardless. With one account on `auto_start` nothing changes at all: the gap is the whole window, so that account still opens one the moment its last lapses.
+
+clauth keeps no file for the queue: it derives the last open from `usage_history.jsonl`, where a window it opened is recorded the moment the kick lands and one opened out of band shows up as a reset boundary the samples agree on. A single usage-cache snapshot cannot stand in. `/usage` reports an idle window's reset five hours out, identical to a window that just opened, and anchoring on that would wedge the queue shut. A restart can read a stretch of idle samples as a boundary; the queue then opens one window late and re-spaces itself on the next cycle.
 
 ## `profiles.toml`
 
@@ -120,7 +133,9 @@ If the messages limiter is blocking Claude Code, a live 5h window will not clear
 | `profiles` | list | `[]` | display order |
 | `fallback_chain` | list | `[]` | ordered chain members ([Auto-switch](Auto-Switch)) |
 | `refresh_interval_ms` | int | `90000` | usage poll cadence, 10 s to 1 h |
+| `context_nudge_threshold_tokens` | int | none | context-window nudge threshold in tokens, 50k to 2M |
 | `refresh_spent_accounts` | bool | `true` | keep polling accounts at 100% |
+| `auto_start_queue` | bool | `false` | interleave the `auto_start` ping so windows open `5h / N` apart |
 | `preemptive_rotation` | bool | `true` | rotate OAuth ahead of expiry; `false` waits for a rejection |
 | `weekly_switch_threshold` | float | `98.0` | chain-wide 7d exhaustion line, 50-100 |
 | `burn_aware_switching` | bool | `false` | project usage forward instead of comparing to the threshold |
@@ -144,6 +159,8 @@ If the messages limiter is blocking Claude Code, a live 5h window will not clear
 | `[herdr] border_label` | bool | `false` | publish `--display-agent "$profile"` so split-pane borders name the account; off clears the stale label |
 | `[herdr] delegate_dot` | bool | `true` | report `clauth_delegate=working\|idle` pane metadata during delegate runs |
 | `[herdr] delegate_row_text` | bool | `false` | append `$clauth_delegate` to the sidebar row `install` writes |
+
+A key clauth does not know (written by a newer release, or added by hand) is kept verbatim across every rewrite, under a `# keys preserved from the previous file` marker. Nothing a newer version of clauth wrote into these files is lost by running an older one beside it.
 
 ## `config.toml`
 
@@ -173,34 +190,55 @@ If the messages limiter is blocking Claude Code, a live 5h window will not clear
 ```
 ~/.clauth/
   profiles.toml            # everything in the table above
-  genai_price_cache.json  # genai-prices model prices for the cost lens
+  ai_pricelog_v4_price_cache.json  # ai-pricelog model prices for the cost lens
   status_cache.json        # status.claude.com incident feed
   status.json              # the daemon's published snapshot (see Daemon)
+  devices.json             # devices paired with the REST API: name, tier, a SHA-256 of each token (0600)
+  pairing.json             # the waiting pairing code's SHA-256 while `clauth devices pair` runs (0600)
+  tls.json                 # REST API certificate directory, written on the first `--listen` start
+  session_profiles.json    # which account each Claude Code session ran on
+  token_ledger.json        # the per-day token ledger behind the Tokens tab
   clauth.log, daemon.log   # event lines from the TUI and the daemon
+  clauthd.pid              # the running daemon's process id
   completions/             # generated shell completion scripts
+  .completions_installed   # marker: completions have been installed
+  conversations/<sid>[.<agent_id>].json  # the account a live conversation is on
   jobs/<id>.json           # backgrounded delegate jobs, GC'd after a day
+  live_bare/<pid>          # one marker per live bare `claude` session
   live_sessions/<sid>.json # one row per live `clauth start` session
+  presets/<name>.json      # endpoint + model presets you saved
+  rotation-locks/<name>.lock  # one OAuth-rotation lock per account
+  keychain-quarantine/     # macOS: raw bytes of a corrupted Keychain item, saved before clauth overwrites or deletes it
   profiles/
     work/
       config.toml          # everything in the table above
       credentials.json     # OAuth snapshot (.pending while a rotation is mid-write)
+      mcp-logins.json      # MCP-server logins parked while this profile stores no Claude login
       session-token.json   # long-lived setup-token login, when captured
       session-token.static.json # the mint a rolling token superseded, kept for the restore
       usage_cache.json     # last-known utilization and plan
       usage_history.jsonl  # 2 days of samples, feeding burn-aware switching
+      wallet_history.jsonl # 2 days of balance readings, feeding the wallet-burn rate
       third_party_cache.json
       third_party_auth.json# set while the usage login is expired; a hash, never the credential
       account_id.json      # which account this is, so a re-login can be told apart
       profile_fetched.json # when the plan tier was last read
       kick_block.json      # messages-limiter block state
       throughput_cache.json# observed delegate tokens/sec per model
+      touch-receipt.json   # what the last credential swap wrote, for the watchdog
+      quarantine/          # credentials parked after a refresh token was rejected
       runtime-<sid>/       # one CLAUDE_CONFIG_DIR tree per live session
       runtime-isolated-<sid>/
       sessions-<sid>/      # that session's PID file, flock-held while it runs
+
+~/.local/share/clauth/     # macOS ~/Library/Application Support/, Windows %APPDATA%
+  current@claude           # points at the version dir Claude Code registers
+  versions/<ver>-<hash>@claude/  # the bundled plugin: plugin.json, hooks/, marketplace.json
+  markers/<hash>           # the install record `clauth self-heal` keys on
 ```
 
-Lock files (`.lock`, `clauthd.lock`, `usage-fetch.lock`) sit alongside. Everything clauth owns is `0600`, every directory `0700`, re-tightened on each launch.
+Five static lock files sit alongside and are never deleted on purpose: `.lock`, `clauthd.lock`, `clauthd-standby.lock`, `usage-fetch.lock`, `conversations/.lock`. That is the whole tree: every path clauth writes is listed above, so a file you find here that is not is a leftover from an older version. Everything under `~/.clauth` is `0600`, every directory `0700`, re-tightened on each launch. The plugin tree is not: it carries no credentials and lands at your umask.
 
-Deleting any `*_cache.json`, `usage_history.jsonl`, `third_party_auth.json`, or `status.json` costs you history and nothing else. Deleting `credentials.json` or `session-token.json` signs that profile out.
+Deleting any `*_cache.json`, `third_party_auth.json`, or `status.json` costs you history and nothing else. Deleting `usage_history.jsonl` costs burn-aware switching its samples and the queue its anchor, so the queue re-spaces from scratch over the next cycle. Deleting `wallet_history.jsonl` costs the wallet-burn rate its series; the rate rebuilds from the next day of fetches. Deleting `credentials.json` or `session-token.json` signs that profile out.
 
-The `-<sid>` suffix appears only where the OS grants symlinks. Windows without symlink privilege builds the runtime tree by copying `~/.claude/`, so every session of one profile shares a single unsuffixed `runtime/` instead of paying for a copy each.
+The `-<sid>` suffix appears on every isolated session, and on a shared one wherever the OS grants symlinks. Where it does not (a home on exFAT, FAT32 or SMB, or Windows without the symlink privilege) clauth builds a shared runtime tree by copying `~/.claude/`, so every shared session of one profile lands on a single unsuffixed `runtime/` instead of paying for a copy each. An isolated session copies nothing from `~/.claude/`, so it keeps its own suffixed tree there too and its transcripts are rescued on its own exit rather than the last one out.

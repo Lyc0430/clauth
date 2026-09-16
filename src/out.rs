@@ -11,6 +11,9 @@
 //! [`outln!`] and [`out!`] are what the crate prints with, [`errln!`] is the
 //! stderr half; a bare `println!` or `eprintln!` under `src/` is the bug this
 //! module exists to stop, and a guard test fails on one.
+//! `platform::copy_to_clipboard_osc52` is the one sanctioned raw stdout
+//! writer, for the OSC 52 clipboard escape, which is a terminal command rather
+//! than a line of output.
 //!
 //! The two halves answer a closed reader differently. Stdout carries the
 //! payload, so a gone reader ends the run at exit 0. Stderr carries diagnostics
@@ -37,19 +40,15 @@ pub(crate) enum Wrote {
     ReaderGone,
 }
 
-/// Write one chunk, flushing when it carries no newline of its own.
-///
-/// Split out from [`emit`] so the `EPIPE` arm can be driven against a closed
-/// writer without the exit taking the test process with it. A write error that
-/// is not `EPIPE` — a full disk behind a redirect — still panics exactly as
-/// `println!` did, because that one IS this run failing; `sink` names the stream
-/// it was printing to.
-pub(crate) fn write_chunk<W: Write>(
+/// Write one chunk, flushing when it carries no newline of its own, and hand
+/// every outcome back to the caller: [`Wrote::Yes`], [`Wrote::ReaderGone`] for
+/// an `EPIPE`, or the write error itself. Never panics, so a caller that minted
+/// something it must roll back sees the error as a value it can act on first.
+pub(crate) fn write_chunk_result<W: Write>(
     w: &mut W,
     args: Arguments<'_>,
     newline: bool,
-    sink: &str,
-) -> Wrote {
+) -> Result<Wrote, std::io::Error> {
     let written = if newline {
         writeln!(w, "{args}")
     } else {
@@ -58,8 +57,27 @@ pub(crate) fn write_chunk<W: Write>(
         write!(w, "{args}").and_then(|()| w.flush())
     };
     match written {
-        Ok(()) => Wrote::Yes,
-        Err(e) if e.kind() == ErrorKind::BrokenPipe => Wrote::ReaderGone,
+        Ok(()) => Ok(Wrote::Yes),
+        Err(e) if e.kind() == ErrorKind::BrokenPipe => Ok(Wrote::ReaderGone),
+        Err(e) => Err(e),
+    }
+}
+
+/// [`write_chunk_result`] with the panic contract the emitters want: a write
+/// error that is not `EPIPE` — a full disk behind a redirect — panics exactly
+/// as `println!` did, because for them that one IS this run failing; `sink`
+/// names the stream it was printing to.
+///
+/// Split out from [`emit`] so the `EPIPE` arm can be driven against a closed
+/// writer without the exit taking the test process with it.
+pub(crate) fn write_chunk<W: Write>(
+    w: &mut W,
+    args: Arguments<'_>,
+    newline: bool,
+    sink: &str,
+) -> Wrote {
+    match write_chunk_result(w, args, newline) {
+        Ok(wrote) => wrote,
         Err(e) => panic!("failed printing to {sink}: {e}"),
     }
 }

@@ -20,15 +20,17 @@ The figures cover **every account sharing this machine's home directory**, since
 
 Older days from Claude Code's rollup carry a combined in/out total with no cache split. A period that reaches back into those days shows a floor rather than an exact figure, marked with a badge, and cost renders as `$X+`.
 
+Some third-party endpoints report usage in an OpenAI-shaped way: the full prompt (cached prefix included) lands in `input`, and cache writes are never reported. clauth detects that shape from the usage rows themselves, subtracts the double-counted prefix, and prices the corrected figure. A model detail marked `cache write not reported` comes from such an endpoint — the write metric is absent there, so it stays 0 rather than being invented.
+
 ## Cost
 
 The cost figure is what your recorded usage **would cost on the pay-as-you-go API**. Nobody is billing you that: it is the value of what a subscription covered.
 
-It is computed per model, never off a blended rate, and it prices the four token classes separately: input, output, cache reads, cache writes. The <kbd>c</kbd> toggle changes whether cache tokens count toward the token *totals*; cost always counts them.
+It is computed per model, never off a blended rate, and it prices the four token classes separately: input, output, cache reads, cache writes. The <kbd>c</kbd> toggle changes whether cache tokens count toward the token *totals*; cost always counts them. A model id ending in `-free` or `:free` — a reseller's free variant — prices at zero rather than showing as unpriced.
 
-Prices come from pydantic's genai-prices v2 public dataset, fetched daily and cached at `~/.clauth/genai_price_cache.json`. clauth loads the cache first so the tab paints instantly and works offline. A model with no matching rate contributes nothing to cost, renders as a faint dash, and puts the surrounding totals on a `$X+` floor; a first launch whose fetch fails before any rates are cached reads `rates unavailable` on the cost figure instead of a blank dash.
+Prices come from the ai-pricelog public index, fetched daily. clauth keeps a distilled copy of it at `~/.clauth/ai_pricelog_v4_price_cache.json` and loads that before fetching, so the tab paints instantly and works offline. A model with no matching rate contributes nothing to cost: it renders as a faint dash, and the surrounding totals get a `$X+` floor. A first launch whose fetch fails before any rates are cached reads `rates unavailable` on the cost figure.
 
-Rates are dated snapshots, and a feed-carried peak/off-peak window prices each recorded hour at the rate live at that date and hour. Hours only exist from the hourly ledger onward, so past days recorded before it price flat at their day's hour-0 tier. The days from Claude Code's own rollup keep that flat rate permanently; ledger days get their hours backfilled once from the stored transcripts (visible one refresh later; a day the transcripts no longer fully cover keeps the flat rate). The lifetime card prices everything at today's rate.
+Rates are dated snapshots, and a feed-carried peak/off-peak window prices each recorded hour at the rate live at that date and hour. The same windows drive the live peak indicator: a `▲` on an Overview row and a `pricing` row on the Usage tab while the account's provider is inside a peak window. The indicator is provider-bound: it follows the provider's own schedule, never which models the profile pins, and an account on an endpoint clauth doesn't recognize shows none. Hours only exist from the hourly ledger onward, so past days recorded before it price flat at their day's hour-0 tier. The days from Claude Code's own rollup keep that flat rate permanently; ledger days get their hours backfilled once from the stored transcripts (visible one refresh later; a day the transcripts no longer fully cover keeps the flat rate). The lifetime card prices everything at today's rate.
 
 ## Model grouping
 

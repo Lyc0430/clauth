@@ -12,6 +12,7 @@ mod fallback;
 mod format;
 mod harness;
 mod herdr;
+mod hook_context;
 mod hook_note;
 mod jobs_cli;
 mod jsonsync;
@@ -125,19 +126,57 @@ impl std::fmt::Display for UsageError {
 
 impl std::error::Error for UsageError {}
 
+/// The bare-invocation help was already printed to stderr (clap's
+/// missing-subcommand convention); [`exit_code`] maps it to the usage code
+/// with no extra `Error:` line, since the help IS the message.
+#[derive(Debug)]
+struct HelpRendered;
+
+impl std::fmt::Display for HelpRendered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("help printed on stderr (bare clauth with piped stdout)")
+    }
+}
+
+impl std::error::Error for HelpRendered {}
+
+/// A run a signal ended once its command had cleaned up after itself (`clauth
+/// devices pair` withdrawing its code). [`exit_code`] answers the shell's
+/// `128 + signal` with no `Error:` line, since the command already said what
+/// it did.
+#[derive(Debug)]
+pub(crate) struct Interrupted(pub(crate) i32);
+
+impl std::fmt::Display for Interrupted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "interrupted by signal {}", self.0)
+    }
+}
+
+impl std::error::Error for Interrupted {}
+
 /// Build a [`UsageError`] as an `anyhow::Error` for a dispatch arm to return.
 fn usage_error(msg: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(UsageError(msg.into()))
 }
 
 /// Map a dispatch outcome to a process exit code: 0 on success, 2 for a
-/// [`UsageError`] (bad flag/args), 1 for any other failure. Prints the error
-/// exactly as anyhow's `Result` `Termination` did (`Error: {:?}`), so the
-/// message surface is unchanged now that `main` maps the code itself.
+/// [`UsageError`] (bad flag/args) or an already-printed [`HelpRendered`],
+/// `128 + signal` for an [`Interrupted`] run, 1 for any other failure. Prints
+/// the error exactly as anyhow's `Result` `Termination` did (`Error: {:?}`) —
+/// except the [`HelpRendered`] and [`Interrupted`] arms, whose commands already
+/// said what happened on stderr — so the message surface is unchanged now that
+/// `main` maps the code itself.
 pub(crate) fn exit_code(result: Result<()>) -> i32 {
     match result {
         Ok(()) => 0,
         Err(e) => {
+            if e.downcast_ref::<HelpRendered>().is_some() {
+                return 2;
+            }
+            if let Some(Interrupted(signal)) = e.downcast_ref::<Interrupted>() {
+                return 128 + signal;
+            }
             // `errln!`, so a reader that walked away from `2>&1 | head` still
             // gets this code rather than the 101 `eprintln!` panicked with.
             errln!("Error: {e:?}");
@@ -159,12 +198,23 @@ fn dispatch(cli: Cli) -> Result<()> {
     });
 
     let Some(command) = cli.command else {
-        return cmd_tui(theme_override);
+        use std::io::IsTerminal as _;
+        if std::io::stdout().is_terminal() {
+            return cmd_tui(theme_override);
+        }
+        return cmd_bare_help();
     };
 
     match command {
-        Command::Start(a) => cmd_start(&a.profile, &a.claude_args, a.isolation(), a.with_fallback),
+        Command::Start(a) => cmd_start(
+            &a.target(),
+            &a.passthrough(),
+            a.isolation(),
+            a.with_fallback,
+            a.explain,
+        ),
         Command::Login(a) => cmd_login(a),
+        Command::Capture { profile } => cmd_capture(&profile),
         Command::Delete {
             profile,
             yes,
@@ -196,9 +246,21 @@ fn dispatch(cli: Cli) -> Result<()> {
             standby,
             replace,
             status,
+            listen,
+            cert,
+            key,
             // The default's explicit spelling: nothing to branch on.
             no_standby: _,
-        } => cmd_daemon(standby, replace, status),
+            dump_openapi,
+        } => cmd_daemon(
+            standby,
+            replace,
+            status,
+            listen,
+            daemon::api::tls::CertSource::from_flags(cert, key),
+            dump_openapi,
+        ),
+        Command::Devices { json, cmd } => cmd_devices(json, cmd),
         Command::Status {
             json: _,
             all,
@@ -221,15 +283,60 @@ fn dispatch(cli: Cli) -> Result<()> {
     }
 }
 
-fn cmd_daemon(standby: bool, replace: bool, status: bool) -> Result<()> {
+fn cmd_daemon(
+    standby: bool,
+    replace: bool,
+    status: bool,
+    listen: Option<std::net::SocketAddr>,
+    certs: daemon::api::tls::CertSource,
+    dump_openapi: bool,
+) -> Result<()> {
+    // The dump arm is first: it must return before any listener, certificate
+    // read, singleton claim or home access, so CI can pin the spec without a
+    // daemon.
+    if dump_openapi {
+        let mut stdout = std::io::stdout().lock();
+        return write_openapi_document(&mut stdout);
+    }
     if status {
         daemon::status_probe()
     } else if replace {
-        daemon::serve(daemon::StartMode::Replace)
+        daemon::serve(daemon::StartMode::Replace, listen, &certs)
     } else if standby {
-        daemon::serve(daemon::StartMode::Standby)
+        daemon::serve(daemon::StartMode::Standby, listen, &certs)
     } else {
-        daemon::serve(daemon::StartMode::ExitIfRunning)
+        daemon::serve(daemon::StartMode::ExitIfRunning, listen, &certs)
+    }
+}
+
+/// Write the OpenAPI document verbatim to `writer` — the exact bytes
+/// `GET /api/v1/openapi.json` serves, with no trailing newline or framing.
+/// Split out from [`cmd_daemon`] so the byte-for-byte contract is unit-testable
+/// without capturing stdout.
+fn write_openapi_document<W: std::io::Write>(writer: &mut W) -> Result<()> {
+    let document = daemon::api::routes::openapi_document_bytes().map_err(anyhow::Error::msg)?;
+    // The serializer always emits UTF-8; the check keeps the byte contract exact
+    // instead of a lossy conversion that could drop a byte.
+    let text = String::from_utf8(document).map_err(anyhow::Error::msg)?;
+    match crate::out::write_chunk(writer, format_args!("{text}"), false, "stdout") {
+        crate::out::Wrote::Yes => Ok(()),
+        // A reader that left ends the dump at Ok, exit 0 at the real entry: the
+        // pipeline reported what the reader returned, not this run failing.
+        crate::out::Wrote::ReaderGone => Ok(()),
+    }
+}
+
+/// `clauth devices`: bare lists; `pair`, `add` and `revoke` change the list.
+fn cmd_devices(json: bool, cmd: Option<cli::DevicesCommand>) -> Result<()> {
+    match cmd {
+        None => daemon::api::devices::run_list(json),
+        Some(cli::DevicesCommand::Pair { name, control }) => {
+            daemon::api::pairing::run_pair(&name, control)
+        }
+        Some(cli::DevicesCommand::Add { name, control }) => {
+            daemon::api::devices::run_add(&name, control)
+        }
+        Some(cli::DevicesCommand::Revoke { name }) => daemon::api::devices::run_revoke(&name),
     }
 }
 
@@ -296,29 +403,82 @@ fn cmd_completions(target: &str, shell: Option<&str>) -> Result<()> {
     completions::print_script(target)
 }
 
-fn cmd_start(name: &str, rest: &[String], isolation: Isolation, follows_chain: bool) -> Result<()> {
+fn cmd_start(
+    target: &cli::StartTarget,
+    rest: &[String],
+    isolation: Isolation,
+    follows_chain: bool,
+    explain_only: bool,
+) -> Result<()> {
     platform::init();
     runtime::gc_stale_runtimes();
     let config = load_config()?;
-    let Some(canonical) = config.canonical_name(name) else {
-        // Not a claude name — a codex profile starts an interactive `codex`
-        // in its own clauth-built home. The claude-only flags refuse by name
-        // rather than silently not doing what they promise.
-        if let Some(canonical) = codex_profiles::CodexState::load()?.canonical_name(name) {
-            if follows_chain {
-                anyhow::bail!(
-                    "--with-fallback is not available on a codex profile: codex reads \
-                     auth.json once at start, so a chain lands at the NEXT start, not \
-                     mid-session — start without the flag"
-                );
-            }
-            return start::run_codex(&config, &canonical, rest, isolation);
+
+    let (name, rows, pick, demand) = match target {
+        cli::StartTarget::Named(raw) => {
+            let Some(canonical) = config.canonical_name(raw) else {
+                // Not a claude name — a codex profile starts an interactive `codex`
+                // in its own clauth-built home. The claude-only flags refuse by name
+                // rather than silently not doing what they promise.
+                if let Some(canonical) = codex_profiles::CodexState::load()?.canonical_name(raw) {
+                    if follows_chain {
+                        anyhow::bail!(
+                            "--with-fallback is not available on a codex profile: codex reads \
+                             auth.json once at start, so a chain lands at the NEXT start, not \
+                             mid-session — start without the flag"
+                        );
+                    }
+                    if explain_only {
+                        outln!("{}", format::start_pick_line(&canonical, &[]));
+                        return Ok(());
+                    }
+                    return start::run_codex(&config, &canonical, rest, isolation);
+                }
+                return Err(unknown_profile_error(&config, raw));
+            };
+            (ProfileName::from(canonical), Vec::new(), None, Vec::new())
         }
-        return Err(unknown_profile_error(&config, name));
+        cli::StartTarget::Auto => {
+            anyhow::ensure!(
+                !config.state.fallback_chain.is_empty(),
+                "--auto picks from the fallback chain and it is empty; add accounts on the \
+                 fallback tab, or name one"
+            );
+            let demand = fallback::demand_from(start::launch_models(rest));
+            let families = (!demand.is_empty()).then_some(demand.as_slice());
+            let (rows, pick) = fallback::start_walk(&config, families, follows_chain);
+            let Some(pick) = pick else {
+                anyhow::bail!("{}", format::start_refusal(&demand, &rows));
+            };
+            (rows[pick].name.clone(), rows, Some(pick), demand)
+        }
     };
-    let canonical = ProfileName::from(canonical);
-    refuse_if_disabled(&config, &canonical)?;
-    start::run(&config, &canonical, rest, isolation, None, follows_chain)
+
+    if explain_only {
+        // Run the same refusals a real launch runs, so `--explain` answers what
+        // a start would do rather than naming a target it would then reject.
+        start::admit(&config, &name, isolation, follows_chain)?;
+        outln!("{}", format::start_pick_line(name.as_str(), &demand));
+        if !rows.is_empty() {
+            outln!("{}", format::render_start_walk(&rows, pick));
+        }
+        return Ok(());
+    }
+
+    let announce = match target {
+        cli::StartTarget::Auto => Some(format::start_launch_line(name.as_str(), &demand)),
+        cli::StartTarget::Named(_) => None,
+    };
+
+    start::run(
+        &config,
+        &name,
+        rest,
+        isolation,
+        None,
+        follows_chain,
+        announce.as_deref(),
+    )
 }
 
 /// Where `clauth login <name>` lands. An EXISTING profile (matched
@@ -361,16 +521,26 @@ fn reauth_confirmed(input: &str) -> bool {
 /// Prompt `[y/N]` before a reauth overwrites a profile's stored credentials.
 /// Non-TTY stdin proceeds (a piped script can't be prompted), matching the
 /// OAuth reauth contract. `is_api` tailors the copy (endpoint + key vs tokens).
-fn confirm_reauth(target: &str, is_api: bool) -> Result<bool> {
+/// What the reauth confirm says it REPLACES. Split out so the survivor clause
+/// is unit-pinned: it is the only affirmative promise the prompt makes, and it
+/// is true only where the preserve arm actually fires
+/// (`actions::overwrite_captured_profile`) — an api-mode login replaces the
+/// endpoint set outright, and a profile with nothing to preserve must not be
+/// told something survives.
+fn reauth_confirm_object(is_api: bool, keeps_endpoint: bool) -> &'static str {
+    match (is_api, keeps_endpoint) {
+        (true, _) => "endpoint + API key",
+        (false, true) => "stored subscription login, keeping its endpoint and api key",
+        (false, false) => "stored credentials",
+    }
+}
+
+fn confirm_reauth(target: &str, is_api: bool, keeps_endpoint: bool) -> Result<bool> {
     use std::io::IsTerminal as _;
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Ok(true);
     }
-    let object = if is_api {
-        "endpoint + API key"
-    } else {
-        "stored credentials"
-    };
+    let object = reauth_confirm_object(is_api, keeps_endpoint);
     out!(
         "clauth: profile '{target}' already exists. Re-authenticating replaces its {object}. Continue? [y/N] "
     );
@@ -381,15 +551,16 @@ fn confirm_reauth(target: &str, is_api: bool) -> Result<bool> {
 
 /// Collect the base_url + api_key pair for API-key mode. Each value comes from
 /// its `--flag` when given; otherwise a prompt: base_url on a normal echo'ing
-/// line, api_key echo-off (it's a secret). A non-TTY stdin that still owes a
-/// value bails — a script must pass both flags explicitly.
+/// line, api_key echo-off (it's a secret). `interactive` is the caller's
+/// decision (its stdin is a terminal), never re-read here: the arms key on the
+/// parameter alone, so the routing is pin-able under any runner. A
+/// non-interactive call that still owes a value bails — a script must pass
+/// both flags explicitly.
 fn collect_api_endpoint(
     base_url: Option<&str>,
     api_key: Option<&str>,
+    interactive: bool,
 ) -> Result<(Option<String>, Option<String>)> {
-    use std::io::IsTerminal as _;
-    let interactive = std::io::stdin().is_terminal();
-
     let base_url = match base_url {
         // A flag value gets the same trim + empty-reject as the prompt, so
         // `--base-url ""` or a space-padded value can't slip through unvalidated.
@@ -445,27 +616,290 @@ fn collect_api_endpoint(
     Ok((base_url, api_key))
 }
 
-/// Run the browser OAuth flow (preamble, authorize-URL paste fallback, minted
-/// tokens, login summary, identity-anchor seed) and wrap it in a capture
-/// snapshot. Shared by `cmd_login`'s new and reauth OAuth arms so the two stay
-/// in lockstep.
-fn run_oauth_browser(reauth: bool, target: &str) -> Result<actions::CaptureSnapshot> {
+/// The base_url for an api-mode reauth, decided before any prompt so the
+/// TTY-vs-headless routing is unit-pinned without touching stdin: the flag
+/// wins as typed (an empty one passes through — `collect_api_endpoint` rejects
+/// it), a TTY with no flag keeps the prompt (`None`), a non-TTY reuses the
+/// stored endpoint (owner ruling), and a non-TTY with nothing stored bails
+/// through `collect_api_endpoint`'s non-interactive refusal.
+fn resolve_reauth_base_url(
+    flag: Option<&str>,
+    stored: Option<&crate::profile::Profile>,
+    tty: bool,
+) -> Option<String> {
+    match (flag, tty) {
+        (Some(flag), _) => Some(flag.to_string()),
+        (None, true) => None,
+        (None, false) => stored.and_then(|p| p.base_url.clone()),
+    }
+}
+
+/// The reauth snapshot for api mode. Carries the STORED OAuth chain when the
+/// profile has one: `overwrite_captured_profile` replaces credentials with
+/// exactly what the snapshot holds, so a credentials-less snapshot here would
+/// silently drop the chain `rolling-token` and usage polling roll from (owner
+/// ruling). Keyed on api-mode reauth alone — every other credentials-less
+/// snapshot keeps replacing (a third-party recapture is a deliberate
+/// sign-out). `account_uuid` stays `None`: an api-key login proves no
+/// Anthropic identity, and seeding `None` leaves the existing anchor alone.
+fn api_reauth_snapshot(
+    base_url: Option<String>,
+    api_key: Option<String>,
+    stored: Option<&crate::profile::Profile>,
+) -> actions::CaptureSnapshot {
+    actions::CaptureSnapshot {
+        credentials: stored.and_then(|p| p.credentials.as_ref().cloned()),
+        base_url,
+        api_key,
+        account_uuid: None,
+    }
+}
+
+/// The is_api reauth arm in one call: resolve the endpoint
+/// ([`resolve_reauth_base_url`]), run the same validate/trim
+/// [`collect_api_endpoint`] every api capture takes (called, never re-spelled),
+/// then build the chain-carrying snapshot ([`api_reauth_snapshot`]). The
+/// composition lives here so the arm itself holds no wiring a bad edit could
+/// silently miscompose. Interactivity is this helper's own `tty` param, passed
+/// through to `collect_api_endpoint`, so the pins drive the `interactive =
+/// false` arms under ANY runner stdin. The `interactive = true` arms (prompt,
+/// read stdin) are pinned at the router level only
+/// ([`resolve_reauth_base_url`]) — driving them here would hang the suite.
+fn collect_api_reauth_snapshot(
+    flag: Option<&str>,
+    key_flag: Option<&str>,
+    stored: Option<&crate::profile::Profile>,
+    tty: bool,
+) -> Result<actions::CaptureSnapshot> {
+    let base_url = resolve_reauth_base_url(flag, stored, tty);
+    let (base_url, api_key) = collect_api_endpoint(base_url.as_deref(), key_flag, tty)?;
+    Ok(api_reauth_snapshot(base_url, api_key, stored))
+}
+
+/// One line of pasted `code#state` from a non-TTY stdin, for a driver that
+/// read the link off stdout and feeds the code back to the SAME process (the
+/// code is bound to this process's PKCE verifier). Reads through a `take` so
+/// at most `MANUAL_CODE_MAX + 3` bytes are ever buffered (the cap, a CRLF,
+/// and one byte to tell "exactly the cap" from "over it"): a longer line with
+/// no newline is refused before it is held, not after. The cap is judged on
+/// the line minus its terminator, so a code of exactly the cap still passes.
+/// A line ended by EOF is as good as one ended by `\n` (the driver may close
+/// stdin after writing). An EOF or a blank line is `Ok(None)`: nobody is there
+/// to answer, so the browser door keeps waiting.
+fn read_manual_code_from(reader: impl std::io::BufRead) -> Result<Option<String>> {
+    use std::io::BufRead as _;
+    let cap = oauth_login::MANUAL_CODE_MAX;
+    let mut line = String::new();
+    reader.take(cap as u64 + 3).read_line(&mut line)?;
+    if line.trim_end_matches(['\r', '\n']).len() > cap {
+        anyhow::bail!("{}", oauth_login::ManualCodeError::TooLong.message());
+    }
+    if line.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(line))
+}
+
+/// One keystroke of the paste prompt's raw-mode loop, decided without a
+/// terminal: the loop calls this, the tests drive it. A `Char` appends unless
+/// the buffer is already at the cap (the overflow is dropped, never echoed);
+/// `Backspace` pops; `Enter` submits; `Esc` or ctrl-`c` cancels. Only a
+/// `Press` counts — Windows delivers release events too.
+enum PasteKey {
+    Continue,
+    Submit,
+    Cancel,
+}
+
+fn feed_paste_key(buffer: &mut String, key: ratatui::crossterm::event::KeyEvent) -> PasteKey {
+    use ratatui::crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+    if key.kind != KeyEventKind::Press {
+        return PasteKey::Continue;
+    }
+    match key.code {
+        KeyCode::Enter => PasteKey::Submit,
+        KeyCode::Esc => PasteKey::Cancel,
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => PasteKey::Cancel,
+        KeyCode::Char(c) => {
+            if buffer.len() < oauth_login::MANUAL_CODE_MAX {
+                buffer.push(c);
+            }
+            PasteKey::Continue
+        }
+        KeyCode::Backspace => {
+            buffer.pop();
+            PasteKey::Continue
+        }
+        _ => PasteKey::Continue,
+    }
+}
+
+/// Re-enters cooked mode on every exit from the paste loop, an early `?` included.
+struct RawModeGuard;
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = ratatui::crossterm::terminal::disable_raw_mode();
+    }
+}
+
+/// Why the paste loop stopped: a submit, a cancel, or the worker no longer
+/// needing a code (the other door landed first, or it gave up with none).
+enum TtyExit {
+    Submit,
+    Cancel,
+    WorkerDone,
+}
+
+/// Between keystrokes the paste loop asks the progress channel whether the
+/// worker still wants a code. A landed door (`ExchangingCode`, whichever door)
+/// ends the prompt; so does a worker that returned with none (`Disconnected`:
+/// the login timeout, a declined or state-mismatched callback, an accept
+/// error), or the prompt would outlive the login and hide its error behind
+/// `login canceled`. `outcome_rx` then says which it was.
+fn worker_done(
+    progress: std::result::Result<oauth_login::LoginProgress, std::sync::mpsc::TryRecvError>,
+) -> bool {
+    use std::sync::mpsc::TryRecvError;
+    match progress {
+        Ok(oauth_login::LoginProgress::ExchangingCode(_)) | Err(TryRecvError::Disconnected) => true,
+        Ok(oauth_login::LoginProgress::Verifying) | Err(TryRecvError::Empty) => false,
+    }
+}
+
+/// Feed the paste door from a TTY: echo-off, no line buffering, and a 100 ms
+/// poll so the worker can end the wait ([`worker_done`]). A bad paste prints
+/// the canned refusal and re-prompts against the same login; a submit sends
+/// the code; a cancel bails.
+fn feed_paste_tty(
+    links: &oauth_login::LoginLinks,
+    paste_tx: &std::sync::mpsc::Sender<oauth_login::ManualCode>,
+    progress_rx: &std::sync::mpsc::Receiver<oauth_login::LoginProgress>,
+) -> Result<()> {
+    use ratatui::crossterm::event::{Event, poll, read};
+    use ratatui::crossterm::terminal::enable_raw_mode;
+    use std::time::Duration;
+
+    let mut buffer = String::new();
+    loop {
+        out!("Paste code here if prompted: ");
+        let exit = {
+            let _guard = RawModeGuard;
+            enable_raw_mode().map_err(|e| anyhow::anyhow!("failed to read the code: {e}"))?;
+            loop {
+                if poll(Duration::from_millis(100))
+                    .map_err(|e| anyhow::anyhow!("failed to read the code: {e}"))?
+                    && let Event::Key(key) =
+                        read().map_err(|e| anyhow::anyhow!("failed to read the code: {e}"))?
+                {
+                    match feed_paste_key(&mut buffer, key) {
+                        PasteKey::Submit => break TtyExit::Submit,
+                        PasteKey::Cancel => break TtyExit::Cancel,
+                        PasteKey::Continue => {}
+                    }
+                }
+                if worker_done(progress_rx.try_recv()) {
+                    break TtyExit::WorkerDone;
+                }
+            }
+        };
+        // Raw mode does not translate `\n`; print nothing else while it is on.
+        outln!("");
+        match exit {
+            TtyExit::Submit => match links.parse(&buffer) {
+                Ok(code) => {
+                    // A late paste is never read (`run` already picked its
+                    // door), so the send's result is discarded; the outcome
+                    // channel carries the result.
+                    let _ = paste_tx.send(code);
+                    return Ok(());
+                }
+                Err(e) => {
+                    errln!("clauth: {}. Try again.", e.message());
+                    buffer.clear();
+                }
+            },
+            TtyExit::Cancel => anyhow::bail!("login canceled"),
+            TtyExit::WorkerDone => return Ok(()),
+        }
+    }
+}
+
+/// Feed the paste door from a piped stdin: no prompt, no raw mode, one line.
+/// The reader owns the paste sender, so EOF, a blank line, or a bad paste
+/// closes only the paste door and the browser door keeps waiting.
+fn feed_paste_piped(
+    links: oauth_login::LoginLinks,
+    paste_tx: std::sync::mpsc::Sender<oauth_login::ManualCode>,
+) {
+    let _ = std::thread::spawn(
+        move || match read_manual_code_from(std::io::stdin().lock()) {
+            Ok(Some(line)) => match links.parse(&line) {
+                Ok(code) => {
+                    let _ = paste_tx.send(code);
+                }
+                Err(e) => errln!("clauth: {}", e.message()),
+            },
+            Ok(None) => {}
+            Err(e) => errln!("clauth: {e}"),
+        },
+    );
+}
+
+/// The one "browser didn't open" line every CLI login prints under its
+/// preamble, so the OAuth login and the Alibaba console capture cannot drift
+/// into two spellings of it again.
+fn print_browser_fallback(url: &str) {
+    outln!("\nBrowser didn't open? Use the url below to sign in\n{url}\n");
+}
+
+/// Run an OAuth login (preamble, the links, minted tokens, login summary,
+/// identity-anchor seed) and wrap it in a capture snapshot. One flow, two
+/// doors: the browser opens as today, the hosted link is printed under the
+/// fallback line, and a pasted `code#state` competes with the loopback
+/// callback — whichever lands first wins. Shared by `cmd_login`'s new and
+/// reauth OAuth arms so the two stay in lockstep.
+fn run_oauth(reauth: bool, target: &str) -> Result<actions::CaptureSnapshot> {
+    use std::io::IsTerminal as _;
+
+    // CLI stderr: name the HTTP status too. This lands on the `errln!`
+    // backstop below, a terminal with no companion log open, and a fresh login
+    // failing on a 400 is the case that ruling exists for.
+    let cli_err = |e: oauth_login::LoginError| anyhow::anyhow!("{}", e.cli_message());
     if reauth {
         outln!("clauth: re-authenticating existing profile '{target}', opening a browser…");
     } else {
         outln!("clauth: opening a browser to log in to a new account for '{target}'…");
     }
-    let outcome = oauth_login::login_with(|progress| {
-        // The CLI surfaces only the paste-fallback URL; the later milestones
-        // are TUI-modal fodder and would just be noise between the prints here.
-        if let oauth_login::LoginProgress::AuthorizeUrl(url) = progress {
-            outln!("\nIf the browser didn't open, visit this URL to authorize:\n{url}\n");
-        }
-    })
-    // CLI stderr: name the HTTP status too. This lands on the `errln!`
-    // backstop below, a terminal with no companion log open, and a fresh login
-    // failing on a 400 is the case that ruling exists for.
-    .map_err(|e| anyhow::anyhow!("{}", e.cli_message()))?;
+    let pending = oauth_login::begin_login().map_err(cli_err)?;
+    let links = pending.links().clone();
+    print_browser_fallback(&links.hosted_url);
+    let _ = crate::platform::open_url(&links.browser_url);
+
+    let (paste_tx, paste_rx) = std::sync::mpsc::channel::<oauth_login::ManualCode>();
+    let (outcome_tx, outcome_rx) =
+        std::sync::mpsc::channel::<Result<oauth_login::LoginOutcome, oauth_login::LoginError>>();
+    let (progress_tx, progress_rx) = std::sync::mpsc::channel::<oauth_login::LoginProgress>();
+
+    // The listener and the exchange run off the main thread; the paste loop
+    // below owns the main thread and only learns a door landed via `progress`.
+    std::thread::spawn(move || {
+        let progress = move |p| {
+            let _ = progress_tx.send(p);
+        };
+        let _ = outcome_tx.send(pending.run(paste_rx, progress));
+    });
+
+    if std::io::stdin().is_terminal() {
+        feed_paste_tty(&links, &paste_tx, &progress_rx)?;
+    } else {
+        feed_paste_piped(links, paste_tx);
+    }
+
+    let outcome = outcome_rx
+        .recv()
+        .map_err(|_| anyhow::anyhow!("the login worker ended without a result"))?
+        .map_err(cli_err)?;
     outln!(
         "clauth: login complete.\n{}",
         oauth_login::login_summary(&outcome.credentials)
@@ -489,17 +923,25 @@ fn run_oauth_browser(reauth: bool, target: &str) -> Result<actions::CaptureSnaps
 /// OAuth flow (`oauth_login`) and writes the minted tokens straight into the
 /// profile's `.credentials.json`, identically on every platform; passing either
 /// endpoint flag switches to API-key mode and captures a base_url + api_key pair
-/// instead, prompting (echo-off for the key) for whatever a flag omitted.
+/// instead, prompting (echo-off for the key) for whatever a flag omitted. On a
+/// reauth, a non-TTY stdin cannot answer the endpoint prompt, so `--api-key`
+/// without `--base-url` reuses the stored endpoint; a TTY keeps the prompt.
 ///
 /// A NEW name captures into a fresh profile; an EXISTING name routes through
 /// [`actions::overwrite_captured_profile`] — the fresh credential set (tokens OR
 /// endpoint + key) replaces the old in place (chain slot, env, and model
 /// settings survive; stale per-account fetch caches are dropped; when it is the
 /// ACTIVE profile the live link is re-run so a running `claude` picks the new
-/// login up). A reauth that crosses types (OAuth ↔ API) is allowed: the
-/// snapshot overwrites all three of credentials/base_url/api_key, so the old
-/// type's leftovers are cleared. Neither path switches to the profile (`clauth
-/// <name>` does that). `--model` is persisted onto the profile after capture.
+/// login up). A reauth that crosses types (OAuth ↔ API) is allowed, with two
+/// preserves: a browser reauth onto a profile with a stored endpoint and
+/// working inference auth keeps the endpoint + key the snapshot omits, whether
+/// or not clauth recognises the provider (see
+/// [`actions::overwrite_captured_profile`]), and an api-mode reauth keeps the
+/// stored OAuth chain (the credential usage polling and `rolling-token` roll
+/// from) by carrying it in the snapshot, which
+/// [`actions::overwrite_captured_profile`] then writes back unchanged. Neither
+/// path switches to the profile (`clauth <name>` does that). `--model` is
+/// persisted onto the profile after capture.
 /// Tokens are never printed — only a sha256 prefix.
 fn cmd_login(args: LoginArgs) -> Result<()> {
     platform::init();
@@ -546,33 +988,36 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
     // and NOTHING else. Not the api key: the callback returns a workspace key
     // for a different product, and `actions::store_console_login` exists to
     // keep it off the profile.
-    if !is_api
-        && reauth
-        && config.find(&target).and_then(|p| p.provider) == Some(providers::Provider::Alibaba)
-    {
+    let is_alibaba = reauth
+        && config.find(&target).and_then(|p| p.provider) == Some(providers::Provider::Alibaba);
+    if !is_api && is_alibaba {
         return cmd_login_console(&mut config, &target, args.model.as_deref());
     }
 
     // Confirm a reauth BEFORE collecting anything (browser or key prompt): a
     // declined overwrite must not open a browser or read a secret.
-    if reauth && !confirm_reauth(&target, is_api)? {
+    // The preserve arm's own predicate, called rather than re-spelled: only a
+    // profile that has an endpoint AND something to authenticate with keeps
+    // them through a browser reauth, so only that one is told so.
+    let keeps_endpoint = config
+        .find(&target)
+        .is_some_and(claude::has_own_inference_endpoint);
+    if reauth && !confirm_reauth(&target, is_api, keeps_endpoint)? {
         outln!("clauth: aborted. '{target}' left unchanged.");
         return Ok(());
     }
 
     if reauth {
         let snapshot = if is_api {
-            let (base_url, api_key) =
-                collect_api_endpoint(args.base_url.as_deref(), args.api_key.as_deref())?;
-            actions::CaptureSnapshot {
-                credentials: None,
-                base_url,
-                api_key,
-                // An api-key login authenticates no Anthropic account.
-                account_uuid: None,
-            }
+            use std::io::IsTerminal as _;
+            collect_api_reauth_snapshot(
+                args.base_url.as_deref(),
+                args.api_key.as_deref(),
+                config.find(&target),
+                std::io::stdin().is_terminal(),
+            )?
         } else {
-            run_oauth_browser(true, &target)?
+            run_oauth(true, &target)?
         };
         actions::overwrite_captured_profile(&mut config, &target, snapshot)?;
         // On a reauth `--model` is an explicit override; without it the
@@ -591,8 +1036,16 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
         // "active" before it's wired. The user switches explicitly (the print
         // below), which writes settings.json. `create_blank_profile` also
         // takes the model inline, so no separate model write is needed here.
-        let (base_url, api_key) =
-            collect_api_endpoint(args.base_url.as_deref(), args.api_key.as_deref())?;
+        // `interactive` is this site's ruling: a TTY prompts, headless bails.
+        // Unpin-able in-suite — driving this arm with `interactive = true`
+        // reads stdin, which hangs the runner — so the arg's value is carried
+        // by review, not a test.
+        use std::io::IsTerminal as _;
+        let (base_url, api_key) = collect_api_endpoint(
+            args.base_url.as_deref(),
+            args.api_key.as_deref(),
+            std::io::stdin().is_terminal(),
+        )?;
         actions::create_blank_profile(
             &mut config,
             target.to_string(),
@@ -602,13 +1055,15 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
         )?;
         outln!("clauth: captured into profile '{target}'. Switch to it with:  clauth {target}");
     } else {
-        let snapshot = run_oauth_browser(false, &target)?;
-        actions::capture_into_profile(&mut config, target.to_string(), snapshot)?;
-        // Apply the requested default model so the captured profile's sessions
-        // route there from the first launch.
-        if let Some(model) = args.model.as_deref() {
-            actions::set_profile_default_model(&mut config, &target, model)?;
-        }
+        let snapshot = run_oauth(false, &target)?;
+        // The requested default model rides the capture's own save, so the
+        // profile's sessions route there from the first launch.
+        actions::capture_into_profile(
+            &mut config,
+            target.to_string(),
+            args.model.clone(),
+            snapshot,
+        )?;
         outln!("clauth: captured into profile '{target}'. Switch to it with:  clauth {target}");
     }
     // CLA-SPLIT: the sidecar outranks `credentials.json` at every switch, so a
@@ -622,6 +1077,24 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
              install. This login only feeds usage polling. Drop it with:  clauth static-token \
              {target} --clear"
         );
+    }
+    Ok(())
+}
+
+/// `clauth capture <name>`: save the login Claude Code is using now as a new
+/// profile. The refusal paths (existing name, nothing live to capture) and the
+/// capture itself live in `actions::capture_current_login`, so they are
+/// testable without argv; this wrapper only loads config and reports the
+/// outcome.
+fn cmd_capture(profile: &str) -> Result<()> {
+    platform::init();
+    let mut config = load_config()?;
+    let name = profile.trim();
+    let became_active = actions::capture_current_login(&mut config, name)?;
+    if became_active {
+        outln!("clauth: captured into profile '{name}'. It is the active account.");
+    } else {
+        outln!("clauth: captured into profile '{name}'. Switch to it with:  clauth {name}");
     }
     Ok(())
 }
@@ -642,9 +1115,7 @@ fn cmd_login_console(config: &mut AppConfig, target: &str, model: Option<&str>) 
     outln!(
         "clauth: opening the Alibaba Model Studio console to capture a usage session for '{target}'…"
     );
-    let outcome = alibaba_login::login_with(site, region, |url| {
-        outln!("\nIf the browser didn't open, visit this URL to sign in:\n{url}\n");
-    })?;
+    let outcome = alibaba_login::login_with(site, region, print_browser_fallback)?;
     actions::store_console_login(config, &target, outcome.console.clone())?;
     if let Some(model) = model {
         actions::set_profile_default_model(config, &target, model)?;
@@ -1218,6 +1689,15 @@ fn cmd_rolling_token(name: &str) -> Result<()> {
         .as_ref()
         .and_then(|c| c.claude_ai_oauth.as_ref())
     else {
+        // Third-party names the why-not and stops. A bare login WOULD mint a
+        // chain here (the browser flow; Alibaba diverts to its console), but
+        // that adds an Anthropic login to an api-key account rather than
+        // answering the request, so this arm states the missing chain and
+        // prescribes nothing. The OAuth arm keeps the tail, where the same
+        // login IS the recovery.
+        if claude::has_own_inference_endpoint(profile) {
+            anyhow::bail!("'{canonical}' has no usage OAuth chain to roll from");
+        }
         anyhow::bail!(
             "'{canonical}' has no usage OAuth chain to roll from; run \
              `clauth login {canonical}` first"
@@ -1229,6 +1709,15 @@ fn cmd_rolling_token(name: &str) -> Result<()> {
     // with nothing at all, which is worse than the disengaged mis-fill it
     // started in.
     if config.state.auth_broken.contains(&canonical) {
+        // Through the shared splitter, so this bail, the rotate toast and the
+        // quarantine's own log line cannot prescribe different commands for
+        // one state. Both third-party legs are reachable here: the load
+        // boundary re-reads a creds-and-no-key profile as OAuth, but a key
+        // that survives its emptiness test and fails `validate_api_key` keeps
+        // the endpoint and reaches the keyless leg (pinned with `rt-badkey`).
+        if let Some(sentence) = oauth::third_party_dead_chain_copy(Some(profile), &canonical) {
+            anyhow::bail!("{sentence}");
+        }
         anyhow::bail!(
             "'{canonical}' usage chain is dead · run `clauth login {canonical}` first, \
              then re-run"
@@ -1506,9 +1995,7 @@ fn cmd_static_token(name: &str) -> Result<()> {
     // and the states do not deserve one verdict: a profile already on its mint
     // is a successful no-op, while a rolling bearer left with nothing
     // re-stamping it is a failed restore a script must see as non-zero.
-    let backup_exists = profile::profile_dir(&canonical)?
-        .join("session-token.static.json")
-        .exists();
+    let backup_exists = claude::static_backup_path(&canonical)?.exists();
     // A backup that exists but did not restore is an EXPIRED backup
     // (`restore_static_mint` refuses to install a dead mint, and quarantines
     // away anything that is not a mint at all) — every FAILING verdict below
@@ -1631,6 +2118,29 @@ fn api_key_for_profile(name: &str) -> Result<Option<String>> {
         claude::validate_api_key(k)?;
     }
     Ok(key.map(str::to_string))
+}
+
+/// A bare `clauth` reached with stdout not a terminal: the full-screen TUI has
+/// nowhere to draw, so this arm renders the command help the way clap renders
+/// a missing subcommand — help on stderr, usage exit code 2 (owner ruling).
+/// `cmd_tui` stays the whole terminal path.
+fn cmd_bare_help() -> Result<()> {
+    use clap::CommandFactory as _;
+    let mut command = Cli::command();
+    let mut buf = Vec::new();
+    command
+        .write_help(&mut buf)
+        .context("rendering the command help")?;
+    let help = String::from_utf8(buf).context("clap rendered non-UTF-8 help")?;
+    // The stderr half of `out`'s contract: a reader that left drops the line
+    // and the run keeps its own exit code.
+    let _ = crate::out::write_chunk(
+        &mut std::io::stderr().lock(),
+        format_args!("{help}"),
+        false,
+        "stderr",
+    );
+    Err(HelpRendered.into())
 }
 
 fn cmd_tui(theme_override: Option<tui::theme::Tier>) -> Result<()> {

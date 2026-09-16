@@ -10,7 +10,9 @@
 
 use chrono::{DateTime, Datelike, Local, Timelike};
 
+use crate::fallback::{StartBlock, StartCandidate};
 use crate::profile::Profile;
+use crate::profile_json::OauthAge;
 use crate::usage::{PlanTier, humanize_duration};
 
 // ── Cross-surface diagnostics ───────────────────────────────────────────────
@@ -63,6 +65,7 @@ impl Message {
 /// Travels INSIDE [`Transient`] rather than arriving as a parameter: three
 /// surfaces render [`refresh_transient`], and a `kind` argument would re-scatter
 /// this choice across exactly the call sites this module exists to unify.
+#[derive(Debug)]
 pub(crate) enum Retry {
     /// A transport failure — the connection is the thing worth checking.
     Connection,
@@ -74,11 +77,11 @@ pub(crate) enum Retry {
     /// connection and retry` gives two different and incompatible reasons to
     /// retry, one of which is wrong).
     Stated,
-    /// There is nothing left to retry in-process: `login_with` has no retry
-    /// path around its code exchange, so whatever the status, the only action
-    /// available is running `clauth login` again. Stated as the ABSENCE of a
-    /// retry loop rather than as a fact about the code or the listener, because
-    /// this correctly stops being true the moment someone adds one.
+    /// There is nothing left to retry in-process: `PendingLogin::run` has no
+    /// retry path around its code exchange, so whatever the status, the only
+    /// action available is running `clauth login` again. Stated as the ABSENCE
+    /// of a retry loop rather than as a fact about the code or the listener,
+    /// because this correctly stops being true the moment someone adds one.
     Restart,
 }
 
@@ -98,6 +101,7 @@ pub(crate) enum Retry {
 /// a profile name, so a body passed there would read as an account name and
 /// nothing else. Sealing all four means a newtype only the callers can mint;
 /// worth doing if a fifth arm ever needs a runtime value that is not a name.
+#[derive(Clone, Debug)]
 pub(crate) enum Cause {
     /// Already-canned copy from `oauth::TokenFailure`.
     Endpoint(&'static str),
@@ -132,7 +136,10 @@ pub(crate) enum Cause {
     /// Another holder has the profile's rotation lock and the caller must not
     /// park behind it — the scheduler's CLA-ROLL re-stamp leg, which runs on a
     /// thread that cannot wait, and the account-mutation refusals, which decline
-    /// rather than block on a lock carrying no timeout. Genuine contention — the
+    /// rather than park on a form of the acquire that carries no deadline. Both are
+    /// properties of the FORM, not of the lock: a session start takes a bounded
+    /// acquire (`runtime::ROTATION_LOCK_TIMEOUT`), and neither of these callers
+    /// wants that wait either. Genuine contention — the
     /// opposite claim from [`Self::RotationLockUnavailable`], which is why it is
     /// not that arm: the holder's own path usually re-stamps the sidecar itself,
     /// and the scan retries in minutes against an hours-wide horizon either way.
@@ -160,15 +167,16 @@ pub(crate) enum Cause {
     SidecarMisfilled(String),
     /// The cross-process state flock could not be taken inside its bounded
     /// wait — another clauth process is busy under `~/.clauth` (on macOS that
-    /// flock is even held across a `/usr/bin/security` shell-out for up to 20
-    /// seconds). Surfaced by the CLA-ROLL sidecar repair and the gate's
-    /// rotation-adoption leg alike. Genuine contention, not a fault: the
-    /// holder finishes and a retry goes through. Distinct from
-    /// [`Self::SidecarWriteFailed`] and [`Self::StateLockUnavailable`] on
-    /// purpose — that copy prescribes a permissions check, which a busy
-    /// sibling would send the operator on for nothing. Same
-    /// contention-vs-fault split as [`Self::RotationLockUnavailable`] (fault)
-    /// vs [`Self::RotationLockHeld`] (contention).
+    /// flock is even held across `/usr/bin/security` shell-outs, bounded in
+    /// aggregate by `lock::SUBPROCESS_BUDGET`). Surfaced by the CLA-ROLL
+    /// sidecar repair and the gate's rotation-adoption leg alike. Genuine
+    /// contention, not a fault: the holder finishes and a retry goes through.
+    /// Distinct from [`Self::SidecarWriteFailed`] and
+    /// [`Self::StateLockUnavailable`] on purpose — that copy prescribes a
+    /// permissions check, which a busy sibling would send the operator on for
+    /// nothing. Same contention-vs-fault split as
+    /// [`Self::RotationLockUnavailable`] (fault) vs
+    /// [`Self::RotationLockHeld`] (contention).
     StateLockBusy(String),
     /// The cross-process state flock could not be CREATED or OPENED during
     /// the gate's rotation-adoption leg — a filesystem or permissions problem
@@ -182,6 +190,22 @@ pub(crate) enum Cause {
 }
 
 impl Cause {
+    /// Whether the arm's rendered copy already names the operator's next step,
+    /// so an appended retry hint would duplicate it (`RotationLockHeld` ends in
+    /// `retry in a moment`) or contradict it (a permissions check followed by
+    /// `check your connection and retry`). [`Transient`]'s constructors enforce
+    /// the pairing against this rather than leaving it to convention.
+    ///
+    /// New arms default to self-prescribing: an arm joins the list below only
+    /// by an explicit edit, so an unclassified arm refuses every suffix-bearing
+    /// retry loudly at construction instead of shipping the stutter.
+    fn names_its_own_next_step(&self) -> bool {
+        !matches!(
+            self,
+            Self::Endpoint(_) | Self::PersistFailed(_) | Self::StateLockBusy(_)
+        )
+    }
+
     fn text(&self) -> String {
         match self {
             Self::Endpoint(canned) => (*canned).to_string(),
@@ -250,7 +274,17 @@ pub(crate) struct Transient {
 }
 
 impl Transient {
+    /// # Panics
+    ///
+    /// If `cause` names its own next step and `retry` appends advice
+    /// ([`Retry::Wait`], [`Retry::Connection`], [`Retry::Restart`]): the
+    /// appended hint would duplicate or contradict the cause's own advice.
+    /// Pair with [`Retry::Stated`] instead. Unreachable from every production
+    /// site today — each passes a literal retry and none pairs a
+    /// self-prescribing arm with a suffix-bearing retry — so a wrong pairing
+    /// fails here rather than shipping a stutter.
     pub(crate) fn new(cause: Cause, retry: Retry) -> Self {
+        Self::refuse_contradicting_suffix(&cause, &retry);
         Self {
             cause,
             status: None,
@@ -258,12 +292,23 @@ impl Transient {
         }
     }
 
+    /// [`Self::new`] with an HTTP status. The same pairing rule applies: the
+    /// status sits between the two clauses but does not un-stutter them.
     pub(crate) fn with_status(cause: Cause, status: u16, retry: Retry) -> Self {
+        Self::refuse_contradicting_suffix(&cause, &retry);
         Self {
             cause,
             status: Some(status),
             retry,
         }
+    }
+
+    fn refuse_contradicting_suffix(cause: &Cause, retry: &Retry) {
+        assert!(
+            !cause.names_its_own_next_step() || matches!(retry, Retry::Stated),
+            "cause {cause:?} names its own next step; retry {retry:?} would duplicate or \
+             contradict it"
+        );
     }
 
     fn suffix(&self) -> &'static str {
@@ -311,7 +356,13 @@ impl Transient {
 }
 
 /// A login whose refresh token is dead: re-login is the only fix. Shared by the
-/// CLI/MCP switch bail, the daemon tick log, and the TUI switch toast.
+/// CLI/MCP switch bail, the daemon tick log, the TUI switch toast, the MCP
+/// pre-flight's quarantine arm, and — through
+/// `oauth::third_party_dead_chain_copy`'s `None` case — the rotate toast and
+/// the quarantine's own log line, wherever the profile neither serves its own
+/// inference nor is a recognised keyless one. `clauth rolling-token`'s dead-chain bail takes that
+/// same `None` case but words its own sentence, since it also has to say the
+/// arming did not happen.
 pub(crate) fn login_expired(name: &crate::profile::ProfileName) -> Message {
     Message {
         head: format!("login for '{name}' has expired"),
@@ -319,6 +370,92 @@ pub(crate) fn login_expired(name: &crate::profile::ProfileName) -> Message {
             "refresh token revoked or invalid: run clauth login {name}"
         )),
     }
+}
+
+/// A third-party profile with no inference auth source: an api key is the only
+/// credential that fixes it, so the fix names the `--api-key` command — a bare
+/// `clauth login <name>` on a third-party profile runs the browser flow (OAuth
+/// for most providers, the console flow on Alibaba) and leaves the missing key
+/// missing, while `--api-key` also lifts any quarantine the profile carries
+/// (`clauth login` is the documented quarantine recovery, AUTH-1 in
+/// `actions.rs`). Rendered by the MCP pre-flight's keyless arm, the
+/// rolling-token bail, the manual-rotate toast and the quarantine's own log
+/// line, so the surfaces cannot spell one state two ways. Those last three
+/// render it for a key the profile's `AuthExpired` verdict pronounces dead,
+/// too — Alibaba excepted, whose verdict records a dead console session:
+/// `oauth::third_party_dead_chain_copy` treats such a key as no credential, and
+/// routes a console-carrying Alibaba profile to [`third_party_dead_console`]
+/// instead, which says the opposite about the key.
+pub(crate) fn third_party_keyless(name: &crate::profile::ProfileName) -> String {
+    format!("profile has no api key: {name} (run `clauth login {name} --api-key <key>`)")
+}
+
+/// A third-party profile whose stored OAuth chain is dead while it still has
+/// an inference auth source: the split state, named so the reader learns the
+/// account is not dead and what clears the quarantine (an api-mode login
+/// replaces the credential set and lifts the flag, AUTH-1 in `actions.rs`).
+///
+/// The sentence is owner-ruled verbatim and claims more than the predicate
+/// behind it proves: `has_inference_auth` is satisfied by a well-formed key OR
+/// an `[env]` token, and well-formed is not live. The key half is guarded
+/// where a verdict can speak to it — `oauth::third_party_dead_chain_copy`
+/// consults the per-credential `AuthExpired` verdict and renders
+/// [`third_party_keyless`] instead when the record matches the profile's
+/// current credential, except on Alibaba, whose verdict records a dead console
+/// session, not a key. The `[env]`-token half is guarded too (owner ruling
+/// 2026-09-02): a profile with no usable api key — field or env-carried —
+/// renders [`third_party_keyless`] instead. The Alibaba console half renders
+/// [`third_party_dead_console`] when the verdict matches its current credential
+/// AND a console was captured; a console-less Alibaba profile whose verdict
+/// matches lands on this sentence instead, since "expired" would be false.
+///
+/// Three sites route through `oauth::third_party_dead_chain_copy`:
+/// `cmd_rolling_token`'s up-front dead-chain bail, the manual-rotate toast,
+/// and the quarantine's own `mark_auth_broken` log line. `report_armed_sidecar`
+/// carries a fourth dead-chain sentence and is deliberately NOT routed: its
+/// `chain_is_broken` comes from the arm's own gate, which cannot reach `Broken`
+/// for a profile with a `base_url`, so a third-party branch there is dead code.
+/// The MCP pre-flight admits that target instead of refusing it, so it renders
+/// nothing (owner ruling 2026-08-30).
+/// The command is backticked to match [`third_party_keyless`], which renders
+/// beside it on the same surfaces (owner ruling: house style).
+pub(crate) fn third_party_dead_chain(name: &crate::profile::ProfileName) -> String {
+    format!(
+        "stored OAuth chain is dead, its api key still works: {name} \
+         (run `clauth login {name} --api-key <key>` to clear the quarantine)"
+    )
+}
+
+/// An Alibaba profile whose stored OAuth chain is dead while its console
+/// session has expired too: the split state, named so the reader learns both
+/// halves — the api key still serves inference, and one command restores the
+/// console. `cmd_login` diverts a bare `clauth login <name>` on Alibaba to the
+/// console capture flow, so the command is exactly that.
+///
+/// Rendered only by `oauth::third_party_dead_chain_copy`'s own-endpoint arm,
+/// where the profile's stored `AuthExpired` verdict matches its current
+/// credential fingerprint AND a console was actually captured: an Alibaba
+/// verdict records a dead console session, never a dead key, so this sentence
+/// replaces the dead-chain one the other providers render there. Without a
+/// console the verdict means "never captured", where "expired" and "re-capture"
+/// are both false, so that profile keeps [`third_party_dead_chain`].
+///
+/// The key clause claims what its sibling's does and is guarded no further: the
+/// arm proves a well-formed key, or merely a non-empty `[env]` token, never a
+/// live one, and an Alibaba verdict cannot speak to the key at all since its
+/// usage fetch never sends one. The gate is also wider than the verdict:
+/// `credential_fingerprint` hashes the api key as well as the console, so a key
+/// change alone retires a still-true console verdict and this sentence stops
+/// rendering. A running scheduler re-writes the verdict on its next tick;
+/// `cmd_rolling_token` loads a config and fetches nothing, so with no daemon and
+/// no TUI that window has no bound.
+/// The command is backticked to match [`third_party_keyless`] and
+/// [`third_party_dead_chain`] (owner ruling: house style).
+pub(crate) fn third_party_dead_console(name: &crate::profile::ProfileName) -> String {
+    format!(
+        "console session expired, stored OAuth chain is dead: {name} \
+         (run `clauth login {name}` to re-capture the console; the api key still serves inference)"
+    )
 }
 
 /// A refresh that failed for a transient reason: this switch is refused but the
@@ -422,6 +559,31 @@ pub(crate) fn format_pct(pct: f64) -> String {
     }
 }
 
+/// Absolute API amount: whole numbers render bare, fractions at two decimals →
+/// `42`, `42.35`. The one shared spelling for a bar's `used / total` figures;
+/// a surface-local twin of this is a drift, not a specialization.
+pub(crate) fn format_amount(n: f64) -> String {
+    if n.fract() == 0.0 {
+        format!("{n:.0}")
+    } else {
+        format!("{n:.2}")
+    }
+}
+
+/// A token threshold in its display form: exact millions as `{n}M` (`2M`),
+/// whole thousands below a million as `{n}k` (`600k`), anything else plain.
+/// The one rule behind the hook note, the Config row's custom-value append,
+/// its hint, and the editor seed.
+pub(crate) fn format_threshold_tokens(v: u64) -> String {
+    if v.is_multiple_of(1_000_000) {
+        format!("{}M", v / 1_000_000)
+    } else if v < 1_000_000 && v.is_multiple_of(1000) {
+        format!("{}k", v / 1000)
+    } else {
+        v.to_string()
+    }
+}
+
 /// The one LOCAL prose-stamp formatter: an epoch-seconds instant as
 /// `YYYY-MM-DD HH:MM:SS` in the operator's local wall clock. A second spelling
 /// of a LOCAL stamp is a bug in its caller, not a new helper. Machine timestamps
@@ -441,6 +603,148 @@ pub(crate) fn local_stamp(epoch: i64) -> Option<String> {
         naive.minute(),
         naive.second(),
     ))
+}
+
+// ── diagnostic chip words + start-walk rendering ────────────────────────────
+
+/// Canonical `[ label ]` wording for the diagnostic states whose text pill
+/// surfaces on more than one tab, and the `--explain` row verdicts. One source
+/// so the same account state never wears two words on two tabs.
+pub(crate) const DIAG_DISABLED: &str = "disabled";
+pub(crate) const DIAG_CANCELED: &str = "canceled";
+pub(crate) const DIAG_AUTH_BROKEN: &str = "auth broken";
+pub(crate) const DIAG_BUDGET_SPENT: &str = "extra usage spent";
+pub(crate) const DIAG_KICK: &str = "claude code blocked";
+pub(crate) const DIAG_WEEKLY_SPENT: &str = "weekly spent";
+pub(crate) const DIAG_WEEKLY_SOFT: &str = "past the weekly switch line, still serving";
+pub(crate) const DIAG_STALE: &str = "stale data";
+
+/// A seconds age as the relative ladder (`4m ago`, `2h ago`, `3d ago`), open
+/// ended into weeks. The TUI's `relative_age` (`tui/render/format.rs`) calls
+/// this under its own 30-day local-stamp arm.
+pub(crate) fn humanize_age(secs: u64) -> String {
+    let mins = secs / 60;
+    let hours = mins / 60;
+    let days = hours / 24;
+    if secs < 60 {
+        "just now".to_string()
+    } else if mins < 60 {
+        format!("{mins}m ago")
+    } else if hours < 24 {
+        format!("{hours}h ago")
+    } else if days < 7 {
+        format!("{days}d ago")
+    } else {
+        format!("{}w ago", days / 7)
+    }
+}
+
+/// The one-line label for a start verdict, sharing the TUI's chip words where
+/// one exists ([`crate::fallback::StartBlock`]).
+pub(crate) fn start_block_label(block: &StartBlock) -> String {
+    match block {
+        StartBlock::Disabled => DIAG_DISABLED.to_string(),
+        StartBlock::AuthBroken => DIAG_AUTH_BROKEN.to_string(),
+        StartBlock::Canceled => DIAG_CANCELED.to_string(),
+        StartBlock::KickRejected => DIAG_KICK.to_string(),
+        StartBlock::NotOauth => "not an oauth account".to_string(),
+        StartBlock::WeeklySpent => DIAG_WEEKLY_SPENT.to_string(),
+        StartBlock::WeeklySoft { pct } => format!("weekly {}", format_pct(*pct)),
+        StartBlock::FiveHour { pct } => format!("5h {}", format_pct(*pct)),
+        StartBlock::ScopedSpent { label, pct } => {
+            format!("{label} {}, other models ok", format_pct(*pct))
+        }
+    }
+}
+
+fn start_verdict(row: &StartCandidate) -> String {
+    match &row.block {
+        Some(block) => start_block_label(block),
+        None => "ok".to_string(),
+    }
+}
+
+fn start_age_cell(row: &StartCandidate) -> String {
+    match row.age {
+        OauthAge::Dated(ms) => {
+            let cell = format!("usage {}", humanize_age(ms / 1000));
+            if row.stale {
+                format!("{cell} (stale)")
+            } else {
+                cell
+            }
+        }
+        OauthAge::Undated => "usage undated (stale)".to_string(),
+        OauthAge::Absent => "no usage yet".to_string(),
+    }
+}
+
+/// The member rows of a `--explain` start walk, one line per chain member in
+/// chain order: `*` for the pick, then the name and verdict each padded to the
+/// column's widest, then the cache-age cell. Pure, so the byte layout is pinned
+/// without capturing stdout.
+pub(crate) fn render_start_walk(rows: &[StartCandidate], pick: Option<usize>) -> String {
+    let name_w = rows
+        .iter()
+        .map(|r| r.name.as_str().len())
+        .max()
+        .unwrap_or(0);
+    let verdict_w = rows
+        .iter()
+        .map(|r| start_verdict(r).len())
+        .max()
+        .unwrap_or(0);
+    rows.iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let marker = if Some(i) == pick { '*' } else { ' ' };
+            format!(
+                "{marker} {:<name_w$}  {:<verdict_w$}   {}",
+                r.name.as_str(),
+                start_verdict(r),
+                start_age_cell(r),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn start_demand_suffix(demand: &[String]) -> String {
+    if demand.is_empty() {
+        String::new()
+    } else {
+        format!(" for {}", demand.join(" + "))
+    }
+}
+
+/// The `--explain` first line for a picked name.
+pub(crate) fn start_pick_line(name: &str, demand: &[String]) -> String {
+    format!("would start on '{name}'{}", start_demand_suffix(demand))
+}
+
+/// The stderr line a real `--auto` launch prints before `start::run`.
+pub(crate) fn start_launch_line(name: &str, demand: &[String]) -> String {
+    format!(
+        "clauth: starting on '{name}'{}",
+        start_demand_suffix(demand)
+    )
+}
+
+/// The `--auto` no-member refusal: the first line plus, when rows exist, the
+/// explain rows rendered with no `*` on any of them.
+pub(crate) fn start_refusal(demand: &[String], rows: &[StartCandidate]) -> String {
+    let rendered = render_start_walk(rows, None);
+    if rendered.is_empty() {
+        format!(
+            "--auto found no chain member with headroom{}",
+            start_demand_suffix(demand)
+        )
+    } else {
+        format!(
+            "--auto found no chain member with headroom{}\n{rendered}",
+            start_demand_suffix(demand)
+        )
+    }
 }
 
 #[cfg(test)]

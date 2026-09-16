@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 
-use crate::actions::{switch_off, switch_profile};
+use crate::actions::{switch_off_locked, switch_profile_locked};
 use crate::lock::with_state_lock;
 use crate::profile::{AppConfig, Profile, ProfileName};
 use crate::usage::{
@@ -44,6 +44,22 @@ pub(crate) const DEFAULT_THRESHOLD: f64 = 95.0;
 
 pub(crate) fn threshold_for(profile: &Profile) -> f64 {
     profile.fallback_threshold.unwrap_or(DEFAULT_THRESHOLD)
+}
+
+/// The one band a fallback threshold may hold: finite, 0..=100. The TUI's
+/// text parser ([`parse_threshold`]) and the chain-edit action
+/// (`actions::set_member_threshold`) both read it, so the two surfaces cannot
+/// drift on the range.
+pub(crate) const MIN_THRESHOLD: f64 = 0.0;
+pub(crate) const MAX_THRESHOLD: f64 = 100.0;
+
+pub(crate) fn threshold_in_range(value: f64) -> bool {
+    value.is_finite() && (MIN_THRESHOLD..=MAX_THRESHOLD).contains(&value)
+}
+
+/// Parse a typed threshold, valid only inside [`threshold_in_range`].
+pub(crate) fn parse_threshold(raw: &str) -> Option<f64> {
+    raw.parse::<f64>().ok().filter(|v| threshold_in_range(*v))
 }
 
 /// Live 5h window for `profile`, or `None` when there's no snapshot yet or its
@@ -218,7 +234,11 @@ fn spend_armed(usage: Option<&crate::usage::UsageInfo>, budget_on: bool, ceiling
 /// limits (e.g. "7d fable") gate separately, per-account and never as full
 /// exhaustion (see [`scoped_weekly_blocked_info`]). Store-side twin logic
 /// inlines this same shape (see `is_exhausted_from_usage`).
-fn weekly_blocked_info(info: &crate::usage::UsageInfo, now_secs: i64, weekly_pct: f64) -> bool {
+pub(crate) fn weekly_blocked_info(
+    info: &crate::usage::UsageInfo,
+    now_secs: i64,
+    weekly_pct: f64,
+) -> bool {
     seven_day_live(info, now_secs)
         && info
             .seven_day
@@ -277,7 +297,7 @@ pub(crate) fn weekly_hard_blocked(profile: &Profile) -> bool {
 /// Whether one window carries a parseable reset still in the future — the
 /// per-window liveness primitive [`scoped_weekly_blocked_info`] applies to
 /// each `weekly_scoped` entry (mirroring `seven_day_live` for the aggregate).
-fn window_live(w: &UsageWindow, now_secs: i64) -> bool {
+pub(crate) fn window_live(w: &UsageWindow, now_secs: i64) -> bool {
     w.resets_at
         .as_deref()
         .and_then(iso_to_epoch_secs)
@@ -313,10 +333,97 @@ pub(crate) fn worst_scoped_window(
     now_secs: i64,
     weekly_pct: f64,
 ) -> Option<&crate::usage::ScopedWindow> {
+    worst_scoped_window_for(info, now_secs, weekly_pct, None)
+}
+
+/// [`worst_scoped_window`] narrowed to the model families a caller actually
+/// cares about.
+///
+/// `None` weighs every per-model window, which is the chain walk's case and its
+/// only correct one: it cannot know which model the next session runs, so any
+/// capped window is disqualifying. A caller that DOES know — start-time
+/// selection, which reads the models a launch will run — passes them, and a
+/// member capped only on a family this session never touches stays a candidate.
+///
+/// Liveness and the comparison live here rather than at either call site, so
+/// the narrowed judgment cannot drift from the blanket one.
+pub(crate) fn worst_scoped_window_for<'a>(
+    info: &'a crate::usage::UsageInfo,
+    now_secs: i64,
+    weekly_pct: f64,
+    families: Option<&[String]>,
+) -> Option<&'a crate::usage::ScopedWindow> {
     info.weekly_scoped
         .iter()
+        .filter(|s| families.is_none_or(|fams| fams.iter().any(|f| scoped_label_is(&s.label, f))))
         .filter(|s| window_live(&s.window, now_secs) && s.window.utilization >= weekly_pct)
         .max_by(|a, b| a.window.utilization.total_cmp(&b.window.utilization))
+}
+
+/// The model family a scoped window is named for — `"fable"`, `"opus"`, … —
+/// derived from a model id. Leading all-digit components are skipped and the
+/// first alphabetic token is the family, so a `claude-3.x` id (its date and
+/// version digits prefix the family) still resolves. A non-Anthropic id has no
+/// family: no per-model window is ever scoped to one.
+pub(crate) fn model_family(model_id: &str) -> Option<String> {
+    let id = model_id.trim().to_lowercase();
+    let base = crate::pricing::strip_bracket_suffix(&id);
+    if base.is_empty() {
+        return None;
+    }
+    // Bare aliases as Claude Code spells them in `settings.json` and `--model`,
+    // a `[1m]` context suffix stripped above. `opusplan` is deliberately absent:
+    // it is two families and resolves in `demand_from`, which can return both.
+    if matches!(base, "opus" | "sonnet" | "haiku" | "fable") {
+        return Some(base.to_owned());
+    }
+    let rest = base.strip_prefix("claude-")?;
+    rest.split(['-', '.', '['])
+        .find(|c| !c.is_empty() && c.chars().all(|ch| ch.is_ascii_alphabetic()))
+        .map(str::to_owned)
+}
+
+/// Whether a scoped window's label names `family`.
+///
+/// Labels are built server-side as `"7d " + display_name.to_lowercase()`
+/// ([`crate::usage::ScopedWindow`]), so this matches a word rather than a fixed
+/// set — a model the server adds later joins with no change here. Any word, not
+/// just the last: a display name can be more than one word (`"7d sonnet 4.5"`).
+pub(crate) fn scoped_label_is(label: &str, family: &str) -> bool {
+    label
+        .split_whitespace()
+        .any(|w| w.eq_ignore_ascii_case(family))
+}
+
+/// The union of model families a launch may run, deduped and order-stable.
+///
+/// `opusplan` and `best` each expand to both families they can resolve to. An
+/// id that resolves to nothing (`default`, an unknown provider id) is dropped
+/// rather than poisoning the set: an unresolved demand must not silently narrow
+/// the candidates.
+pub(crate) fn demand_from<I, S>(models: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut out: Vec<String> = Vec::new();
+    for m in models {
+        let raw = m.as_ref().trim().to_lowercase();
+        let base = crate::pricing::strip_bracket_suffix(&raw);
+        let families: Vec<String> = if base == "opusplan" {
+            vec!["opus".to_owned(), "sonnet".to_owned()]
+        } else if base == "best" {
+            vec!["fable".to_owned(), "opus".to_owned()]
+        } else {
+            model_family(base).into_iter().collect()
+        };
+        for f in families {
+            if !out.contains(&f) {
+                out.push(f);
+            }
+        }
+    }
+    out
 }
 
 /// [`scoped_weekly_blocked_info`] over a profile's own usage snapshot, gated
@@ -959,6 +1066,27 @@ pub(crate) fn snapshot_session_chain(
     }))
 }
 
+/// One chain member resolved out of `config` for `name` — the fields
+/// [`build_chain_snapshot`] folds per member and [`start_walk`] needs for a
+/// single member, shared so the two cannot drift on a field.
+fn chain_member(config: &AppConfig, name: &ProfileName, weekly_pct: f64) -> ChainMember {
+    let profile = config.find(name);
+    ChainMember {
+        name: name.clone(),
+        threshold: profile.map(threshold_for).unwrap_or(DEFAULT_THRESHOLD),
+        last_resort: profile.is_some_and(|p| p.last_resort),
+        preferred: profile.is_some_and(|p| p.preferred),
+        max_spend: profile.and_then(|p| p.max_auto_spend).unwrap_or(0.0),
+        weekly_line: profile
+            .map(|p| member_weekly_line(p, weekly_pct))
+            .unwrap_or(weekly_pct),
+        scoped_line: profile
+            .map(|p| member_scoped_line(p, weekly_pct))
+            .unwrap_or(weekly_pct),
+        check_scoped: profile.is_none_or(|p| p.check_scoped),
+    }
+}
+
 /// The shared body of [`snapshot_chain`] and [`snapshot_session_chain`],
 /// parameterized on the name that plays "active" plus an extra per-candidate skip.
 ///
@@ -996,23 +1124,7 @@ fn build_chain_snapshot(
                     && !profile.is_some_and(Profile::is_disabled)
                     && !skip_candidate(profile))
         })
-        .map(|name| {
-            let profile = config.find(name);
-            ChainMember {
-                name: name.clone(),
-                threshold: profile.map(threshold_for).unwrap_or(DEFAULT_THRESHOLD),
-                last_resort: profile.is_some_and(|p| p.last_resort),
-                preferred: profile.is_some_and(|p| p.preferred),
-                max_spend: profile.and_then(|p| p.max_auto_spend).unwrap_or(0.0),
-                weekly_line: profile
-                    .map(|p| member_weekly_line(p, weekly_pct))
-                    .unwrap_or(weekly_pct),
-                scoped_line: profile
-                    .map(|p| member_scoped_line(p, weekly_pct))
-                    .unwrap_or(weekly_pct),
-                check_scoped: profile.is_none_or(|p| p.check_scoped),
-            }
-        })
+        .map(|name| chain_member(config, name, weekly_pct))
         .collect();
     ChainSnapshot {
         active,
@@ -1030,6 +1142,25 @@ fn build_chain_snapshot(
     }
 }
 
+/// [`is_exhausted_from_usage`]'s body over an already-resolved usage snapshot —
+/// the aggregate half of the start walk's accept, shared with [`start_block`]
+/// rather than a third spelling.
+fn is_exhausted_from_info(
+    member: &ChainMember,
+    info: Option<&UsageInfo>,
+    line: f64,
+    now: i64,
+) -> bool {
+    info.is_some_and(|info| {
+        weekly_blocked_info(info, now, line)
+            || (five_hour_live(info, now)
+                && info
+                    .five_hour
+                    .as_ref()
+                    .is_some_and(|w| w.utilization >= member.threshold))
+    })
+}
+
 /// Scheduler-side [`is_exhausted`] over a usage snapshot: reads 5h utilization
 /// from a `HashMap<String, UsageInfo>` taken under a single `UsageStore` lock
 /// (see [`next_auto_switch_target`]) rather than `Profile.usage` (which only the
@@ -1042,15 +1173,12 @@ fn is_exhausted_from_usage(
     usage: &HashMap<String, UsageInfo>,
     line: f64,
 ) -> bool {
-    let now = now_epoch_secs();
-    usage.get(member.name.as_str()).is_some_and(|info| {
-        weekly_blocked_info(info, now, line)
-            || (five_hour_live(info, now)
-                && info
-                    .five_hour
-                    .as_ref()
-                    .is_some_and(|w| w.utilization >= member.threshold))
-    })
+    is_exhausted_from_info(
+        member,
+        usage.get(member.name.as_str()),
+        line,
+        now_epoch_secs(),
+    )
 }
 
 /// Scheduler-side [`is_canceled`] over a usage snapshot — reads the plan from the
@@ -1126,6 +1254,190 @@ fn walk_chain(
         }
     }
     None
+}
+
+/// Why a chain member is ineligible for a START (not a mid-session switch),
+/// rendered as one label per arm. [`start_block`]'s ladder mirrors
+/// [`health_blocked_reason`]'s precedence, minus the rungs a start does not
+/// decide on (budget, staleness) and plus the two a start alone knows
+/// (`NotOauth`, the narrowed per-model demand).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum StartBlock {
+    Disabled,
+    AuthBroken,
+    Canceled,
+    KickRejected,
+    NotOauth,
+    WeeklySpent,
+    WeeklySoft { pct: f64 },
+    FiveHour { pct: f64 },
+    ScopedSpent { label: String, pct: f64 },
+}
+
+/// The worst reason `member` cannot be STARTED on, or `None` when it is clear.
+///
+/// `usage` is the member's resolved snapshot (absent when nothing has been read
+/// yet), `kick_rejected` the switch-grade kick flag the start walk read off
+/// disk, and `families` the models a launch is about to run: `Some` narrows the
+/// per-model weekly judgment to exactly those families regardless of
+/// `check_scoped` (a KNOWN demand supersedes the blanket gate), `None` keeps
+/// today's blanket behaviour gated by `check_scoped`. `needs_oauth` is
+/// `--with-fallback`, which refuses a member the chain could never move the
+/// session off.
+///
+/// The aggregate decision is computed once by [`is_exhausted_from_info`] (the
+/// walk's own predicate); the `WeeklySpent`/`FiveHour`/`WeeklySoft` rungs only
+/// NAME which of its clauses fired, so none can fire while the predicate is
+/// clear. `None` means the member is not excluded (disabled, canceled,
+/// auth-broken, kick-rejected, non-OAuth under `--with-fallback`) AND not
+/// exhausted AND scoped-clear. Every rung but `NotOauth` is one the switch
+/// walk also skips or refuses on; the active-slot skip is the walk's alone,
+/// since a start has no active to leave.
+pub(crate) fn start_block(
+    config: &AppConfig,
+    member: &ChainMember,
+    profile: &Profile,
+    usage: Option<&UsageInfo>,
+    kick_rejected: bool,
+    needs_oauth: bool,
+    families: Option<&[String]>,
+) -> Option<StartBlock> {
+    if profile.is_disabled() {
+        return Some(StartBlock::Disabled);
+    }
+    if usage
+        .and_then(|u| u.plan.as_ref())
+        .is_some_and(|p| p.is_canceled())
+    {
+        return Some(StartBlock::Canceled);
+    }
+    if config.is_auth_broken(&member.name) {
+        return Some(StartBlock::AuthBroken);
+    }
+    if needs_oauth && !profile.is_oauth() {
+        return Some(StartBlock::NotOauth);
+    }
+    let now = now_epoch_secs();
+    let exhausted = is_exhausted_from_info(member, usage, member.weekly_line, now);
+    if exhausted && usage.is_some_and(|info| weekly_blocked_info(info, now, WEEKLY_HARD_BLOCK_PCT))
+    {
+        return Some(StartBlock::WeeklySpent);
+    }
+    if kick_rejected {
+        return Some(StartBlock::KickRejected);
+    }
+    if exhausted
+        && let Some(info) = usage
+        && five_hour_live(info, now)
+        && let Some(window) = info.five_hour.as_ref()
+        && window.utilization >= member.threshold
+    {
+        return Some(StartBlock::FiveHour {
+            pct: window.utilization,
+        });
+    }
+    let scoped = match families {
+        Some(fams) => usage
+            .and_then(|info| worst_scoped_window_for(info, now, member.scoped_line, Some(fams))),
+        None if member.check_scoped => {
+            usage.and_then(|info| worst_scoped_window_for(info, now, member.scoped_line, None))
+        }
+        None => None,
+    };
+    if let Some(worst) = scoped {
+        return Some(StartBlock::ScopedSpent {
+            label: worst.label.clone(),
+            pct: worst.window.utilization,
+        });
+    }
+    if exhausted && usage.is_some_and(|info| weekly_blocked_info(info, now, member.weekly_line)) {
+        let pct = usage
+            .and_then(|info| info.seven_day.as_ref())
+            .map(|w| w.utilization)
+            .unwrap_or(member.weekly_line);
+        return Some(StartBlock::WeeklySoft { pct });
+    }
+    None
+}
+
+/// One chain member as the start walk judged it, with enough to render the
+/// `--explain` row: the verdict, the cache age (for the staleness cell), whether
+/// that age reads stale, and whether the reading is DATED and fresh (pass one's
+/// preference).
+pub(crate) struct StartCandidate {
+    pub(crate) name: ProfileName,
+    pub(crate) block: Option<StartBlock>,
+    pub(crate) age: crate::profile_json::OauthAge,
+    pub(crate) stale: bool,
+    pub(crate) fresh: bool,
+}
+
+/// The `--auto` walk: every resolvable fallback-chain member in chain order,
+/// each judged by [`start_block`] with the models a launch is about to run, plus
+/// the index of the first clear member (freshness PREFERRED in pass one, any
+/// freshness accepted in pass two — the same preference the switch walk gives
+/// its target in [`next_auto_switch_target`]).
+pub(crate) fn start_walk(
+    config: &AppConfig,
+    families: Option<&[String]>,
+    needs_oauth: bool,
+) -> (Vec<StartCandidate>, Option<usize>) {
+    let weekly_pct = config.state.weekly_switch_threshold_pct();
+    let now = now_epoch_secs();
+    let names = &config.state.fallback_chain;
+    let kick = crate::usage::switch_grade_kick_blocked_from_cache(names, now);
+    let mut rows: Vec<StartCandidate> = Vec::with_capacity(names.len());
+    for name in names {
+        let Some(profile) = config.find(name) else {
+            continue;
+        };
+        let member = chain_member(config, name, weekly_pct);
+        let windows = crate::profile_json::profile_windows(profile);
+        let third_party_usage = match &windows {
+            crate::profile_json::ProfileWindows::ThirdParty { stats, .. } => {
+                stats.as_ref().and_then(|s| s.to_usage_info())
+            }
+            _ => None,
+        };
+        let (usage, age) = match &windows {
+            crate::profile_json::ProfileWindows::Oauth { usage, age } => (usage.as_deref(), *age),
+            crate::profile_json::ProfileWindows::ThirdParty { age_secs, .. } => (
+                third_party_usage.as_ref(),
+                match age_secs {
+                    Some(secs) => crate::profile_json::OauthAge::Dated(secs.saturating_mul(1000)),
+                    None => crate::profile_json::OauthAge::Absent,
+                },
+            ),
+        };
+        let stale = windows.stale();
+        let fresh = windows.fresh();
+        let kick_rejected = kick.iter().any(|k| k == name);
+        let block = start_block(
+            config,
+            &member,
+            profile,
+            usage,
+            kick_rejected,
+            needs_oauth,
+            families,
+        );
+        rows.push(StartCandidate {
+            name: name.clone(),
+            block,
+            age,
+            stale,
+            fresh,
+        });
+    }
+    if rows.is_empty() {
+        return (rows, None);
+    }
+    let len = rows.len();
+    let pick = walk_chain(len - 1, len, &|i| rows[i].block.is_some(), &|i| {
+        rows[i].fresh
+    })
+    .or_else(|| walk_chain(len - 1, len, &|i| rows[i].block.is_some(), &|_| true));
+    (rows, pick)
 }
 
 /// Config-side exclusions every fallback-chain walk applies before it weighs
@@ -1676,6 +1988,89 @@ pub(crate) fn find_recovered_member(
     None
 }
 
+// ── test-only decision/dispatch rendezvous ───────────────────────────────────
+//
+// `auto_switch_if_needed`'s decision and dispatch must share one state-flock
+// hold; this seam is what makes that falsifiable. A test arms it with the
+// action it expects the automatic actor to decide; when the actor reaches the
+// decision/dispatch boundary with exactly that decision in hand it reports and
+// parks until the controller releases it — under whatever locks the production
+// path holds at that point. Scheduling only: the decision, the dispatch fns,
+// and every persisted value are the real ones. Fires at most once per arming
+// and only on an exact action match, so every unarmed caller passes through
+// untouched.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct AutoDecisionDone {
+    pub(crate) action: SwitchAction,
+}
+
+#[cfg(test)]
+struct AutoDecisionRendezvous {
+    action: SwitchAction,
+    reached: std::sync::mpsc::Sender<AutoDecisionDone>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+static AUTO_DECISION_RENDEZVOUS: std::sync::Mutex<Option<AutoDecisionRendezvous>> =
+    std::sync::Mutex::new(None);
+
+/// Arm the rendezvous for `action`: the next matching decision reports on
+/// `reached` and parks until a send on `release`. One rendezvous at a time;
+/// tests arming one hold a `HomeSandbox`, which serializes them.
+#[cfg(test)]
+pub(crate) fn install_auto_decision_rendezvous(
+    action: SwitchAction,
+) -> (
+    std::sync::mpsc::Receiver<AutoDecisionDone>,
+    std::sync::mpsc::Sender<()>,
+) {
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let mut slot = AUTO_DECISION_RENDEZVOUS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    assert!(
+        slot.is_none(),
+        "only one auto-decision rendezvous may be armed"
+    );
+    *slot = Some(AutoDecisionRendezvous {
+        action,
+        reached: reached_tx,
+        release: release_rx,
+    });
+    (reached_rx, release_tx)
+}
+
+/// The boundary's park: report the decision, then hold the actor here until
+/// the controller releases the dispatch.
+#[cfg(test)]
+fn auto_decision_rendezvous(action: &SwitchAction) {
+    let rendezvous = {
+        let mut slot = AUTO_DECISION_RENDEZVOUS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match slot.as_ref() {
+            Some(hook) if &hook.action == action => slot.take(),
+            _ => None,
+        }
+    };
+    let Some(rendezvous) = rendezvous else {
+        return;
+    };
+    rendezvous
+        .reached
+        .send(AutoDecisionDone {
+            action: action.clone(),
+        })
+        .expect("rendezvous controller stays alive until the boundary is reached");
+    rendezvous
+        .release
+        .recv()
+        .expect("rendezvous controller releases the dispatch");
+}
+
 /// If the active profile is a chain member past its threshold, switch to the
 /// next viable member — or, in wrap-off mode when the whole chain is spent and
 /// no sink exists, turn off all accounts. Returns the action taken, or None.
@@ -1683,63 +2078,94 @@ pub(crate) fn find_recovered_member(
 /// `active_burn_pct_per_hour` is the caller's in-memory burn rate for the
 /// active profile (ignored unless burn-aware mode is on) — same contract as
 /// [`next_target`], which this forwards it to.
+///
+/// Takes the shared [`crate::profile::ConfigHandle`] and runs the decision
+/// AND its dispatch inside ONE state-flock hold — the guard-then-flock shape
+/// the daemon's tick drain uses — so an explicit switch (CLI/TUI/MCP) that
+/// starts after the decision cannot complete before the dispatch and then be
+/// overwritten by the already-made decision; it waits out the transaction and
+/// lands last. The config guard is acquired first (Config ranks outer of the
+/// state flock in [`crate::lockorder`]); the dispatch goes through the
+/// `_locked` cores over that same guard — the guard-taking wrappers would
+/// re-lock a mutex this call already holds — and the guard is dropped before
+/// the feed republish below, so that sweep runs under no config guard. A
+/// caller holding a guard across this call self-deadlocks.
 pub(crate) fn auto_switch_if_needed(
-    config: &mut AppConfig,
+    config: &crate::profile::ConfigHandle,
     active_burn_pct_per_hour: Option<f64>,
 ) -> Result<Option<SwitchAction>> {
-    with_state_lock(|_held| {
-        let Some(active_name) = config.state.active_profile.as_ref() else {
-            return Ok(None);
+    #[allow(
+        clippy::expect_used,
+        reason = "config mutex poisoning is unrecoverable"
+    )]
+    let mut guard = config.lock().expect("config mutex poisoned");
+    let (action, changed) = with_state_lock(|_held| {
+        let config = &mut *guard;
+        let Some(action) = decide_auto_switch(config, active_burn_pct_per_hour) else {
+            return Ok((None, false));
         };
-        if !config.state.fallback_chain.iter().any(|n| n == active_name) {
-            return Ok(None);
-        }
-        let Some(active) = config.find(active_name) else {
-            return Ok(None);
-        };
-        // AUTH-4 parity with the scheduler-side walk: an auth-broken active's
-        // usage is frozen-stale (its fetches can't succeed), so exhaustion
-        // cannot be a precondition for leaving it. A canceled active is the same
-        // shape — a dead account whose cached window reads as idle headroom while
-        // every request 403s — so it also bypasses the exhaustion gate.
-        let weekly_pct = config.state.weekly_switch_threshold_pct();
-        if !config.is_auth_broken(active_name)
-            && !is_canceled(active)
-            && !is_exhausted_active(
-                active,
-                config.state.burn_aware_switching,
-                config.state.refresh_interval_ms,
-                active_burn_pct_per_hour,
-                weekly_blocked(active, weekly_pct),
-                config.state.burn_switch_floor_pct(),
-                config.state.burn_horizon_cap_ms(),
-            )
-        {
-            // Scoped active trigger (parity with `next_auto_switch_target`):
-            // a per-model weekly line crossed on an otherwise-healthy active
-            // (its `check_scoped` gate on) hops ONLY onto a clear member —
-            // hopping between equally model-blocked members buys nothing.
-            // Parity with the scheduler walk: a pinned sink stays parked.
-            if !active.last_resort
-                && scoped_weekly_blocked(active, weekly_pct)
-                && let Some(target) = fully_clear_target(config, weekly_pct)
-            {
-                switch_profile(config, &ProfileName::from(target.clone()))?;
-                return Ok(Some(SwitchAction::To(target)));
+        #[cfg(test)]
+        auto_decision_rendezvous(&action);
+        let changed = match &action {
+            SwitchAction::To(target) => {
+                switch_profile_locked(config, &ProfileName::from(target.clone()))?
             }
-            return Ok(None);
-        }
-
-        let Some(action) = next_target(config, active_burn_pct_per_hour) else {
-            return Ok(None);
+            SwitchAction::Off => switch_off_locked(config)?,
         };
+        Ok((Some(action), changed))
+    })?;
+    drop(guard);
+    if changed {
+        crate::daemon::publish_status(config);
+    }
+    Ok(action)
+}
 
-        match &action {
-            SwitchAction::To(target) => switch_profile(config, &ProfileName::from(target.clone()))?,
-            SwitchAction::Off => switch_off(config)?,
+/// [`auto_switch_if_needed`]'s decision half: which [`SwitchAction`] the
+/// active profile's state calls for, or `None` to stay put. Read-only over
+/// the config — the caller holds the config guard and the state flock, and
+/// dispatches the returned action under that same hold.
+fn decide_auto_switch(
+    config: &AppConfig,
+    active_burn_pct_per_hour: Option<f64>,
+) -> Option<SwitchAction> {
+    let active_name = config.state.active_profile.as_ref()?;
+    if !config.state.fallback_chain.iter().any(|n| n == active_name) {
+        return None;
+    }
+    let active = config.find(active_name)?;
+    // AUTH-4 parity with the scheduler-side walk: an auth-broken active's
+    // usage is frozen-stale (its fetches can't succeed), so exhaustion
+    // cannot be a precondition for leaving it. A canceled active is the same
+    // shape — a dead account whose cached window reads as idle headroom while
+    // every request 403s — so it also bypasses the exhaustion gate.
+    let weekly_pct = config.state.weekly_switch_threshold_pct();
+    if !config.is_auth_broken(active_name)
+        && !is_canceled(active)
+        && !is_exhausted_active(
+            active,
+            config.state.burn_aware_switching,
+            config.state.refresh_interval_ms,
+            active_burn_pct_per_hour,
+            weekly_blocked(active, weekly_pct),
+            config.state.burn_switch_floor_pct(),
+            config.state.burn_horizon_cap_ms(),
+        )
+    {
+        // Scoped active trigger (parity with `next_auto_switch_target`):
+        // a per-model weekly line crossed on an otherwise-healthy active
+        // (its `check_scoped` gate on) hops ONLY onto a clear member —
+        // hopping between equally model-blocked members buys nothing.
+        // Parity with the scheduler walk: a pinned sink stays parked.
+        if !active.last_resort
+            && scoped_weekly_blocked(active, weekly_pct)
+            && let Some(target) = fully_clear_target(config, weekly_pct)
+        {
+            return Some(SwitchAction::To(target));
         }
-        Ok(Some(action))
-    })
+        return None;
+    }
+    next_target(config, active_burn_pct_per_hour)
 }
 
 #[cfg(test)]

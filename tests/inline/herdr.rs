@@ -333,6 +333,7 @@ fn registry_entry_from_reads_every_real_shape() {
     assert!(github.enabled);
     assert_eq!(github.source_kind.as_deref(), Some("github"));
     assert_eq!(github.plugin_root, None);
+    assert_eq!(github.resolved_commit.as_deref(), Some("abc123"));
     assert!(github.warnings.is_empty());
 
     let disabled = registry_entry_from(&plugin_list_json(DISABLED)).expect("disabled");
@@ -355,6 +356,881 @@ fn registry_entry_from_reads_every_real_shape() {
     assert!(
         registry_entry_from(&plugin_list_json(r#"{"plugin_id":"other","enabled":true}"#)).is_none(),
         "another plugin is not ours"
+    );
+}
+
+/// The one install refusal: a registered local link is the developer's live
+/// tree, herdr refuses a github install over it, and clauth must say so before
+/// the fetch, naming the tree and both ways out.
+#[test]
+fn install_refuses_over_a_registered_local_link() {
+    let local = registry_entry_from(&plugin_list_json(
+        r#"{"enabled":true,"plugin_id":"clauth","plugin_root":"/tree/herdr-plugin","source":{"kind":"local"}}"#,
+    ))
+    .expect("entry");
+    let err = refuse_over_local_link(Some(&local)).expect_err("a local link refuses");
+    let text = format!("{err:#}");
+    assert!(
+        text.contains("linked from a local checkout: /tree/herdr-plugin"),
+        "the error names the tree: {text}"
+    );
+    assert!(
+        text.contains("clauth herdr uninstall"),
+        "the error names the way out: {text}"
+    );
+    assert!(
+        text.contains("herdr plugin link /tree/herdr-plugin"),
+        "the error names the relink: {text}"
+    );
+
+    let github = registry_entry_from(&plugin_list_json(
+        r#"{"enabled":true,"plugin_id":"clauth","source":{"kind":"github"}}"#,
+    ))
+    .expect("entry");
+    refuse_over_local_link(Some(&github)).expect("a github entry proceeds");
+    refuse_over_local_link(None).expect("an absent entry proceeds");
+}
+
+/// `install` refuses before herdr's installer runs: the shim answers a local
+/// link, and no other argv may reach it. The refusal saves the doomed fetch,
+/// and it lands before the release probe — the git shim would record the
+/// probe's argv, and no ruled line is printed.
+#[cfg(unix)]
+#[test]
+fn install_refuses_a_local_link_before_running_herdrs_installer() {
+    let home = crate::testutil::HomeSandbox::new();
+    let answer = plugin_list_json(
+        r#"{"enabled":true,"plugin_id":"clauth","plugin_root":"/tree/herdr-plugin","source":{"kind":"local"}}"#,
+    );
+    let shim = write_shim(
+        home.home(),
+        "herdr",
+        "if [ \"$1\" = \"plugin\" ] && [ \"$2\" = \"list\" ]; then echo \"$ANSWER\"; exit 0; fi; echo \"$@\" >> \"$(dirname \"$0\")/install.log\"; exit 0",
+    );
+    git_shim(home.home());
+    let path = format!(
+        "{}:{}",
+        home.home().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            (
+                "HERDR_BIN_PATH",
+                Some(std::ffi::OsStr::new(shim.to_str().expect("utf8 path"))),
+            ),
+            ("ANSWER", Some(std::ffi::OsStr::new(&answer))),
+            ("PATH", Some(std::ffi::OsStr::new(&path))),
+        ],
+    );
+    let capture = InstallLines::new();
+    let _capture = capture.capture_here();
+
+    let err = install(None, true, true, false).expect_err("a local link refuses install");
+    assert!(
+        format!("{err:#}").contains("linked from a local checkout"),
+        "the refusal reaches the user: {err:#}"
+    );
+    assert!(
+        !home.home().join("install.log").exists(),
+        "herdr's installer never ran"
+    );
+    assert!(
+        !home.home().join("git.log").exists(),
+        "the release probe never ran: the refusal lands first"
+    );
+    assert!(
+        capture.snapshot().is_empty(),
+        "a refused install printed no ruled line"
+    );
+}
+
+/// The installing line names the tag only when the release probe picked one;
+/// without a tag the line is the unpinned form.
+#[test]
+fn the_installing_line_names_the_pinned_tag() {
+    assert_eq!(
+        installing_line(Some("v0.15.1")),
+        "clauth: installing uwuclxdy/clauth/herdr-plugin at v0.15.1 into herdr"
+    );
+    assert_eq!(
+        installing_line(None),
+        "clauth: installing uwuclxdy/clauth/herdr-plugin into herdr"
+    );
+}
+
+/// The fallback note names the probe failure and the unpinned fallback, so a
+/// probe failure never reads as a silent change of plan.
+#[test]
+fn the_unpinned_release_note_names_the_error_and_the_fallback() {
+    let note = unpinned_release_note(&anyhow::anyhow!("boom"));
+    assert!(
+        note.contains("could not resolve the latest release (boom)"),
+        "the note names the probe failure: {note}"
+    );
+    assert!(
+        note.contains("installing uwuclxdy/clauth/herdr-plugin unpinned"),
+        "the note names the fallback: {note}"
+    );
+}
+
+/// The picked tag is the numeric-component maximum, never the string maximum:
+/// `v0.15.10` outranks `v0.15.9`.
+#[test]
+fn pick_release_prefers_the_numeric_maximum_version() {
+    let text = concat!(
+        "cccccccccccccccc\trefs/tags/v0.15.9\n",
+        "bbbbbbbbbbbbbbbb\trefs/tags/v0.15.10\n",
+        "aaaaaaaaaaaaaaaa\trefs/tags/v0.14.5\n",
+    );
+    assert_eq!(
+        pick_release(text),
+        Some(("v0.15.10".to_string(), "bbbbbbbbbbbbbbbb".to_string()))
+    );
+}
+
+/// An annotated tag prints both lines: the tag object and its peeled `^{}`
+/// commit. The peeled commit is what an install at the tag resolves to, so it
+/// is the compare target, never the tag object's sha.
+#[test]
+fn pick_release_prefers_the_peeled_commit_of_an_annotated_tag() {
+    let text = concat!(
+        "feedfeedfeedfeedfeedfeedfeedfeed\trefs/tags/v0.15.1\n",
+        "bbbbbbbbbbbbbbbb\trefs/tags/v0.15.1^{}\n",
+    );
+    assert_eq!(
+        pick_release(text),
+        Some(("v0.15.1".to_string(), "bbbbbbbbbbbbbbbb".to_string()))
+    );
+}
+
+/// A lightweight tag prints only the plain line; it is still a release target.
+#[test]
+fn pick_release_accepts_a_lightweight_tag_line() {
+    let text = "bbbbbbbbbbbbbbbb\trefs/tags/v0.15.1\n";
+    assert_eq!(
+        pick_release(text),
+        Some(("v0.15.1".to_string(), "bbbbbbbbbbbbbbbb".to_string()))
+    );
+}
+
+/// Every line that is not a conforming release tag is skipped, and no tags
+/// means `None`: the heal then no-ops and the install proceeds unpinned.
+#[test]
+fn pick_release_skips_unparseable_lines_and_non_release_tags() {
+    let text = concat!(
+        "noise\n",
+        "cccccccccccccccc\trefs/tags/not-a-version\n",
+        "bbbbbbbbbbbbbbbb\trefs/tags/x1.2.3\n",
+        "1111111111111111\trefs/tags/v+1.2.3\n",
+        "aaaaaaaaaaaaaaaa\trefs/tags/v1.2\n",
+        "dddddddddddddddd\trefs/tags/v1.2.3.4\n",
+        "eeeeeeeeeeeeeeee\trefs/tags/v1.2.3^{}extra\n",
+        "zzzzzzzzzzzzzzzz\trefs/tags/v9.9.9\n",
+    );
+    assert_eq!(pick_release(text), None);
+    assert_eq!(pick_release(""), None);
+}
+
+/// A `git` shim answering `ls-remote --tags` with `$TAGS_OUTPUT`, the real
+/// git's output shape, and recording every argv into `git.log` so a test pins
+/// exactly what the code passed. The heal and `install` resolve `git` off
+/// `PATH`, so the test prepends the shim's dir.
+#[cfg(unix)]
+fn git_shim(dir: &Path) -> PathBuf {
+    write_shim(
+        dir,
+        "git",
+        "echo \"$@\" >> \"$(dirname \"$0\")/git.log\"; if [ \"$1\" = \"ls-remote\" ] && [ \"$2\" = \"--tags\" ]; then printf '%s' \"$TAGS_OUTPUT\"; fi; exit 0",
+    )
+}
+
+/// One annotated release tag's `ls-remote --tags` pair, the real git's shape:
+/// the tag-object line and its peeled `^{}` commit line.
+#[cfg(unix)]
+fn annotated_tag(tag: &str, tag_object: &str, commit: &str) -> String {
+    format!("{tag_object}\trefs/tags/{tag}\n{commit}\trefs/tags/{tag}^{{}}\n")
+}
+
+/// One lightweight release tag's single `ls-remote --tags` line.
+#[cfg(unix)]
+fn lightweight_tag(tag: &str, commit: &str) -> String {
+    format!("{commit}\trefs/tags/{tag}\n")
+}
+
+/// The heal's staleness truth is the installed checkout's commit, so the shim
+/// flips its `plugin list --json` answer when an install runs: `ANSWER_BEFORE`
+/// until the `installed` state file exists, then `ANSWER_AFTER` (the install
+/// leg creates it). Every other invocation logs its argv into `heal.log`.
+#[cfg(unix)]
+fn stateful_heal_shim(dir: &Path) -> PathBuf {
+    write_shim(
+        dir,
+        "herdr",
+        "if [ \"$1\" = \"plugin\" ] && [ \"$2\" = \"list\" ]; then if [ -f \"$(dirname \"$0\")/installed\" ]; then echo \"$ANSWER_AFTER\"; else echo \"$ANSWER_BEFORE\"; fi; exit 0; fi; if [ \"$1\" = \"plugin\" ] && [ \"$2\" = \"install\" ]; then : > \"$(dirname \"$0\")/installed\"; fi; echo \"$@\" >> \"$(dirname \"$0\")/heal.log\"; exit 0",
+    )
+}
+
+/// The heal's own env: the herdr shim, the git shim ahead of `PATH`, the
+/// list answers, and the `ls-remote --tags` body. Returns the `EnvPin` guard.
+#[cfg(unix)]
+fn heal_env<'a>(
+    home: &'a crate::testutil::HomeSandbox,
+    herdr_shim: &Path,
+    before: &str,
+    after: &str,
+    tags: &str,
+    extra: &[(&'static str, &OsStr)],
+) -> crate::testutil::EnvPin<'a> {
+    let path = format!(
+        "{}:{}",
+        home.home().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut pins: Vec<(&'static str, Option<&OsStr>)> = vec![
+        ("HERDR_BIN_PATH", Some(herdr_shim.as_os_str())),
+        ("ANSWER_BEFORE", Some(OsStr::new(before))),
+        ("ANSWER_AFTER", Some(OsStr::new(after))),
+        ("TAGS_OUTPUT", Some(OsStr::new(tags))),
+        ("PATH", Some(OsStr::new(&path))),
+    ];
+    for (key, value) in extra {
+        pins.push((key, Some(*value)));
+    }
+    crate::testutil::EnvPin::new(home, &pins)
+}
+
+/// A stale github install (installed commit differs from the newest release
+/// tag's commit) reinstalls pinned to that tag, and the success line names
+/// the tag and both commits. The numeric-component maximum is the picked tag:
+/// `v0.15.10` outranks `v0.15.9`, which a string compare gets backwards. The
+/// landed commit is the fresh registry probe's — it wins over the tag's.
+#[cfg(unix)]
+#[test]
+fn plugin_heal_reinstalls_a_github_install_at_an_older_commit() {
+    let home = crate::testutil::HomeSandbox::new();
+    let before = plugin_list_json(
+        r#"{"enabled":true,"plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth","resolved_commit":"aaaaaaaaaaaaaaaa"}}"#,
+    );
+    let after = plugin_list_json(
+        r#"{"enabled":true,"plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth","resolved_commit":"dddddddddddddddd"}}"#,
+    );
+    let shim = stateful_heal_shim(home.home());
+    git_shim(home.home());
+    let tags = format!(
+        "{}{}",
+        lightweight_tag("v0.15.9", "cccccccccccccccc"),
+        annotated_tag(
+            "v0.15.10",
+            "feedfeedfeedfeedfeedfeedfeedfeed",
+            "bbbbbbbbbbbbbbbb"
+        ),
+    );
+    let _env = heal_env(&home, &shim, &before, &after, &tags, &[]);
+
+    let line = plugin_heal_line()
+        .expect("heal runs")
+        .expect("update lands");
+    assert!(
+        line.contains("reinstalled the herdr plugin from uwuclxdy/clauth/herdr-plugin at v0.15.10"),
+        "the line names the release the update landed at: {line}"
+    );
+    assert!(
+        line.contains("aaaaaaa -> ddddddd"),
+        "the line names the fresh probe's commit, which wins over the tag's: {line}"
+    );
+
+    let log = std::fs::read_to_string(home.home().join("heal.log")).unwrap_or_default();
+    assert_eq!(
+        log.trim(),
+        "plugin install uwuclxdy/clauth/herdr-plugin --ref v0.15.10 --yes",
+        "the update is a reinstall pinned to the release tag, preview skipped"
+    );
+    let git_log = std::fs::read_to_string(home.home().join("git.log")).unwrap_or_default();
+    assert_eq!(
+        git_log.trim(),
+        "ls-remote --tags https://github.com/uwuclxdy/clauth.git",
+        "the probe reads the release tags"
+    );
+}
+
+/// An installed commit equal to the newest release tag's peeled commit is
+/// current: the remote probe runs, nothing installs. The peeled `^{}` sha is
+/// the compare target — the tag object's sha never equals an install at the
+/// tag, and comparing against it would reinstall every tick.
+#[cfg(unix)]
+#[test]
+fn plugin_heal_skips_an_install_at_the_latest_release() {
+    let home = crate::testutil::HomeSandbox::new();
+    let entry = plugin_list_json(
+        r#"{"enabled":true,"plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth","resolved_commit":"bbbbbbbbbbbbbbbb"}}"#,
+    );
+    let shim = stateful_heal_shim(home.home());
+    git_shim(home.home());
+    let tags = annotated_tag(
+        "v0.15.1",
+        "feedfeedfeedfeedfeedfeedfeedfeed",
+        "bbbbbbbbbbbbbbbb",
+    );
+    let _env = heal_env(&home, &shim, &entry, &entry, &tags, &[]);
+
+    assert!(
+        plugin_heal_line().expect("heal runs").is_none(),
+        "a current install is a no-op"
+    );
+    assert!(!home.home().join("heal.log").exists(), "nothing installed");
+    assert!(
+        home.home().join("git.log").exists(),
+        "the probe ran: the no-op verdict came from the tag comparison"
+    );
+}
+
+/// When the fresh registry probe after a reinstall carries no commit (an
+/// older herdr's registration), the line falls back to the picked tag's
+/// commit rather than drop the target half.
+#[cfg(unix)]
+#[test]
+fn plugin_heal_reports_the_tag_commit_when_the_fresh_probe_has_no_commit() {
+    let home = crate::testutil::HomeSandbox::new();
+    let before = plugin_list_json(
+        r#"{"enabled":true,"plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth","resolved_commit":"aaaaaaaaaaaaaaaa"}}"#,
+    );
+    let after = plugin_list_json(
+        r#"{"enabled":true,"plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth"}}"#,
+    );
+    let shim = stateful_heal_shim(home.home());
+    git_shim(home.home());
+    let tags = lightweight_tag("v0.15.1", "cccccccccccccccc");
+    let _env = heal_env(&home, &shim, &before, &after, &tags, &[]);
+
+    let line = plugin_heal_line()
+        .expect("heal runs")
+        .expect("update lands");
+    assert!(
+        line.contains("aaaaaaa -> ccccccc"),
+        "the fallback names the tag's commit: {line}"
+    );
+    assert!(
+        line.contains("at v0.15.1"),
+        "the line still names the tag: {line}"
+    );
+}
+
+/// Every shape that carries no github commit is skipped before any network
+/// call: no clauth entry, a linked checkout, a disabled entry, and a github
+/// entry whose commit field is missing.
+#[cfg(unix)]
+#[test]
+fn plugin_heal_skips_every_non_stale_shape() {
+    let home = crate::testutil::HomeSandbox::new();
+    let stale = plugin_list_json(
+        r#"{"enabled":true,"plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth","resolved_commit":"aaaaaaaaaaaaaaaa"}}"#,
+    );
+    let shim = stateful_heal_shim(home.home());
+    git_shim(home.home());
+    let _env = heal_env(&home, &shim, &stale, &stale, "", &[]);
+
+    let cases = [
+        (
+            "no clauth entry",
+            plugin_list_json(r#"{"plugin_id":"other"}"#),
+        ),
+        (
+            "a linked checkout",
+            plugin_list_json(r#"{"enabled":true,"plugin_id":"clauth","source":{"kind":"local"}}"#),
+        ),
+        (
+            "a disabled entry",
+            plugin_list_json(
+                r#"{"enabled":false,"plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth","resolved_commit":"aaaaaaaaaaaaaaaa"}}"#,
+            ),
+        ),
+        (
+            "a github entry without a commit",
+            plugin_list_json(r#"{"enabled":true,"plugin_id":"clauth","source":{"kind":"github"}}"#),
+        ),
+        (
+            "a fork's install",
+            plugin_list_json(
+                r#"{"enabled":true,"plugin_id":"clauth","source":{"kind":"github","owner":"someone","repo":"clauth","resolved_commit":"aaaaaaaaaaaaaaaa"}}"#,
+            ),
+        ),
+        (
+            "a fork under a different repo name",
+            plugin_list_json(
+                r#"{"enabled":true,"plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth-plugins","resolved_commit":"aaaaaaaaaaaaaaaa"}}"#,
+            ),
+        ),
+    ];
+    for (why, answer) in cases {
+        let _answer = crate::testutil::EnvPin::new(
+            &home,
+            &[("ANSWER_BEFORE", Some(std::ffi::OsStr::new(&answer)))],
+        );
+        assert!(
+            plugin_heal_line().expect("heal runs").is_none(),
+            "case `{why}` must be a no-op"
+        );
+    }
+    assert!(
+        !home.home().join("heal.log").exists(),
+        "none of the no-op cases installed anything"
+    );
+    assert!(
+        !home.home().join("git.log").exists(),
+        "none of the no-op cases probed the remote"
+    );
+}
+
+/// A remote probe that fails (git exits nonzero) fails the heal, never skips:
+/// a skip would leave a possibly-stale install silent.
+#[cfg(unix)]
+#[test]
+fn plugin_heal_fails_loud_when_the_remote_probe_fails() {
+    let home = crate::testutil::HomeSandbox::new();
+    let entry = plugin_list_json(
+        r#"{"enabled":true,"plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth","resolved_commit":"aaaaaaaaaaaaaaaa"}}"#,
+    );
+    let shim = stateful_heal_shim(home.home());
+    write_shim(home.home(), "git", "exit 1");
+    let _env = heal_env(&home, &shim, &entry, &entry, "", &[]);
+
+    let err = plugin_heal_line().expect_err("a broken remote probe must fail, not skip");
+    assert!(
+        format!("{err:#}").contains("ls-remote"),
+        "the error names the failing probe: {err:#}"
+    );
+}
+
+/// A remote with no conforming release tag is nothing to reinstall: the heal
+/// is a no-op, never an unpinned HEAD install, and unparseable lines are
+/// skipped rather than read as failure.
+#[cfg(unix)]
+#[test]
+fn plugin_heal_skips_when_no_release_tag_exists() {
+    let home = crate::testutil::HomeSandbox::new();
+    let entry = plugin_list_json(
+        r#"{"enabled":true,"plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth","resolved_commit":"aaaaaaaaaaaaaaaa"}}"#,
+    );
+    let shim = stateful_heal_shim(home.home());
+    git_shim(home.home());
+    let _env = heal_env(&home, &shim, &entry, &entry, "", &[]);
+
+    for tags in [
+        "",
+        "no commit here\n",
+        "cccccccccccccccc\trefs/tags/not-a-release\n",
+    ] {
+        let _tags = crate::testutil::EnvPin::new(
+            &home,
+            &[("TAGS_OUTPUT", Some(std::ffi::OsStr::new(tags)))],
+        );
+        assert!(
+            plugin_heal_line().expect("heal runs").is_none(),
+            "no conforming tag in {tags:?} is a no-op, never an error"
+        );
+    }
+    assert!(!home.home().join("heal.log").exists(), "nothing installed");
+}
+
+/// A failed install's error read: stdout first, stderr appended, so the
+/// heal's failure line carries whatever herdr printed.
+#[cfg(unix)]
+#[test]
+fn plugin_heal_fails_loud_when_the_install_fails() {
+    let home = crate::testutil::HomeSandbox::new();
+    let entry = plugin_list_json(
+        r#"{"enabled":true,"plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth","resolved_commit":"aaaaaaaaaaaaaaaa"}}"#,
+    );
+    let shim = write_shim(
+        home.home(),
+        "herdr",
+        "if [ \"$1\" = \"plugin\" ] && [ \"$2\" = \"list\" ]; then echo \"$ANSWER_BEFORE\"; exit 0; fi; echo \"$@\" >> \"$(dirname \"$0\")/heal.log\"; echo 'install broke'; echo 'more stderr' >&2; exit 1",
+    );
+    git_shim(home.home());
+    let tags = lightweight_tag("v0.15.1", "bbbbbbbbbbbbbbbb");
+    let _env = heal_env(&home, &shim, &entry, &entry, &tags, &[]);
+
+    let err = plugin_heal_line().expect_err("a failed install must fail the heal");
+    let shown = format!("{err:#}");
+    assert!(
+        shown.contains("install broke"),
+        "the error carries stdout: {shown}"
+    );
+    assert!(
+        shown.contains("more stderr"),
+        "the error carries stderr: {shown}"
+    );
+    assert!(
+        shown.contains("--ref v0.15.1"),
+        "the failure names the pinned install: {shown}"
+    );
+    let log = std::fs::read_to_string(home.home().join("heal.log")).unwrap_or_default();
+    assert_eq!(
+        log.trim(),
+        "plugin install uwuclxdy/clauth/herdr-plugin --ref v0.15.1 --yes",
+        "the failed install was pinned to the tag"
+    );
+}
+
+/// The heal-level twin of the bound: a stalled install costs the caller the
+/// timeout, never a hang — the in-flight claim must not sit on a stalled
+/// fetch.
+#[cfg(unix)]
+#[test]
+fn plugin_heal_bounds_a_stalled_install() {
+    let home = crate::testutil::HomeSandbox::new();
+    let entry = plugin_list_json(
+        r#"{"enabled":true,"plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth","resolved_commit":"aaaaaaaaaaaaaaaa"}}"#,
+    );
+    let shim = write_shim(
+        home.home(),
+        "herdr",
+        "if [ \"$1\" = \"plugin\" ] && [ \"$2\" = \"list\" ]; then echo \"$ANSWER_BEFORE\"; exit 0; fi; echo \"$@\" >> \"$(dirname \"$0\")/heal.log\"; exec sleep 10",
+    );
+    git_shim(home.home());
+    let tags = lightweight_tag("v0.15.1", "bbbbbbbbbbbbbbbb");
+    let _env = heal_env(&home, &shim, &entry, &entry, &tags, &[]);
+
+    let start = std::time::Instant::now();
+    let err = plugin_heal_line_with(std::time::Duration::from_secs(1))
+        .expect_err("a stalled install must fail the heal, not hang");
+    let shown = format!("{err:#}");
+    assert!(
+        shown.contains("timed out after 1s"),
+        "the error names the bound: {shown}"
+    );
+    assert!(
+        shown.contains("--ref v0.15.1"),
+        "the timeout names the pinned install: {shown}"
+    );
+    let log = std::fs::read_to_string(home.home().join("heal.log")).unwrap_or_default();
+    assert_eq!(
+        log.trim(),
+        "plugin install uwuclxdy/clauth/herdr-plugin --ref v0.15.1 --yes",
+        "the stalled install was pinned to the tag"
+    );
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(5),
+        "the heal is bounded, not the shim's full sleep"
+    );
+}
+
+/// `heal_detached` reinstalls once per throttle window: the first attempt
+/// installs, a second spawns nothing.
+#[cfg(unix)]
+#[test]
+fn heal_detached_reinstalls_once_and_throttles() {
+    use crate::testutil::join_background_tasks;
+
+    let home = crate::testutil::HomeSandbox::new();
+    let before = plugin_list_json(
+        r#"{"enabled":true,"plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth","resolved_commit":"aaaaaaaaaaaaaaaa"}}"#,
+    );
+    let after = plugin_list_json(
+        r#"{"enabled":true,"plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth","resolved_commit":"bbbbbbbbbbbbbbbb"}}"#,
+    );
+    let shim = stateful_heal_shim(home.home());
+    git_shim(home.home());
+    let tags = lightweight_tag("v0.15.1", "bbbbbbbbbbbbbbbb");
+    let _env = heal_env(
+        &home,
+        &shim,
+        &before,
+        &after,
+        &tags,
+        &[("HERDR_SHIM_STATE", std::ffi::OsStr::new("1"))],
+    );
+    reset_heal_throttle_for_test();
+
+    heal_detached();
+    join_background_tasks();
+    let log = std::fs::read_to_string(home.home().join("heal.log")).unwrap_or_default();
+    assert_eq!(
+        log.trim(),
+        "plugin install uwuclxdy/clauth/herdr-plugin --ref v0.15.1 --yes",
+        "the first attempt installs"
+    );
+
+    // The floor is armed by the first attempt: a second spawns nothing.
+    heal_detached();
+    join_background_tasks();
+    let log = std::fs::read_to_string(home.home().join("heal.log")).unwrap_or_default();
+    assert_eq!(
+        log.trim(),
+        "plugin install uwuclxdy/clauth/herdr-plugin --ref v0.15.1 --yes",
+        "the floor refuses a second attempt"
+    );
+}
+
+/// The opt-out gates the network update before the throttle claim.
+#[cfg(unix)]
+#[test]
+fn heal_detached_respects_the_update_optout() {
+    use crate::testutil::join_background_tasks;
+
+    let home = crate::testutil::HomeSandbox::new();
+    let entry = plugin_list_json(
+        r#"{"enabled":true,"plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth","resolved_commit":"aaaaaaaaaaaaaaaa"}}"#,
+    );
+    let shim = stateful_heal_shim(home.home());
+    git_shim(home.home());
+    let tags = lightweight_tag("v0.15.1", "bbbbbbbbbbbbbbbb");
+    let _env = heal_env(
+        &home,
+        &shim,
+        &entry,
+        &entry,
+        &tags,
+        &[
+            ("HERDR_SHIM_STATE", std::ffi::OsStr::new("1")),
+            ("CLAUTH_NO_UPDATE", std::ffi::OsStr::new("1")),
+        ],
+    );
+    reset_heal_throttle_for_test();
+
+    heal_detached();
+    join_background_tasks();
+    assert!(
+        !home.home().join("heal.log").exists(),
+        "the opt-out gates the network update"
+    );
+
+    // The gate must run BEFORE the throttle claim: if the opted-out call had
+    // claimed, the floor would refuse this second, un-gated call. It landing
+    // proves the opted-out call never armed the floor.
+    let _unset = crate::testutil::EnvPin::new(&home, &[("CLAUTH_NO_UPDATE", None)]);
+    heal_detached();
+    join_background_tasks();
+    let log = std::fs::read_to_string(home.home().join("heal.log")).unwrap_or_default();
+    assert_eq!(
+        log.trim(),
+        "plugin install uwuclxdy/clauth/herdr-plugin --ref v0.15.1 --yes",
+        "an un-gated call right after an opted-out one still installs"
+    );
+}
+
+/// The fail-closed sentinel: `heal_detached` refuses to run when only
+/// `HERDR_BIN_PATH` is pinned, because a herdr pane injects that with the
+/// operator's real binary. The shim-state var is the sentinel a test fake sets.
+#[cfg(unix)]
+#[test]
+#[should_panic(expected = "stage a herdr shim beside a `HERDR_SHIM_STATE` pin")]
+fn heal_detached_fails_closed_without_the_shim_sentinel() {
+    let home = crate::testutil::HomeSandbox::new();
+    reset_heal_throttle_for_test();
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            (
+                "HERDR_BIN_PATH",
+                Some(home.home().join("no-such-herdr").as_os_str()),
+            ),
+            ("HERDR_SHIM_STATE", None),
+            ("CLAUTH_NO_UPDATE", None),
+        ],
+    );
+
+    heal_detached();
+}
+
+/// `install`'s herdr shim: answers the plugin list with `$ANSWER` (a registry
+/// with no clauth entry, so no local-link refusal fires) and records the
+/// install argv.
+#[cfg(unix)]
+fn install_shim(dir: &Path) -> PathBuf {
+    write_shim(
+        dir,
+        "herdr",
+        "if [ \"$1\" = \"plugin\" ] && [ \"$2\" = \"list\" ]; then echo \"$ANSWER\"; exit 0; fi; echo \"$@\" >> \"$(dirname \"$0\")/install.log\"; exit 0",
+    )
+}
+
+/// The env the install tests share: the herdr shim, the git shim ahead of
+/// `PATH`, the registry answer, and the `ls-remote --tags` body.
+#[cfg(unix)]
+fn install_env<'a>(
+    home: &'a crate::testutil::HomeSandbox,
+    herdr_shim: &Path,
+    answer: &str,
+    tags: &str,
+) -> crate::testutil::EnvPin<'a> {
+    let path = format!(
+        "{}:{}",
+        home.home().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    crate::testutil::EnvPin::new(
+        home,
+        &[
+            ("HERDR_BIN_PATH", Some(herdr_shim.as_os_str())),
+            ("ANSWER", Some(std::ffi::OsStr::new(answer))),
+            ("TAGS_OUTPUT", Some(std::ffi::OsStr::new(tags))),
+            ("PATH", Some(std::ffi::OsStr::new(&path))),
+        ],
+    )
+}
+
+/// `install` resolves the newest release tag and pins the install to it: the
+/// recorded argv carries `--ref <tag>`, and the printed line names the tag.
+#[cfg(unix)]
+#[test]
+fn install_pins_the_latest_release_tag() {
+    let home = crate::testutil::HomeSandbox::new();
+    let shim = install_shim(home.home());
+    git_shim(home.home());
+    let tags = annotated_tag(
+        "v0.15.1",
+        "feedfeedfeedfeedfeedfeedfeedfeed",
+        "bbbbbbbbbbbbbbbb",
+    );
+    let answer = plugin_list_json(r#"{"plugin_id":"other"}"#);
+    let _env = install_env(&home, &shim, &answer, &tags);
+    let capture = InstallLines::new();
+    let _capture = capture.capture_here();
+
+    install(None, true, true, false).expect("install runs");
+    let log = std::fs::read_to_string(home.home().join("install.log")).unwrap_or_default();
+    assert_eq!(
+        log.trim(),
+        "plugin install uwuclxdy/clauth/herdr-plugin --ref v0.15.1 --yes",
+        "the install is pinned to the release tag"
+    );
+    let git_log = std::fs::read_to_string(home.home().join("git.log")).unwrap_or_default();
+    assert_eq!(
+        git_log.trim(),
+        "ls-remote --tags https://github.com/uwuclxdy/clauth.git",
+        "the probe reads the release tags"
+    );
+    let printed = capture.snapshot();
+    assert_eq!(
+        printed,
+        ["clauth: installing uwuclxdy/clauth/herdr-plugin at v0.15.1 into herdr"],
+        "the printed line names the tag the argv pins"
+    );
+}
+
+/// A failed release probe never fails the install: it prints the one-line
+/// note and proceeds unpinned.
+#[cfg(unix)]
+#[test]
+fn install_proceeds_unpinned_when_the_release_probe_fails() {
+    let home = crate::testutil::HomeSandbox::new();
+    let shim = install_shim(home.home());
+    write_shim(home.home(), "git", "exit 1");
+    let answer = plugin_list_json(r#"{"plugin_id":"other"}"#);
+    let _env = install_env(&home, &shim, &answer, "");
+    let capture = InstallLines::new();
+    let _capture = capture.capture_here();
+
+    install(None, true, true, false).expect("the probe failure never fails the install");
+    let log = std::fs::read_to_string(home.home().join("install.log")).unwrap_or_default();
+    assert_eq!(
+        log.trim(),
+        "plugin install uwuclxdy/clauth/herdr-plugin --yes",
+        "the fallback install is unpinned"
+    );
+    let printed = capture.snapshot();
+    assert_eq!(
+        printed.len(),
+        2,
+        "the note and the line both printed: {printed:?}"
+    );
+    assert!(
+        printed[0].contains("could not resolve the latest release ("),
+        "the note names the probe failure: {printed:?}"
+    );
+    assert!(
+        printed[0].contains("installing uwuclxdy/clauth/herdr-plugin unpinned"),
+        "the note names the fallback: {printed:?}"
+    );
+    assert_eq!(
+        printed[1], "clauth: installing uwuclxdy/clauth/herdr-plugin into herdr",
+        "the unpinned line follows the note: {printed:?}"
+    );
+}
+
+/// A remote with no conforming release tag installs unpinned, silently.
+#[cfg(unix)]
+#[test]
+fn install_proceeds_unpinned_when_no_release_tag_exists() {
+    let home = crate::testutil::HomeSandbox::new();
+    let shim = install_shim(home.home());
+    git_shim(home.home());
+    let answer = plugin_list_json(r#"{"plugin_id":"other"}"#);
+    let _env = install_env(&home, &shim, &answer, "no commit here\n");
+    let capture = InstallLines::new();
+    let _capture = capture.capture_here();
+
+    install(None, true, true, false).expect("install runs");
+    let log = std::fs::read_to_string(home.home().join("install.log")).unwrap_or_default();
+    assert_eq!(
+        log.trim(),
+        "plugin install uwuclxdy/clauth/herdr-plugin --yes",
+        "an install with no release tag is unpinned"
+    );
+    assert_eq!(
+        capture.snapshot(),
+        ["clauth: installing uwuclxdy/clauth/herdr-plugin into herdr"],
+        "no tag prints the unpinned line, and no note"
+    );
+}
+
+/// The order behind one confirm: the config write lands BEFORE the unlink, so
+/// a failing unlink leaves a consistent state (no plugin, no binding) and the
+/// error names the manual command. The shim fails `plugin uninstall` loudly;
+/// the config must already be stripped by then.
+#[cfg(unix)]
+#[test]
+fn uninstall_writes_the_clean_config_before_the_unlink() {
+    let home = crate::testutil::HomeSandbox::new();
+    let path = home.home().join("config.toml");
+    let orig = "# my config\n[ui]\naccent = \"cyan\"\n";
+    let plan = plan_config(orig, "prefix+a", false).expect("plan");
+    let wired = with_append(orig, &plan.append);
+    std::fs::write(&path, &wired).expect("fixture written");
+
+    let shim = write_shim(
+        home.home(),
+        "herdr",
+        "if [ \"$1\" = \"plugin\" ] && [ \"$2\" = \"uninstall\" ]; then echo \"$@\" >> \"$(dirname \"$0\")/uninstall.log\"; echo boom >&2; exit 1; fi; exit 0",
+    );
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            (
+                "HERDR_BIN_PATH",
+                Some(std::ffi::OsStr::new(shim.to_str().expect("utf8 path"))),
+            ),
+            ("HERDR_CONFIG_PATH", Some(path.as_os_str())),
+        ],
+    );
+
+    let err = uninstall(false, true).expect_err("a failing unlink fails the run");
+    let shown = format!("{err:#}");
+    assert!(
+        shown.contains("boom"),
+        "the unlink failure surfaces: {shown}"
+    );
+    assert!(
+        shown.contains("the config was already cleaned"),
+        "the error names the residual: {shown}"
+    );
+    assert!(
+        shown.contains("plugin uninstall clauth"),
+        "the error names the manual finish: {shown}"
+    );
+    let text = std::fs::read_to_string(&path).expect("config reads");
+    assert!(
+        !text.contains("# clauth herdr plugin"),
+        "the config was already cleaned when the unlink failed: {text}"
+    );
+    let log = std::fs::read_to_string(home.home().join("uninstall.log")).unwrap_or_default();
+    assert_eq!(
+        log.trim(),
+        "plugin uninstall clauth",
+        "the unlink ran after the config write: {log}"
     );
 }
 
@@ -1820,5 +2696,216 @@ fn both_knobs_off_publish_both_clears_in_one_call() {
     assert!(
         !line.contains("--display-agent"),
         "no publishes on the off path: {line}"
+    );
+}
+
+// ── report-profile.sh pane resolution, driven through the real script ────────
+
+/// Runs the real `herdr-plugin/report-profile.sh` against shimmed `herdr`,
+/// `ps` and `clauth`. The herdr shim answers `pane process-info` ONCE (its
+/// second caller is the detached watcher, which must fail it three times so it
+/// ends itself) and logs every `pane report-metadata` argv; the ps shim
+/// answers ppid/args from the caller's scripted map; the clauth shim answers
+/// `which` with `fit` and the config knobs. Rows land in the sandbox's
+/// `~/.clauth/live_sessions`; `stale_row` names one whose mtime is pushed an
+/// hour back, posing the dead-session leftover a recycled pid would leave.
+/// Returns the logged report lines.
+#[cfg(unix)]
+fn report_profile_resolve_run(
+    info_json: &str,
+    ps_body: &str,
+    rows: &[(&str, &str, u32)],
+    stale_row: Option<&str>,
+) -> Vec<String> {
+    let home = crate::testutil::HomeSandbox::new();
+    let sessions = home.home().join(".clauth/live_sessions");
+    std::fs::create_dir_all(&sessions).expect("sessions dir");
+    for (sid, start, pid) in rows {
+        let path = sessions.join(format!("{sid}.json"));
+        let body = format!(
+            r#"{{"session_id":"{sid}","start_profile":"{start}","pid":{pid},"started_at":0,"isolated":false,"follows_chain":false,"intended_member":null,"chain_cursor":null,"current_member":null,"last_swap_at":null}}"#
+        );
+        std::fs::write(&path, body).expect("row written");
+        if stale_row == Some(sid) {
+            crate::testutil::set_mtime(
+                &path,
+                std::time::SystemTime::now() - std::time::Duration::from_secs(3600),
+            );
+        }
+    }
+    write_shim(
+        home.home(),
+        "herdr",
+        &format!(
+            "if [ \"$1\" = pane ] && [ \"$2\" = report-metadata ]; then echo \"$*\" >> \"$(dirname \"$0\")/report.log\"; exit 0; fi\nif [ \"$1\" = pane ] && [ \"$2\" = process-info ]; then if [ -f \"$(dirname \"$0\")/answered\" ]; then exit 1; fi; touch \"$(dirname \"$0\")/answered\"; printf '%s\\n' '{info_json}'; exit 0; fi\nexit 0\n"
+        ),
+    );
+    write_shim(home.home(), "ps", ps_body);
+    write_shim(
+        home.home(),
+        "clauth",
+        "case \"$1:$4\" in\n  which:) echo fit ;;\n  herdr:pane_tag) echo on ;;\n  herdr:border_label) echo off ;;\n  herdr:tag_watch_secs) echo 1 ;;\nesac\nexit 0\n",
+    );
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/herdr-plugin/report-profile.sh"
+    ))
+    .env("HERDR_BIN_PATH", home.home().join("herdr"))
+    .env("HERDR_PLUGIN_ID", "clauth")
+    .env("HERDR_PANE_ID", "p1")
+    .env("HERDR_PLUGIN_EVENT_JSON", r#"{"agent":"claude"}"#)
+    .env("HERDR_PLUGIN_STATE_DIR", home.home().join("state"))
+    .env("HOME", home.home())
+    .env(
+        "PATH",
+        format!(
+            "{}:{}",
+            home.home().display(),
+            std::env::var("PATH").unwrap_or_default()
+        ),
+    );
+    let out = cmd.output().expect("report-profile.sh runs");
+    assert!(
+        out.status.success(),
+        "the script exits 0: stderr {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::read_to_string(home.home().join("report.log"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// The token the resolve published; the four resolution tests below pin the
+/// profile herdr would show on the pane, so the token value IS the verdict.
+#[cfg(unix)]
+fn token_line(lines: &[String]) -> String {
+    assert_eq!(
+        lines.len(),
+        1,
+        "exactly one report-metadata call: {lines:?}"
+    );
+    lines[0].clone()
+}
+
+/// The pane's own session resolves FIRST, off `foreground_process_group_id`.
+/// The sweep order puts the delegate's claude before the supervisor, and the
+/// delegate's row is keyed on the pane's `clauth mcp`, so a sweep-first
+/// resolution names the delegate's account (D3) for a pane running uwuclxdy.
+#[cfg(unix)]
+#[test]
+fn the_foreground_chain_beats_a_delegate_row_in_the_sweep() {
+    let info = r#"{"process_info":{"foreground_process_group_id":1000,"foreground_processes":[{"pid":1001,"ppid":1002,"command":"claude"},{"pid":1002,"ppid":1000,"command":"clauth"},{"pid":1000,"ppid":1,"command":"clauth"}]}}"#;
+    let ps = "case \"$*\" in\n  *'-o ppid='*) case \"$*\" in *' 1000') echo 1;; *' 1001') echo 1002;; *' 1002') echo 1000;; esac;;\n  *'-o args='*) case \"$*\" in *' 1002') echo 'clauth mcp';; *) echo other;; esac;;\nesac\nexit 0\n";
+    let lines = report_profile_resolve_run(
+        info,
+        ps,
+        &[("1000-0", "uwuclxdy", 1000), ("1002-0", "D3", 1002)],
+        None,
+    );
+    assert!(
+        token_line(&lines).contains("--token clauth=uwuclxdy"),
+        "the pane's own session wins over the delegate row: {}",
+        lines[0]
+    );
+}
+
+/// A bare `claude` pane (foreground present, no registered session) answers
+/// the global account, never the account of a delegate it happens to host:
+/// the sweep must not run when the foreground chain resolved cleanly to no row.
+#[cfg(unix)]
+#[test]
+fn a_bare_pane_hosting_a_delegate_still_answers_the_global_account() {
+    let info = r#"{"process_info":{"foreground_process_group_id":1001,"foreground_processes":[{"pid":1002,"ppid":1003,"command":"claude"},{"pid":1003,"ppid":1001,"command":"clauth"},{"pid":1001,"ppid":1,"command":"claude"}]}}"#;
+    let ps = "case \"$*\" in\n  *'-o ppid='*) case \"$*\" in *' 1002') echo 1003;; *' 1003') echo 1001;; *' 1001') echo 1;; esac;;\n  *'-o args='*) case \"$*\" in *' 1003') echo 'clauth mcp';; *) echo other;; esac;;\nesac\nexit 0\n";
+    let lines = report_profile_resolve_run(info, ps, &[("1003-0", "D3", 1003)], None);
+    assert!(
+        token_line(&lines).contains("--token clauth=fit"),
+        "the bare pane answers the global account: {}",
+        lines[0]
+    );
+}
+
+/// The compat sweep (a process-info without the foreground field) skips a
+/// delegate child by its parent and refuses to match a row on an mcp hop, so
+/// it climbs through the mcp to the pane's own supervisor instead of stopping
+/// at the delegate's row.
+#[cfg(unix)]
+#[test]
+fn the_compat_sweep_climbs_through_an_mcp_without_matching_its_rows() {
+    let info = r#"{"process_info":{"foreground_processes":[{"pid":1002,"ppid":1003,"command":"claude"},{"pid":1003,"ppid":1001,"command":"clauth"},{"pid":1001,"ppid":1000,"command":"claude"},{"pid":1000,"ppid":1,"command":"clauth"}]}}"#;
+    let ps = "case \"$*\" in\n  *'-o ppid='*) case \"$*\" in *' 1002') echo 1003;; *' 1003') echo 1001;; *' 1001') echo 1000;; *' 1000') echo 1;; esac;;\n  *'-o args='*) case \"$*\" in *' 1003') echo 'clauth mcp';; *) echo other;; esac;;\nesac\nexit 0\n";
+    let lines = report_profile_resolve_run(
+        info,
+        ps,
+        &[("1000-0", "uwuclxdy", 1000), ("1003-0", "D3", 1003)],
+        None,
+    );
+    assert!(
+        token_line(&lines).contains("--token clauth=uwuclxdy"),
+        "the sweep climbs past the mcp to the pane's supervisor: {}",
+        lines[0]
+    );
+}
+
+/// Two rows carrying one pid — the D2/DS4 aliasing measured live 2026-09-03,
+/// a finished delegate's stale row beside a newer one — resolve to the
+/// NEWEST, never the alphabetically-first file. The ids sort so the stale one
+/// is alphabetically first: the old `head -n 1` picks it, mtime picks the
+/// live one.
+#[cfg(unix)]
+#[test]
+fn two_rows_on_one_pid_resolve_to_the_newest() {
+    let info = r#"{"process_info":{"foreground_process_group_id":1000,"foreground_processes":[{"pid":1000,"ppid":1,"command":"clauth"}]}}"#;
+    let ps = "case \"$*\" in\n  *'-o ppid='*) case \"$*\" in *' 1000') echo 1;; esac;;\n  *'-o args='*) echo other;;\nesac\nexit 0\n";
+    let lines = report_profile_resolve_run(
+        info,
+        ps,
+        &[("1823355-1", "D2", 1000), ("1823355-3", "DS4", 1000)],
+        Some("1823355-1"),
+    );
+    assert!(
+        token_line(&lines).contains("--token clauth=DS4"),
+        "the newest row wins over the stale one: {}",
+        lines[0]
+    );
+}
+
+/// The foreground-field parse, pinned against the REAL 0.8.2 process-info
+/// shape (captured 2026-09-03): the sed program is extracted from
+/// `report-profile.sh`'s source, so the pin reds when the script's pattern
+/// drifts from the shape instead of leaving a second spelling that can
+/// disagree with the script.
+#[cfg(unix)]
+#[test]
+fn the_fg_sed_reads_the_real_process_info_shape() {
+    let script = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/herdr-plugin/report-profile.sh"
+    ))
+    .expect("report-profile.sh reads");
+    let fg_line = script
+        .lines()
+        .find(|l| l.contains("foreground_process_group_id") && l.contains("sed -n"))
+        .expect("the fg sed line exists");
+    let fg_prog = fg_line
+        .split_once("sed -n '")
+        .expect("single-quoted program")
+        .1
+        .split('\'')
+        .next()
+        .expect("program body");
+
+    // The real 0.8.2 bytes: `process_info` carries the field before the
+    // process array, compact JSON, one line.
+    let real = r#"{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":1822495,"foreground_processes":[{"argv":["clauth","start","uwuclxdy","--effort","max","/handoff reusable: resume nyatrade queue. read @docs/handoff-state.md first, then the handoff skill's runner protocol from step 1."],"cmdline":"clauth start uwuclxdy --effort max /handoff reusable: resume nyatrade queue. read @docs/handoff-state.md first, then the handoff skill's runner protocol from step 1.","pid":1822495,"ppid":2719707,"cwd":"/home/uwuclxdy/repos/py/nyatrade"}]}}}"#;
+    // The capture ends without a trailing newline, and the script consumes the
+    // answer through command substitution, so the pin compares trimmed.
+    assert_eq!(
+        sed_pipe(real, fg_prog).trim(),
+        "1822495",
+        "the fg sed resolves the real shape"
     );
 }

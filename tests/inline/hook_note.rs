@@ -3,7 +3,7 @@
 use super::*;
 
 use crate::profile::ProfileName;
-use crate::profile_cache::{USAGE_CACHE_FILE, write_profile_cache};
+use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, write_profile_cache};
 use crate::testutil::HomeSandbox;
 
 /// A payload carrying only what these tests vary.
@@ -528,6 +528,212 @@ fn a_note_that_cannot_be_recorded_is_not_emitted() {
     );
 }
 
+/// The read the session→profile attribution takes as the exact per-conversation
+/// observation: the last account the hook actually attributed, and nothing else.
+#[test]
+fn resolved_account_reads_the_main_scope_record() {
+    let _home = HomeSandbox::new();
+    assert_eq!(
+        resolved_account("never-filed"),
+        None,
+        "no record, no account"
+    );
+
+    let path = record_path("conv-res", None).expect("record path");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    store_record(
+        &path,
+        &NoteRecord {
+            resolved: Some("cld".to_string()),
+            ..NoteRecord::default()
+        },
+    )
+    .expect("write record");
+    assert_eq!(
+        resolved_account("conv-res").as_deref(),
+        Some("cld"),
+        "the attributed account comes back",
+    );
+
+    let blank = record_path("conv-blank", None).expect("record path");
+    store_record(
+        &blank,
+        &NoteRecord {
+            told: Some("kerry".to_string()),
+            ..NoteRecord::default()
+        },
+    )
+    .expect("write record");
+    assert_eq!(
+        resolved_account("conv-blank"),
+        None,
+        "a record that never attributed an account answers None, not its told baseline",
+    );
+
+    assert_eq!(
+        resolved_account("../evil"),
+        None,
+        "a non-bare id never reaches a filename",
+    );
+}
+
+// ── the exact owner-store fold ───────────────────────────────────────────────
+
+/// The hook's attribution is exact, so it must overwrite a `Contested` entry a
+/// sweep folded — the whole reason it lands in the durable store rather than
+/// staying in the reaped record.
+#[test]
+fn the_hook_fold_overwrites_a_contested_store_entry() {
+    let home = HomeSandbox::new();
+    let projects = home.home().join(".claude/projects");
+    let s = projects.join("-w-exact/conv-exact.jsonl");
+    std::fs::create_dir_all(s.parent().unwrap()).unwrap();
+    std::fs::write(&s, b"{}\n").unwrap();
+    let t0 = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(10_000);
+    crate::testutil::set_mtime(&s, t0);
+
+    // Two sweeps contest the id, the shape a store holds when the exact
+    // observation is missing.
+    crate::sessions::stamp_run_sessions("A", &projects, false, t0);
+    crate::sessions::stamp_run_sessions("B", &projects, false, t0);
+
+    // Pre-state: the two differing sweeps must have left a CONTESTED entry, the
+    // shape this test's name claims. `owner_of` collapses Contested to None, so
+    // read the store file directly rather than through the reader.
+    let store_file = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("session_profiles.json");
+    let raw: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&store_file).expect("store")).expect("json");
+    assert_eq!(
+        raw["sessions"]["conv-exact"],
+        serde_json::json!("contested"),
+        "two differing sweeps leave a Contested entry for the exact fold to overwrite"
+    );
+
+    // The hook then attributes the account for the first time.
+    note_for(&payload("PostToolUse", "conv-exact"), &watch(1, 0), &kerry);
+
+    // Simulate the record reap: with the record gone, the owner store is the
+    // only observer left, and it must now answer Known — not Contested.
+    std::fs::remove_file(record_path("conv-exact", None).expect("path")).expect("reap");
+    assert_eq!(
+        crate::sessions::owner_of("conv-exact").as_deref(),
+        Some("kerry"),
+        "the exact fold must overwrite the sweep's Contested stamp"
+    );
+}
+
+/// The fold rides the resolution gate: the state flock is taken only when the
+/// resolved account is first set or changes, never on a repeat resolution that
+/// answered the same account.
+#[test]
+fn the_hook_fold_skips_a_repeat_resolution_of_the_same_account() {
+    let _home = HomeSandbox::new();
+    let fire = payload("PostToolUse", "conv-repeat");
+    crate::lock::OUTERMOST_ACQUISITIONS.with(|c| c.set(0));
+
+    note_for(&fire, &watch(1, 0), &kerry);
+    assert_eq!(
+        crate::lock::OUTERMOST_ACQUISITIONS.with(|c| c.get()),
+        1,
+        "a first attribution lands in the store"
+    );
+
+    crate::lock::OUTERMOST_ACQUISITIONS.with(|c| c.set(0));
+    note_for(&fire, &watch(2, 0), &kerry);
+    assert_eq!(
+        crate::lock::OUTERMOST_ACQUISITIONS.with(|c| c.get()),
+        0,
+        "a repeat resolution of the same account takes no state flock"
+    );
+}
+
+/// The store write keys on the bare conversation id, the MAIN scope — an
+/// agent_id-bearing fire is a SUBAGENT's reading of its own scope, so it must
+/// write no store entry at all. Dropping the gate would let the agent's stale
+/// reading overwrite the parent's correct owner.
+#[test]
+fn a_subagent_fire_stamps_no_owner_store_entry() {
+    let _home = HomeSandbox::new();
+    note_for(&payload("PostToolUse", "conv-scope"), &watch(1, 0), &kerry);
+
+    // Reap the main record so `owner_of` reads the store, not the record.
+    std::fs::remove_file(record_path("conv-scope", None).expect("path")).expect("reap");
+    assert_eq!(
+        crate::sessions::owner_of("conv-scope").as_deref(),
+        Some("kerry"),
+        "the main scope attributed kerry into the store"
+    );
+
+    let mut sub = payload("PostToolUse", "conv-scope");
+    sub.agent_id = Some("agent-1".to_string());
+    note_for(&sub, &watch(2, 0), &cld);
+
+    assert_eq!(
+        crate::sessions::owner_of("conv-scope").as_deref(),
+        Some("kerry"),
+        "a subagent fire must not stamp the parent conversation's owner"
+    );
+}
+
+/// The store write takes the state flock, which sits OUTER to the scope lock in
+/// the lock order. `note_for` must drop the scope lock before that write: a
+/// thread holding the state flock and reaching for the scope flock deadlocks
+/// against a stamp that never released it. Posed as a second thread holding the
+/// state flock while the main thread fires a first attribution, then probing the
+/// scope flock — it must find it free while the stamp waits on the state flock.
+#[test]
+fn the_store_stamp_releases_the_scope_lock_before_the_state_flock() {
+    let _home = HomeSandbox::new();
+    let records_lock = records_dir().expect("records dir").join(".lock");
+
+    let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+    let (probe_tx, probe_rx) = std::sync::mpsc::channel::<bool>();
+
+    let records_lock_thread = records_lock.clone();
+    let probe = std::thread::spawn(move || {
+        let held = crate::lock::StateLock::acquire().expect("state lock free");
+        held_tx.send(()).expect("signal held");
+        // Let the main thread finish its note work and reach the stamp. It
+        // blocks on `lock::THREAD_LOCK` — held by the probe's own state-lock
+        // acquire — before it ever polls the flock. Correct code dropped the
+        // scope lock first; the mutated code still holds it here.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let file = crate::profile::open_state_file(&records_lock_thread).expect("open scope lock");
+        let scope_free =
+            crate::lock::lock_file_with_timeout(&file, std::time::Duration::from_millis(1_000))
+                .is_ok();
+        probe_tx.send(scope_free).expect("signal probe");
+        drop(held);
+    });
+
+    held_rx.recv().expect("state lock held");
+    note_for(&payload("PostToolUse", "conv-order"), &watch(1, 0), &kerry);
+
+    let scope_free = probe_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("probe reports");
+    probe.join().expect("probe thread");
+    assert!(
+        scope_free,
+        "the stamp must not hold the scope lock while waiting on the state flock"
+    );
+}
+
+/// `ScopeLock` must enter its rank in the global lock order, so a future edit
+/// that reaches for the state flock while the scope lock is held trips the
+/// order assertion instead of deadlocking.
+#[test]
+fn the_scope_lock_enters_its_rank() {
+    let _home = HomeSandbox::new();
+    let _hold = ScopeLock::acquire();
+    debug_assert!(
+        crate::lockorder::holds::<crate::lockorder::rank::Scope>(),
+        "the scope lock must enter its SCOPE rank"
+    );
+}
+
 // ── the account-changed note's headroom figure (r9) ─────────────────────────
 
 /// A blank profile whose disk usage cache holds a live 5h window at `pct` —
@@ -740,6 +946,31 @@ fn a_still_firing_scope_survives_the_sweep_with_its_transcript_gone() {
     assert!(
         !record_path("conv-firing", None).expect("path").exists(),
         "a scope that has genuinely gone quiet is still reaped",
+    );
+}
+
+/// A backward clock step future-dates a record's mtime. The sweep keeps it (its
+/// age reads as none), and the prune's grace helper must match: a future mtime
+/// counts as within the grace, never as silent-past-it.
+#[test]
+fn a_future_record_mtime_counts_as_within_the_grace() {
+    let _home = HomeSandbox::new();
+    let mut fire = payload("UserPromptSubmit", "conv-future");
+    fire.transcript = Some(PathBuf::from("/absent.jsonl"));
+    note_for(&fire, &watch(1, 0), &kerry);
+
+    let path = record_path("conv-future", None).expect("path");
+    crate::testutil::set_mtime(&path, SystemTime::now() + Duration::from_secs(3600));
+
+    assert!(
+        last_fire_within_missing_transcript_grace("conv-future"),
+        "a future mtime keeps, matching the sweep's age predicate"
+    );
+
+    gc_conversation_records();
+    assert!(
+        path.exists(),
+        "the sweep also keeps the future-dated record"
     );
 }
 
@@ -1596,6 +1827,65 @@ fn the_real_reader_replays_the_decision_leg_over_the_disk_cache() {
     assert!(
         note.ends_with(". no fallback is set; further agent spawns may fail with 429s."),
         "the approved tail: {note}",
+    );
+}
+
+/// The replay judges a third-party member's provider windows the way the live
+/// leg does — the scheduler mirrors this same derivation into the store the
+/// walk reads. An OAuth-only replay reads the member as windowless headroom,
+/// which flips `chain_acts` true over a switch the live leg refuses and
+/// silences a nudge whose failure nothing catches. `b`'s leftover OAuth cache
+/// from the seed (10%) is the control: an implementation still reading it
+/// answers headroom in the spent case and reds this test.
+#[test]
+fn the_replay_judges_a_third_party_members_windows_like_the_live_leg() {
+    let _home = HomeSandbox::new();
+    seed_exhausted_chain();
+    seed_burn_history();
+    // Recast `b` as an api-key account: its figures now live in the
+    // third-party cache, and the OAuth cache the seed wrote goes inert.
+    let mut config = crate::profile::load_config().expect("reload");
+    let b = config
+        .profiles
+        .iter_mut()
+        .find(|p| p.name.as_str() == "b")
+        .expect("member b");
+    b.base_url = Some("https://api.minimax.io/anthropic".to_string());
+    b.api_key = Some("sk-cp-k".to_string());
+    crate::profile::save_profile(b).expect("save b");
+    let provider_window = |pct: f64| {
+        crate::testutil::stats_with_bars(vec![crate::testutil::bar_reset_in("5h", pct, 3_600)])
+    };
+
+    // A clear provider window is a target the walk lands on, same as a clear
+    // OAuth one.
+    write_profile_cache(
+        &ProfileName::from("b"),
+        THIRD_PARTY_CACHE_FILE,
+        &provider_window(10.0),
+    );
+    let read = read_nudge(&task_fire("conv-tp-clear"), None).expect("eligible and readable");
+    assert!(
+        read.chain_acts,
+        "a clear provider window is a target, same as a clear OAuth one"
+    );
+
+    // A spent one leaves the walk nowhere to point, so the nudge lands.
+    write_profile_cache(
+        &ProfileName::from("b"),
+        THIRD_PARTY_CACHE_FILE,
+        &provider_window(97.0),
+    );
+    let fire = task_fire("conv-tp-spent");
+    let read = read_nudge(&fire, None).expect("eligible and readable");
+    assert!(
+        !read.chain_acts,
+        "the spent provider window leaves the walk nowhere to point"
+    );
+    let note = nudge_note(&fire, &read).expect("the nudge fires");
+    assert!(
+        note.starts_with("clauth note: 5h window 97% used ("),
+        "the uncovered session hears it: {note}",
     );
 }
 

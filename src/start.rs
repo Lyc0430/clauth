@@ -19,7 +19,8 @@ use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::{Handle as SignalHandle, Signals};
 
 use crate::logline::logline;
-use crate::profile::{AppConfig, ProfileName};
+use crate::out::errln;
+use crate::profile::{AppConfig, Profile, ProfileName};
 use crate::runtime::{Isolation, ProfileRuntime};
 use crate::spinner::Spinner;
 
@@ -31,26 +32,21 @@ struct ChildOutcome {
     signal: Option<i32>,
 }
 
-/// Lift an exiting isolated session's state into the global store: the
-/// transcripts under `projects/`, then Claude Code's own session sidecar state
-/// (shell snapshots, file history, tasks/plans, …) from the rest of the runtime
-/// root, so a rescued session keeps more than its resumability. Returns
-/// `(transcripts, sidecar files)` moved. Best-effort throughout: an error is
-/// logged, never fails the run.
+/// Lift an exiting isolated session's state into the global store, gated on
+/// being the only live marker in `sessions`: the count — not the keying — is
+/// what proves nothing is reading the tree being emptied, since the sidecar leg
+/// would otherwise pull `shell-snapshots/` out from under a live Claude Code
+/// mid-session. Self holds its own marker, hence `> 1`. The move itself lives
+/// in [`crate::runtime::rescue_isolated_runtime`], shared with the stale-runtime
+/// GC so an unrescued tree is lifted at its deletion site too.
 ///
-/// Gated on being the only live marker in `sessions`, because the count — not
-/// the keying — is what proves nothing is reading the tree being emptied: the
-/// sidecar leg would otherwise pull `shell-snapshots/` out from under a live
-/// Claude Code mid-session. Self holds its own marker, hence `> 1`.
-///
-/// Under real symlinks each session owns its tree and marker dir, so the count is
-/// this session alone and the guard never fires. It DOES fire on a fake-symlink
-/// host, where the profile's isolated sessions share one tree: the first out
-/// rescues nothing and the last out rescues everything, since the shared tree
-/// holds every session's transcripts. The consequence is that the rescue becomes
-/// all-or-nothing on the last session's clean exit — SIGKILL the last one and GC
-/// discards the tree with every session's transcripts in it. Not separable while
-/// the tree is shared: the sidecar trees carry no per-session attribution.
+/// Under real symlinks each session owns its tree and marker dir, and under
+/// fake symlinks an isolated session owns them too, so the count is this
+/// session alone and the `> 1` arm never fires in normal operation. Both arms
+/// still earn their place. `None` means the marker dir could not be read;
+/// deleting the guard would delete that refusal with no replacement.
+/// `Some(n > 1)` is defence in depth against a same-sid collision and against a
+/// legacy shared dir.
 pub(crate) fn rescue_teardown(
     iso_root: &Path,
     sessions: &Path,
@@ -63,24 +59,13 @@ pub(crate) fn rescue_teardown(
         logline!("clauth: skipping rescue, another isolated session is still live");
         return (0, 0);
     }
-    let moved = crate::sessions::rescue_isolated_store(
-        &iso_root.join("projects"),
-        &claude_home.join("projects"),
-    );
-    let sidecars = crate::sessions::rescue_isolated_sidecars(iso_root, claude_home);
-    if moved > 0 || sidecars > 0 {
-        logline!(
-            "clauth: rescued {moved} isolated session transcript(s) \
-             + {sidecars} sidecar file(s) into the global store"
-        );
-    }
-    (moved, sidecars)
+    crate::runtime::rescue_isolated_runtime(iso_root, claude_home)
 }
 
 /// The refusal a `--with-fallback` start gets on a host that structurally cannot
-/// execute a per-session credential swap. Split from the gate so BOTH causes are
-/// exercised from a Linux run: `cfg!(target_os = "macos")` and [`LinkMode::Fake`]
-/// are each unreachable there.
+/// execute a per-session credential swap. Split from the gate so the render is
+/// exercisable from any run: [`LinkMode::Fake`] is unreachable on a real-symlink
+/// host.
 fn unsupported_host_refusal(name: &ProfileName, why: crate::runtime::SwapUnsupported) -> String {
     format!(
         "'{name}': --with-fallback needs a per-session credential swap, but {why}; start without it"
@@ -93,17 +78,13 @@ fn unsupported_host_refusal(name: &ProfileName, why: crate::runtime::SwapUnsuppo
 /// Claude Code probe exists to prevent, so none of these is a warning.
 ///
 /// Every gate that can answer WITHOUT the disk runs first, in unfixable-first
-/// order, and the transport probe runs last. That ordering is load-bearing twice
-/// over: a start refused for a cause the user can act on never materializes a
-/// profile dir for an account that never launched, and the compile-time macOS
-/// verdict never arrives as a state-lock timeout or an IO error from a probe it
-/// did not need. `is_macos` is the caller's `cfg!`, so the keychain arm is
-/// testable off a Mac.
+/// order, and the transport probe runs last. That ordering is load-bearing: a
+/// start refused for a cause the user can act on never materializes a profile
+/// dir for an account that never launched.
 fn refuse_unless_chain_eligible(
     config: &AppConfig,
     profile: &crate::profile::Profile,
     isolation: Isolation,
-    is_macos: bool,
 ) -> Result<()> {
     let name = &profile.name;
     // clap already refuses the flag pair, so this is for a caller that bypasses
@@ -114,9 +95,6 @@ fn refuse_unless_chain_eligible(
             "'{name}': --with-fallback cannot be combined with --isolated, since an \
              isolated session follows no chain"
         );
-    }
-    if let Some(why) = crate::runtime::unsupported_swap_platform(is_macos) {
-        anyhow::bail!("{}", unsupported_host_refusal(name, why));
     }
     // The decision leg's freshness gate reads only the OAuth status store. That
     // is sound because a third-party-launched session gets a chain the walk
@@ -164,6 +142,91 @@ fn refuse_unless_chain_eligible(
     Ok(())
 }
 
+/// The refusals every start runs before any side effect, shared by [`run`] and
+/// `cmd_start`'s explain/launch paths so `--explain` answers what a real launch
+/// would do. The disabled gate is the authoritative one: every caller inherits
+/// it here, before runtime acquire or spawn, so no caller can forget to check.
+pub(crate) fn admit<'a>(
+    config: &'a AppConfig,
+    name: &ProfileName,
+    isolation: Isolation,
+    follows_chain: bool,
+) -> Result<&'a Profile> {
+    crate::refuse_if_disabled(config, name)?;
+    let profile = config.find(name).context("profile not found")?;
+    if follows_chain {
+        refuse_unless_chain_eligible(config, profile, isolation)?;
+    }
+    Ok(profile)
+}
+
+/// The model strings a launch may run, from every source a launcher can see
+/// before the session exists: the live `settings.json`, the process environment,
+/// and an explicit `--model` passthrough. A UNION, not a resolution — a `Task`
+/// subagent shares the parent's process-wide credential memo, so it spends the
+/// same account on whatever model it runs, and selecting for the headline model
+/// alone strands it (see [`crate::fallback::start_walk`]).
+pub(crate) fn launch_models(claude_args: &[String]) -> Vec<String> {
+    launch_models_from(
+        crate::claude::claude_settings_models().unwrap_or_default(),
+        [
+            std::env::var("ANTHROPIC_MODEL").ok(),
+            std::env::var("CLAUDE_CODE_SUBAGENT_MODEL").ok(),
+        ],
+        claude_args,
+    )
+}
+
+/// The union of the three model sources a launcher can see, held here so the
+/// union is testable without a home or a process environment: the live
+/// `settings.json` strings, the two process-env strings (in order), and the
+/// passthrough args. An empty env value is dropped, never a family.
+pub(crate) fn launch_models_from(
+    settings: Vec<String>,
+    env: [Option<String>; 2],
+    args: &[String],
+) -> Vec<String> {
+    let mut out = settings;
+    out.extend(env.into_iter().flatten().filter(|v| !v.trim().is_empty()));
+    out.extend(models_from_args(args));
+    out
+}
+
+/// The `--model` and `--fallback-model` values in a passthrough arg list, in
+/// both spellings. A `--fallback-model` value is a comma-separated list of
+/// models, split and trimmed here. Split out of [`launch_models`] so the
+/// parsing is testable without a home (its siblings read `settings.json` and
+/// the environment, which resolve the operator's real home outside a sandbox).
+pub(crate) fn models_from_args(claude_args: &[String]) -> Vec<String> {
+    fn comma_list(out: &mut Vec<String>, v: &str) {
+        out.extend(
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
+        );
+    }
+
+    let mut out = Vec::new();
+    let mut args = claude_args.iter();
+    while let Some(a) = args.next() {
+        if let Some(v) = a.strip_prefix("--model=") {
+            out.push(v.to_owned());
+        } else if let Some(v) = a.strip_prefix("--fallback-model=") {
+            comma_list(&mut out, v);
+        } else if a == "--model"
+            && let Some(v) = args.next()
+        {
+            out.push(v.clone());
+        } else if a == "--fallback-model"
+            && let Some(v) = args.next()
+        {
+            comma_list(&mut out, v);
+        }
+    }
+    out
+}
+
 pub(crate) fn run(
     config: &AppConfig,
     name: &ProfileName,
@@ -171,16 +234,14 @@ pub(crate) fn run(
     isolation: Isolation,
     workspace: Option<&Path>,
     follows_chain: bool,
+    announce: Option<&str>,
 ) -> Result<()> {
-    // Authoritative "never a live session for a disabled account" gate — every
-    // caller (`cmd_start`, `sessions_cli::run_resume`) inherits it here, before
-    // any side effect (runtime acquire, spawn). A wrapper's own pre-check is a
-    // friendly early error at best; this one can't be bypassed by adding a new
-    // caller that forgets to check.
-    crate::refuse_if_disabled(config, name)?;
-    let profile = config.find(name).context("profile not found")?;
-    if follows_chain {
-        refuse_unless_chain_eligible(config, profile, isolation, cfg!(target_os = "macos"))?;
+    let profile = admit(config, name, isolation, follows_chain)?;
+
+    // Announced after the refusals, so a start that `admit` refuses never
+    // announces first.
+    if let Some(line) = announce {
+        errln!("{line}");
     }
 
     // The plugin-migration pre-flight: heal a broken or divergent clauth
@@ -192,21 +253,19 @@ pub(crate) fn run(
     // uninstalled plugin heals to a one-read no-op.
     crate::plugin_host::preflight();
 
-    // Strip the active profile's custom env from the inherited base so a
+    // Strip the outgoing profile's custom env from the inherited base so a
     // `clauth start <other>` session doesn't inherit it. The live
     // `settings.json` is owned by whoever is active; starting that same profile
-    // passes its own keys, which the merge re-inserts (no-op).
-    let active_env_keys: Vec<String> = config
-        .state
-        .active_profile
-        .as_ref()
-        .and_then(|n| config.find(n))
-        .map(|p| p.env.keys().cloned().collect())
-        .unwrap_or_default();
+    // passes its own keys, which the merge re-inserts (no-op). With no active
+    // marker to read (`switch_off` clears it without touching the file) the
+    // helper answers every configured profile's keys, so a departed account's
+    // entries are stripped too rather than landing in front of the started
+    // account's endpoint.
+    let stale_env_keys = crate::actions::outgoing_env_keys(config);
 
     let runtime = {
         let _spinner = Spinner::start("clauth: preparing runtime");
-        ProfileRuntime::acquire(profile, isolation, &active_env_keys, follows_chain)?
+        ProfileRuntime::acquire(profile, isolation, &stale_env_keys, follows_chain)?
     };
 
     #[cfg(unix)]
@@ -216,11 +275,11 @@ pub(crate) fn run(
     // engine plugs into the same three calls when its runtime lands.
     let engine: &dyn crate::harness::HarnessEngine = &crate::harness::ClaudeEngine;
     let mut command = engine.command();
-    // Scrub clauth-managed + active custom env so a session started under
+    // Scrub clauth-managed + outgoing custom env so a session started under
     // profile B doesn't inherit profile A's endpoint/auth/model overrides from
     // the parent process env. The target's runtime settings.json re-supplies
     // whichever it defines. Mirrors the delegate path (run_delegate).
-    engine.scrub_env(&mut command, &active_env_keys);
+    engine.scrub_env(&mut command, &stale_env_keys);
     // A resume pins `claude` to the session's workspace; a normal start inherits
     // this process's cwd. Either way the resolved dir feeds the home-project
     // settings guard: when it is the real `$HOME`, its project-tier settings

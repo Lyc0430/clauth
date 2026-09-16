@@ -27,6 +27,8 @@ fn spec(job_id: &str, profile: &str, started_at: u64) -> RunningSpec {
         recorded_at: started_at,
         timeout_secs: 0,
         endpoint: None,
+        provider: None,
+        isolated: false,
         idle_secs: Some(300),
         kind: RecordKind::Collectable,
     }
@@ -51,6 +53,48 @@ fn pinned_format_spec(job_id: &str, profile: &str, started_at: u64) -> RunningSp
     }
 }
 
+/// The isolation flag rides the mint like `endpoint` does: resolved once at
+/// the reserve, carried through every heartbeat, and kept on the finalized
+/// record, so the orphan arm can split shared from isolated off the corpse
+/// itself — a heartbeat must not drop it back to the default.
+#[test]
+fn the_isolation_flag_rides_the_mint_through_heartbeats_and_the_finish() {
+    let _home = HomeSandbox::new();
+    let id = new_job_id(1000);
+    let isolated = RunningSpec {
+        isolated: true,
+        ..spec(&id, "work", 1000)
+    };
+    write_running(&isolated).unwrap();
+    assert!(read(&id).unwrap().isolated, "the mint stamps it");
+    write_heartbeat_with_session(&isolated, 41_000, "mid-run", Some("sess-1")).unwrap();
+    assert!(
+        read(&id).unwrap().isolated,
+        "a heartbeat rewrites the record and keeps it"
+    );
+    write_done(
+        &id,
+        "work",
+        1000,
+        None,
+        None,
+        true,
+        serde_json::json!({"result": "ok"}),
+    )
+    .unwrap();
+    assert!(
+        read(&id).unwrap().isolated,
+        "the finalized record keeps it too"
+    );
+
+    let shared = new_job_id(2000);
+    write_running(&spec(&shared, "work", 2000)).unwrap();
+    assert!(
+        !read(&shared).unwrap().isolated,
+        "the default shape writes shared explicitly"
+    );
+}
+
 #[test]
 fn write_read_roundtrip_running_then_done() {
     let _home = HomeSandbox::new();
@@ -63,7 +107,7 @@ fn write_read_roundtrip_running_then_done() {
     assert!(r.envelope.is_none());
 
     let env = serde_json::json!({ "is_error": false, "result": "ok" });
-    write_done(&id, "work", 1000, None, env.clone()).unwrap();
+    write_done(&id, "work", 1000, None, None, false, env.clone()).unwrap();
     let r = read(&id).expect("done record");
     assert_eq!(r.state, JobState::Done);
     assert_eq!(r.envelope, Some(env));
@@ -79,13 +123,152 @@ fn write_read_roundtrip_running_then_done() {
     assert!(read(&id).is_none(), "removed job is gone");
 }
 
+#[test]
+fn a_done_record_is_claimable_once_and_the_claim_evicts_it() {
+    let _home = HomeSandbox::new();
+    let id = new_job_id(1000);
+    let env = serde_json::json!({ "is_error": false, "result": "ok" });
+    write_done(&id, "work", 1000, None, None, false, env.clone()).unwrap();
+
+    let Claim::Owned(claimed) = claim(&id) else {
+        panic!("the first claimant owns the record");
+    };
+    assert_eq!(claimed.state, JobState::Done);
+    assert_eq!(claimed.envelope, Some(env));
+    assert!(
+        read(&id).is_none(),
+        "the claim consumed the file: nothing is left to collect twice"
+    );
+    assert!(
+        !job_path(&id, RecordKind::Collectable)
+            .unwrap()
+            .with_extension("json.claim")
+            .exists(),
+        "the claimed spelling is consumed too, not parked beside the record"
+    );
+    assert!(
+        matches!(claim(&id), Claim::Lost),
+        "a second claimant loses: the delivery is exactly once"
+    );
+}
+
+/// The eviction rule `monitor`'s batch arm used to carry as a literal:
+/// eviction follows the STORED id, so a caller-supplied id must never collect
+/// a file another id's record owns. `claim` refuses the record and puts it
+/// back, so the old guard survives the move into the shared primitive.
+#[test]
+fn claim_refuses_a_record_whose_self_report_disagrees_and_leaves_it_readable() {
+    let _home = HomeSandbox::new();
+    let path = job_path("d-claimed-0", RecordKind::Collectable).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        path,
+        serde_json::json!({
+            "job_id": "d-other-0",
+            "profile": "work",
+            "state": "done",
+            "started_at": 1,
+            "done_at": 1,
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    assert!(
+        matches!(claim("d-claimed-0"), Claim::Refused(_)),
+        "a mismatched self-report is never claimed"
+    );
+    let restored = read("d-claimed-0").expect("the record is renamed back, not eaten");
+    assert_eq!(
+        restored.job_id, "d-other-0",
+        "the stored id decides ownership, and the file still says so"
+    );
+    assert!(
+        read("d-other-0").is_none(),
+        "nothing was moved under the stored id's own path"
+    );
+}
+
+/// The claimed spelling is a transient: invisible to every reader (its
+/// extension is not `json`), and only the startup sweep's foreign-file arm
+/// reaps a leftover from a claimant that died mid-claim.
+#[test]
+fn a_leftover_claimed_file_is_invisible_to_list_and_reaped_only_by_the_full_sweep() {
+    let _home = HomeSandbox::new();
+    let id = new_job_id(1000);
+    write_done(
+        &id,
+        "work",
+        1000,
+        None,
+        None,
+        false,
+        serde_json::json!({"result": "ok"}),
+    )
+    .unwrap();
+    let path = job_path(&id, RecordKind::Collectable)
+        .unwrap()
+        .with_extension("json.claim");
+    std::fs::rename(job_path(&id, RecordKind::Collectable).unwrap(), &path).unwrap();
+
+    assert!(
+        list(crate::usage::now_ms())
+            .iter()
+            .all(|j| j.record.job_id != id),
+        "a claimed file is no record to a reader"
+    );
+    gc_running_corpses(crate::usage::now_ms());
+    assert!(
+        path.exists(),
+        "the narrow collect sweep never touches a claimed file"
+    );
+    gc(crate::usage::now_ms());
+    assert!(
+        !path.exists(),
+        "the startup sweep's foreign-file arm reaps the leftover"
+    );
+}
+
+/// A stale claimed spelling from a claimant that died mid-claim must not
+/// block a later claim. The retry past it is Windows-only by construction
+/// (a unix rename replaces the target, so the first attempt already
+/// succeeds), which makes this pin inert on the linux leg and live on the
+/// Windows one; it documents the contract either way.
+#[test]
+fn a_stale_claimed_spelling_does_not_block_the_claim() {
+    let _home = HomeSandbox::new();
+    let id = new_job_id(1000);
+    write_done(
+        &id,
+        "work",
+        1000,
+        None,
+        None,
+        false,
+        serde_json::json!({"result": "ok"}),
+    )
+    .unwrap();
+    let claimed = job_path(&id, RecordKind::Collectable)
+        .unwrap()
+        .with_extension("json.claim");
+    std::fs::write(&claimed, "stale").unwrap();
+
+    let Claim::Owned(record) = claim(&id) else {
+        panic!("a stale claimed spelling must not block the claim");
+    };
+    assert_eq!(
+        record.job_id, id,
+        "the record behind the stale spelling is claimed"
+    );
+}
+
 /// A running job file is written by the server that spawned it and read by a
-/// possibly newer one PLUS the separate `mcp-await-job` hook process, so every
-/// field added after the first release has to default. Pinned against the real
-/// bytes an older server wrote, not a hand-built `JobRecord`: a struct literal
-/// would compile against whatever the fields are today and prove nothing about
-/// the wire. `read` swallows a parse failure as `None`, which reaches the caller
-/// as `unknown job_id` on a job that is running fine.
+/// possibly newer one, so every field added after the first release has to
+/// default. Pinned against the real bytes an older server wrote, not a
+/// hand-built `JobRecord`: a struct literal would compile against whatever the
+/// fields are today and prove nothing about the wire. `read` swallows a parse
+/// failure as `None`, which reaches the caller as `unknown job_id` on a job that
+/// is running fine.
 #[test]
 fn a_job_file_from_an_older_server_still_parses() {
     let _home = HomeSandbox::new();
@@ -105,6 +288,11 @@ fn a_job_file_from_an_older_server_still_parses() {
     assert_eq!(r.tail, "");
     assert_eq!(r.done_at, 0, "no finish stamp either");
     assert_eq!(r.session_id, None, "and no session id");
+    assert!(
+        !r.isolated,
+        "a record written before the isolation field existed reads as shared, \
+         which is the delegate default"
+    );
 }
 
 /// A heartbeat rewrites the SAME running record: the identity and whichever
@@ -225,8 +413,10 @@ fn promote_moves_the_spelling_and_keeps_the_id() {
     );
 }
 
-/// A blocking run's record rides the same GC as any other: the extension is
-/// still `.json`, so the corpse rule reaches it with no arm of its own.
+/// A blocking run's record rides the same sweep as any other: the extension is
+/// still `.json`, so the silence rule reaches it with no arm of its own. The
+/// outcome differs — a silent one is converted to a tombstone, not reaped —
+/// which the conversion test below pins.
 #[test]
 fn a_liveness_record_is_swept_on_the_same_rules_as_any_other_running_one() {
     let _home = HomeSandbox::new();
@@ -250,7 +440,137 @@ fn a_liveness_record_is_swept_on_the_same_rules_as_any_other_running_one() {
     );
     assert!(
         !dir.join("d-live-silent.live.json").exists(),
-        "and one whose server died is reaped like any other corpse",
+        "a silent one's liveness spelling is gone",
+    );
+    assert!(
+        read("d-live-silent").is_some_and(|r| r.crashed),
+        "and the collectable spelling holds the converted tombstone",
+    );
+}
+
+/// The sweep's conversion, driven through the real producer: a silent blocking
+/// run's liveness record, written by `write_heartbeat_with_session` the way the
+/// streaming reader writes it, becomes a `Done` tombstone that keeps the handle
+/// and the isolation flag and invents no envelope. Seeding post-conversion bytes
+/// would leave the conversion itself untested.
+#[test]
+fn the_sweep_converts_a_silent_liveness_record_into_a_tombstone() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+    let ancient = now - 10 * RUNNING_TTL_MS;
+    let id = new_job_id(ancient);
+    let spec = RunningSpec {
+        kind: RecordKind::Liveness,
+        isolated: true,
+        ..spec(&id, "work", ancient)
+    };
+    write_heartbeat_with_session(&spec, 0, "", Some("sess-tomb-1")).unwrap();
+
+    gc_running_corpses(now);
+
+    let converted = read(&id).expect("the collectable spelling holds the tombstone");
+    assert_eq!(
+        converted.state,
+        JobState::Done,
+        "the tombstone is a done record"
+    );
+    assert!(converted.crashed, "it marks the crash");
+    assert_eq!(
+        converted.session_id.as_deref(),
+        Some("sess-tomb-1"),
+        "the resume handle survives"
+    );
+    assert!(converted.isolated, "the isolation flag survives");
+    assert!(
+        converted.envelope.is_none(),
+        "no envelope is invented for a crash"
+    );
+    assert!(
+        !jobs_dir().unwrap().join(format!("{id}.live.json")).exists(),
+        "the liveness spelling is gone",
+    );
+}
+
+/// The conversion writes to the collectable spelling without reading it, so it
+/// must never overwrite a record that already carries an envelope: a finish
+/// whose liveness leftover is still on disk keeps its result, and only the
+/// stale liveness spelling is dropped.
+#[test]
+fn the_conversion_never_overwrites_a_finished_result() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+    let ancient = now - 10 * RUNNING_TTL_MS;
+    let id = new_job_id(ancient);
+    write_heartbeat_with_session(
+        &RunningSpec {
+            kind: RecordKind::Liveness,
+            ..spec(&id, "work", ancient)
+        },
+        0,
+        "",
+        Some("sess-stale-1"),
+    )
+    .unwrap();
+    write_done(
+        &id,
+        "work",
+        ancient,
+        None,
+        None,
+        false,
+        serde_json::json!({"result": "kept"}),
+    )
+    .unwrap();
+
+    gc_running_corpses(now);
+
+    let kept = read(&id).expect("the finished result survives the sweep");
+    assert_eq!(
+        kept.envelope,
+        Some(serde_json::json!({"result": "kept"})),
+        "the envelope is not overwritten"
+    );
+    assert!(!kept.crashed, "the conversion did not clobber the finish");
+    assert!(
+        !jobs_dir().unwrap().join(format!("{id}.live.json")).exists(),
+        "the stale liveness spelling is dropped",
+    );
+}
+
+/// A tombstone is an orphan, never a done record: `phase()` reads the `crashed`
+/// flag before the generic `Done` arm, or `clauth jobs`, `monitor`'s listing and
+/// the TUI all read a crashed run as a collectable `done`.
+#[test]
+fn a_tombstone_reads_orphaned_not_done() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+    let ancient = now - 10 * RUNNING_TTL_MS;
+    let id = new_job_id(ancient);
+    write_heartbeat_with_session(
+        &RunningSpec {
+            kind: RecordKind::Liveness,
+            ..spec(&id, "work", ancient)
+        },
+        0,
+        "",
+        Some("sess-orph-1"),
+    )
+    .unwrap();
+    gc_running_corpses(now);
+
+    let row = list(now)
+        .into_iter()
+        .find(|j| j.record.job_id == id)
+        .expect("the tombstone is listed");
+    assert_eq!(
+        row.phase(),
+        JobPhase::Orphaned,
+        "a crashed tombstone is an orphan"
+    );
+    assert_eq!(row.phase().label(), "orphaned");
+    assert!(
+        !row.phase().is_collectable(),
+        "no result waits in a tombstone"
     );
 }
 
@@ -319,7 +639,9 @@ fn seed_done_at(job_id: &str, started_at: u64, done_at: Option<u64>) {
 #[test]
 fn gc_reaps_expired_running_and_done_keeps_fresh() {
     let _home = HomeSandbox::new();
-    let now = 10_000_000_000u64; // far-future ms so "fresh" entries read as recent
+    // A synthetic clock, high enough that every TTL this file subtracts from it
+    // stays positive; entries seeded at `now` read as fresh against it.
+    let now = 10_000_000_000u64;
 
     seed_done_at("d-fresh-done", now, Some(now));
     write_running(&spec("d-fresh-run", "p", now)).unwrap();
@@ -439,7 +761,7 @@ fn a_job_still_talking_survives_the_corpse_sweep_however_old_it_is() {
     let now = 10_000_000_000u64;
     let ancient = now - 10 * RUNNING_TTL_MS;
 
-    // Minted half a day ago, said something a second ago: alive.
+    // Minted ten corpse windows ago, said something a second ago: alive.
     write_heartbeat(&spec("d-talking", "p", ancient), now - 1000, "still going").unwrap();
     // Same age, never heard from since the mint: a corpse.
     write_running(&spec("d-silent", "p", ancient)).unwrap();
@@ -766,6 +1088,8 @@ fn job_files_and_dir_are_owner_only() {
         "work",
         1000,
         None,
+        None,
+        false,
         serde_json::json!({"result": "secret output"}),
     )
     .unwrap();

@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! The Setup-tab `model` row is a segmented alias cycle sharing the Config-tab
 //! contract: bare labels when blurred, the active option bracketed only on focus
 //! (the row widens by 2 on focus — the bracket pair is the only width change).
@@ -159,17 +160,81 @@ fn setup_hints_follow_the_row_value() {
 
     snap.auto_start = true;
     let on = row_hint(ConfigRow::AutoStart, &snap).unwrap();
-    assert!(on.contains("throwaway session"), "{on}");
+    assert_eq!(
+        on,
+        "sends a 1-token request to Haiku at every 5h usage reset"
+    );
     snap.auto_start = false;
     let off = row_hint(ConfigRow::AutoStart, &snap).unwrap();
-    assert!(off.contains("never starts"), "{off}");
+    assert_eq!(off, "5h usage window stays closed after reset");
 
     snap.base_url = String::new();
     let empty = row_hint(ConfigRow::BaseUrl, &snap).unwrap();
-    assert!(empty.contains("claude.ai account"), "{empty}");
+    assert_eq!(
+        empty,
+        "leave empty for a Claude account, or set an API endpoint"
+    );
     snap.base_url = "https://api.example.com".into();
     let set = row_hint(ConfigRow::BaseUrl, &snap).unwrap();
-    assert!(set.contains("calls instead"), "{set}");
+    assert_eq!(
+        set,
+        "the API endpoint this account calls instead of claude.ai"
+    );
+}
+
+/// Field rows whose labels self-describe carry no hint (a hint restating the
+/// label reads as noise); the siblings that keep one are pinned whole.
+#[test]
+fn self_describing_rows_have_no_hint_and_sibling_hints_are_pinned() {
+    let mut snap = Snap::blank("a");
+    for row in [
+        ConfigRow::Model,
+        ConfigRow::OpusModel,
+        ConfigRow::SonnetModel,
+        ConfigRow::HaikuModel,
+        ConfigRow::FableModel,
+        ConfigRow::EnvEntry(0),
+        ConfigRow::EnvAdd,
+    ] {
+        assert_eq!(row_hint(row, &snap), None, "{row:?} carries no hint");
+    }
+    assert_eq!(
+        row_hint(ConfigRow::SubagentModel, &snap).as_deref(),
+        Some("default subagent model in this account"),
+    );
+    assert_eq!(
+        row_hint(ConfigRow::ModelOverrideAdd, &snap).as_deref(),
+        Some("set custom model names on this account"),
+    );
+    assert_eq!(
+        row_hint(ConfigRow::ApiKey, &snap).as_deref(),
+        Some("provided to Claude Code via \"apiKeyHelper\" field"),
+    );
+    snap.console_login = true;
+    assert_eq!(
+        row_hint(ConfigRow::Login, &snap).as_deref(),
+        Some("log into alibaba console to see this account's usage"),
+    );
+}
+
+/// The capture + log-out hints state the act alone, nothing else.
+#[test]
+fn capture_and_logout_hints_state_the_act_alone() {
+    let mut snap = Snap::blank("a");
+    assert_eq!(
+        row_hint(ConfigRow::CaptureLogin, &snap).as_deref(),
+        Some("save the current global credentials into a new account"),
+    );
+    assert_eq!(
+        row_hint(ConfigRow::DeleteCreds, &snap).as_deref(),
+        Some("clears the stored OAuth login"),
+    );
+    // `api_login` flips on `!login_is_oauth`, mirroring row_hint's own guard.
+    snap.login_is_oauth = false;
+    assert_eq!(
+        row_hint(ConfigRow::DeleteCreds, &snap).as_deref(),
+        Some("clears the stored API key"),
+    );
 }
 
 // ── `disabled` row (account-action button, same class as `Delete`) ─────────
@@ -346,7 +411,7 @@ fn disabled_hint_follows_the_gate_then_the_value() {
 
     assert_eq!(
         row_hint(ConfigRow::Disabled, &snap).as_deref(),
-        Some("removes this account from auto-switch, usage polling, and status until re-enabled"),
+        Some("excludes this account from auto-switch, usage polling, and status until re-enabled"),
     );
 
     snap.disabled = true;
@@ -359,14 +424,14 @@ fn disabled_hint_follows_the_gate_then_the_value() {
     snap.has_live_session = true;
     assert_eq!(
         row_hint(ConfigRow::Disabled, &snap).as_deref(),
-        Some("has a live session, close it before disabling"),
+        Some("cannot disable an account with a live session"),
     );
 
     // The active-account gate outranks the live-session gate.
     snap.is_active = true;
     assert_eq!(
         row_hint(ConfigRow::Disabled, &snap).as_deref(),
-        Some("the active account can't be disabled · switch away first"),
+        Some("cannot disable the global active account"),
     );
 }
 
@@ -733,20 +798,20 @@ fn clear_session_token_hint_names_the_gate_then_what_the_clear_falls_back_to() {
 
     assert_eq!(
         row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
-        Some("no other login stored, log in first"),
+        Some("cannot clear with no other login stored"),
     );
 
     // An api key alone opens the gate, and there is no login behind it.
     snap.has_other_login = true;
     assert_eq!(
         row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
-        Some("the next switch runs this account on its api key"),
+        Some("the next switch runs this account on its API key"),
     );
 
     snap.is_active = true;
     assert_eq!(
         row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
-        Some("signs Claude Code out now · this account runs on its api key"),
+        Some("signs Claude Code out now · this account runs on its API key"),
     );
 
     // A stored OAuth pair is what the clear actually falls back to.
@@ -825,14 +890,14 @@ fn clear_session_token_hint_lets_a_flag_only_account_past_the_gate() {
     snap.session_token = Some(crate::claude::SessionTokenStatus::LongLived(None));
     assert_eq!(
         row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
-        Some("no other login stored, log in first"),
+        Some("cannot clear with no other login stored"),
     );
 
     snap.session_token = None;
     snap.has_static_backup = true;
     assert_eq!(
         row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
-        Some("no other login stored, log in first"),
+        Some("cannot clear with no other login stored"),
     );
 }
 
@@ -867,6 +932,7 @@ fn snap_rolling_token_is_the_sidecar_content_not_the_config_flag() {
             expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
             scopes: Some(scopes.into_iter().map(String::from).collect()),
             subscription_type: plan.map(String::from),
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
 
@@ -1014,4 +1080,33 @@ fn stalled_rolling_fix_line_uses_the_title_that_survives_a_draft() {
         joined.contains("clauth rolling-token acct re-arms"),
         "the fix line reads the title, which a draft never blanks: {joined}"
     );
+}
+
+/// One login row, one pair of labels: `+ login` until a credential exists,
+/// `re-login` after, whichever of its three flows the account routes to.
+#[test]
+fn login_labels_read_the_same_for_every_flow() {
+    let input = InputState::new("");
+    let text = |snap: &Snap, row: ConfigRow| {
+        line_text(&detail_row(row, false, false, None, snap, &input))
+            .trim()
+            .to_string()
+    };
+    let mut snap = Snap::blank("a");
+    assert_eq!(text(&snap, ConfigRow::Login), "+ login");
+    snap.logged_in = true;
+    assert_eq!(text(&snap, ConfigRow::Login), "re-login");
+
+    // An api-key account: the row re-enters the key.
+    snap.login_is_oauth = false;
+    assert_eq!(text(&snap, ConfigRow::Login), "re-login");
+    snap.logged_in = false;
+    assert_eq!(text(&snap, ConfigRow::Login), "+ login");
+
+    // A Model Studio account is api-typed too, and its row opens the console.
+    snap.login_is_oauth = true;
+    snap.console_login = true;
+    assert_eq!(text(&snap, ConfigRow::Login), "+ login");
+    snap.logged_in = true;
+    assert_eq!(text(&snap, ConfigRow::Login), "re-login");
 }

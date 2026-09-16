@@ -92,6 +92,14 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
             "wrap_off_",
             "find_recovered_",
             "sink_active_",
+            // Interleaved auto-start: membership, gap arithmetic, the
+            // history-series classifier, the per-tick election, and the chip.
+            // ONE prefix, and every test of the feature is rooted at it, so a
+            // deleted test reds this row while nothing else in the test tree
+            // can match by accident — a bare `queue_` would also match the
+            // `build_status_auto_start_queue_` status tests, and `queue` alone
+            // matches every name carrying that substring.
+            "auto_start_queue_",
         ],
     ),
     (
@@ -143,6 +151,24 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
             "live_session_included",
             "force_true_bypasses",
             "rotation_guard_is_independent",
+            // `--listen`: the REST API the Headless bullet claims serves the
+            // feed and the switch to another machine. The bullet said that while
+            // this list named none of it, so the routes, their auth, and the TLS
+            // listener under them all counted as uncovered.
+            "every_route_but_pair_refuses_an_unpaired_caller",
+            "only_the_api_v1_prefix_is_served",
+            "an_unknown_path_is_404_and_a_wrong_method_is_405",
+            "status_serves_the_on_disk_feed_verbatim",
+            "all_equals_one_reads_the_live_stores",
+            "switch_relinks_and_reports_the_previous_account",
+            "a_second_concurrent_switch_is_refused_immediately",
+            "a_revoked_device_is_refused_on_its_next_request",
+            "a_view_device_is_refused_every_control_route",
+            "an_unknown_tier_device_is_refused_while_the_others_work",
+            "the_connection_cap_admits_up_to_the_limit",
+            "a_content_length_that_is_not_bare_digits",
+            "cert_source_is_explicit_only_when_both_files_are_named",
+            "a_missing_certificate_fails_in_prepare_not_after_the_claim",
             // rolling session token (#59): the daemon leg — the tick that
             // re-stamps the sidecar and the gate it goes through.
             "claude_rolling_tick_",
@@ -171,6 +197,8 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
             "cross_thread_with_state_lock_serializes",
             "same_thread_reentrancy_does_not_deadlock",
             "poison_recovery_after_panicking_closure",
+            "start_walk_",
+            "start_auto_",
         ],
     ),
 ];

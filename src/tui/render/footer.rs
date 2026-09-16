@@ -8,7 +8,7 @@ use ratatui::widgets::Paragraph;
 
 use super::super::app::{
     App, ConfigFocus, ConfigRow, FallbackHint, FooterAlert, GLOBAL_CONFIG_ROWS, GlobalConfigRow,
-    HERDR_OPTIONS, HerdrOption, LoginSession, PluginFocus, StatusFocus, Tab, TokenView,
+    HERDR_OPTIONS, HerdrOption, LoginSession, Modal, PluginFocus, StatusFocus, Tab, TokenView,
     build_action_menu, config_rows, fallback_hint, has_sub_focus, herdr_config_writable,
 };
 use super::super::theme;
@@ -25,9 +25,15 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // handling that clears alerts can't hide it.
     if let Some(session) = &app.login {
         // Any open modal owns esc/q (the login modal collapses, others handle
-        // their own keys), so the hint flips to `q back` for the whole stack.
-        let modal_open = !app.modals.is_empty();
-        draw_login(frame, area, session, modal_open, app.tick_count);
+        // their own keys), so the hint flips to `q back` for the whole stack;
+        // the login modal's open code field is the exception, where `q` is
+        // data and ↵ submits.
+        let keys = match app.modals.last() {
+            Some(Modal::Login) if session.paste_field.is_some() => LoginKeys::Paste,
+            Some(_) => LoginKeys::Back,
+            None => LoginKeys::Cancel,
+        };
+        draw_login(frame, area, session, keys, app.tick_count);
         return;
     }
 
@@ -116,14 +122,19 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             }
         },
         Tab::Config => {
-            if app.refresh_interval_draft.is_some() || app.weekly_threshold_draft.is_some() {
+            if app.refresh_interval_draft.is_some()
+                || app.context_nudge_draft.is_some()
+                || app.weekly_threshold_draft.is_some()
+            {
                 &[("↵", "save"), ("←→", "caret"), ("esc", "cancel")]
             } else if GLOBAL_CONFIG_ROWS
                 .get(app.global_config_cursor)
                 .is_some_and(|r| {
                     matches!(
                         r,
-                        GlobalConfigRow::RefreshInterval | GlobalConfigRow::WeeklyThreshold
+                        GlobalConfigRow::RefreshInterval
+                            | GlobalConfigRow::ContextNudge
+                            | GlobalConfigRow::WeeklyThreshold
                     )
                 })
             {
@@ -223,7 +234,8 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 | FallbackHint::DetailWeeklyAtEdit
                 | FallbackHint::DetailRemoveArmed
         ))
-        || (app.tab == Tab::Config && app.refresh_interval_draft.is_some())
+        || (app.tab == Tab::Config
+            && (app.refresh_interval_draft.is_some() || app.context_nudge_draft.is_some()))
         || (app.tab == Tab::Plugin && app.plugin.herdr_tag_draft.is_some()));
 
     let mut hints: Vec<(&str, &str)> = std::iter::once(TAB_NAV)
@@ -433,35 +445,44 @@ fn draw_alert(frame: &mut Frame<'_>, area: Rect, alert: &FooterAlert) {
     );
 }
 
+/// What esc/q/↵ do this frame for the login line's trailing hint.
+#[derive(Clone, Copy)]
+enum LoginKeys {
+    /// A modal is open: `q` steps back out of it.
+    Back,
+    /// The login modal is collapsed: `esc` cancels the login.
+    Cancel,
+    /// The login modal's code field is open: `↵` submits, `esc` restores the
+    /// `p  paste code` row; `q` is data.
+    Paste,
+}
+
 /// Login-in-progress line. Independent of `footer_alert` so key handling that
-/// clears alerts never hides it. The authorize URL and live stage render in
-/// the login modal; this row is the collapsed view. The trailing hint tracks
-/// what esc/q actually do this frame: with any modal open they go to the
-/// modal (`q back`); collapsed, both cancel the login (`esc cancel`).
+/// clears alerts never hides it. The live stage renders in the login modal;
+/// this row is the collapsed view and carries the name alone. The trailing
+/// hint tracks what esc/q actually do this frame: with any modal open they go
+/// to the modal (`q back`; the open code field takes `↵ submit   esc back`);
+/// collapsed, both cancel the login (`esc cancel`).
 fn draw_login(
     frame: &mut Frame<'_>,
     area: Rect,
     session: &LoginSession,
-    modal_open: bool,
+    keys: LoginKeys,
     tick: u64,
 ) {
-    let (key, action) = if modal_open {
-        ("   q ", "back")
-    } else {
-        ("   esc ", "cancel")
+    let hints: &[(&str, &str)] = match keys {
+        LoginKeys::Back => &[("   q ", "back")],
+        LoginKeys::Cancel => &[("   esc ", "cancel")],
+        LoginKeys::Paste => &[("   ↵ ", "submit"), ("   esc ", "back")],
     };
-    let spans = vec![
+    let mut spans = vec![
         Span::styled(format!("{} ", spinner_frame(tick)), theme::accent()),
-        Span::styled(
-            format!(
-                "logging in '{}' (complete it in your browser)",
-                session.name
-            ),
-            theme::dim(),
-        ),
-        Span::styled(key, theme::accent().bold()),
-        Span::styled(action, theme::dim()),
+        Span::styled(format!("logging in '{}'", session.name), theme::dim()),
     ];
+    for (key, action) in hints {
+        spans.push(Span::styled(*key, theme::accent().bold()));
+        spans.push(Span::styled(*action, theme::dim()));
+    }
     frame.render_widget(
         Paragraph::new(Line::from(spans))
             .style(theme::base())

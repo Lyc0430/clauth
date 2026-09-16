@@ -94,6 +94,47 @@ fn the_retry_hint_follows_the_kind_not_the_call_site() {
     );
 }
 
+/// The pairing rule is structural, not a convention: a `Cause` whose copy
+/// names the operator's next step refuses every retry that appends advice
+/// (`Wait`, `Connection`, `Restart`) at construction. The appended hint either
+/// duplicates the cause's advice, since `RotationLockHeld` already ends with
+/// the exact literal `Wait` appends, or contradicts it, as a permissions check
+/// followed by `check your connection and retry` does. A text guard cannot
+/// reach the class: duplication is the only half a string match can see, and
+/// every other self-prescribing arm contradicts the suffix without containing
+/// it, so the refusal has to read the cause rather than its tail. `Stated`
+/// appends nothing and pairs with every arm.
+///
+/// Both constructors run the full retry set. They delegate to one helper today,
+/// which is an implementation detail rather than a pinned invariant: a split
+/// that leaves `with_status` unguarded would otherwise ship with a green suite.
+#[test]
+fn self_prescribing_arm_refuses_every_suffixed_retry_at_construction() {
+    fn refuses_every_suffixed_retry(ctor: &str, build: fn(Cause, Retry)) {
+        for retry in [Retry::Wait, Retry::Connection, Retry::Restart] {
+            let retry_name = format!("{retry:?}");
+            let caught = std::panic::catch_unwind(|| {
+                build(Cause::RotationLockHeld("work".to_string()), retry);
+            });
+            let msg = caught.unwrap_err();
+            let msg = msg
+                .downcast_ref::<String>()
+                .expect("refusal message as String");
+            assert!(
+                msg.contains("RotationLockHeld") && msg.contains(&retry_name),
+                "{ctor} must name the arm and the retry, got: {msg}"
+            );
+        }
+    }
+
+    refuses_every_suffixed_retry("new", |cause, retry| {
+        Transient::new(cause, retry);
+    });
+    refuses_every_suffixed_retry("with_status", |cause, retry| {
+        Transient::with_status(cause, 400, retry);
+    });
+}
+
 /// The CLI/daemon surfaces name the HTTP status; the toast and MCP forms do not.
 /// Asserted together so neither half can drift alone — a status that silently
 /// stops reaching stderr looks exactly like one that was never added.
@@ -141,59 +182,109 @@ fn only_the_status_bearing_form_names_the_status() {
 /// `cause: String` that would have accepted a response body: if an arm is ever
 /// added, this is where its copy has to be stated rather than passed in — ALL
 /// of it, or a blanked-out arm ships mute.
+///
+/// The table also pins the pairing rule per arm, against every `Retry`:
+/// `Stated` renders the bare copy, and each suffix-bearing retry (`Wait`,
+/// `Connection`, `Restart`) is refused when the arm's copy names its own next
+/// step (`names_next_step` — the row states it independently of the
+/// constructor's own classification, so a dropped arm reds here instead of
+/// silently accepting the stutter) and appended when it does not.
 #[test]
 fn every_transient_cause_renders_its_own_copy() {
-    for (cause, want) in [
-        (
-            Cause::Endpoint("anthropic is throttling requests"),
-            "anthropic is throttling requests",
-        ),
-        (
-            Cause::RotationLockUnavailable("work".to_string()),
-            "could not lock 'work' for a token refresh; check permissions on ~/.clauth",
-        ),
-        (
-            Cause::InternalLock,
-            "clauth hit an internal lock error, restart clauth",
-        ),
-        (
-            Cause::PersistFailed("work".to_string()),
-            "refreshed 'work' but failed to persist the rotated tokens",
-        ),
-        (
-            Cause::SidecarWriteFailed("work".to_string()),
-            "could not write 'work' session token · check permissions on ~/.clauth",
-        ),
-        (
-            Cause::LiveSessionOnRotatingChain("work".to_string()),
-            "'work' has a live clauth start session holding its rotating chain (it started \
-             before the rolling token was armed); restart that session or retry once it ends",
-        ),
-        (
-            Cause::RotationLockHeld("work".to_string()),
-            "'work' has a token rotation in progress, retry in a moment",
-        ),
-        (
-            Cause::RollingGrantUnrecorded("work".to_string()),
-            "'work' usage chain has no recorded grant beyond the setup-token scopes, so a \
-             rolling bearer cannot be told from a mint · run `clauth login work` to record \
-             the chain's real grant",
-        ),
-        (
-            Cause::SidecarMisfilled("work".to_string()),
-            "'work' session token holds a rotating pair and no live mint backup exists to \
-             heal it · re-capture with `clauth login work --setup-token`",
-        ),
-        (
-            Cause::StateLockBusy("work".to_string()),
-            "another clauth process holds ~/.clauth's state lock · 'work' left unchanged",
-        ),
-        (
-            Cause::StateLockUnavailable("work".to_string()),
-            "could not lock 'work' for a token refresh; check permissions on ~/.clauth",
-        ),
+    struct Row {
+        cause: Cause,
+        bare: &'static str,
+        names_next_step: bool,
+    }
+    for Row {
+        cause,
+        bare,
+        names_next_step,
+    } in [
+        Row {
+            cause: Cause::Endpoint("anthropic is throttling requests"),
+            bare: "anthropic is throttling requests",
+            names_next_step: false,
+        },
+        Row {
+            cause: Cause::RotationLockUnavailable("work".to_string()),
+            bare: "could not lock 'work' for a token refresh; check permissions on ~/.clauth",
+            names_next_step: true,
+        },
+        Row {
+            cause: Cause::InternalLock,
+            bare: "clauth hit an internal lock error, restart clauth",
+            names_next_step: true,
+        },
+        Row {
+            cause: Cause::PersistFailed("work".to_string()),
+            bare: "refreshed 'work' but failed to persist the rotated tokens",
+            names_next_step: false,
+        },
+        Row {
+            cause: Cause::SidecarWriteFailed("work".to_string()),
+            bare: "could not write 'work' session token · check permissions on ~/.clauth",
+            names_next_step: true,
+        },
+        Row {
+            cause: Cause::LiveSessionOnRotatingChain("work".to_string()),
+            bare: "'work' has a live clauth start session holding its rotating chain (it \
+                    started before the rolling token was armed); restart that session or \
+                    retry once it ends",
+            names_next_step: true,
+        },
+        Row {
+            cause: Cause::RotationLockHeld("work".to_string()),
+            bare: "'work' has a token rotation in progress, retry in a moment",
+            names_next_step: true,
+        },
+        Row {
+            cause: Cause::RollingGrantUnrecorded("work".to_string()),
+            bare: "'work' usage chain has no recorded grant beyond the setup-token scopes, \
+                    so a rolling bearer cannot be told from a mint · run `clauth login work` \
+                    to record the chain's real grant",
+            names_next_step: true,
+        },
+        Row {
+            cause: Cause::SidecarMisfilled("work".to_string()),
+            bare: "'work' session token holds a rotating pair and no live mint backup exists \
+                    to heal it · re-capture with `clauth login work --setup-token`",
+            names_next_step: true,
+        },
+        Row {
+            cause: Cause::StateLockBusy("work".to_string()),
+            bare: "another clauth process holds ~/.clauth's state lock · 'work' left unchanged",
+            names_next_step: false,
+        },
+        Row {
+            cause: Cause::StateLockUnavailable("work".to_string()),
+            bare: "could not lock 'work' for a token refresh; check permissions on ~/.clauth",
+            names_next_step: true,
+        },
     ] {
-        assert_eq!(Transient::new(cause, Retry::Stated).text(), want);
+        assert_eq!(Transient::new(cause.clone(), Retry::Stated).text(), bare);
+        for (retry, suffix) in [
+            (Retry::Wait, ": retry in a moment"),
+            (Retry::Connection, ": check your connection and retry"),
+            (Retry::Restart, ": run clauth login again for a fresh code"),
+        ] {
+            let retry_name = format!("{retry:?}");
+            if names_next_step {
+                let caught = std::panic::catch_unwind(|| {
+                    Transient::new(cause.clone(), retry);
+                });
+                assert!(
+                    caught.is_err(),
+                    "a self-prescribing arm must refuse {retry_name}: {bare}"
+                );
+            } else {
+                assert_eq!(
+                    Transient::new(cause.clone(), retry).text(),
+                    format!("{bare}{suffix}"),
+                    "an arm that names no next step takes {retry_name}'s advice: {bare}"
+                );
+            }
+        }
     }
 }
 
@@ -264,6 +355,19 @@ fn format_pct_shows_fractional_percent() {
     assert_eq!(format_pct(42.3), "42.3%");
 }
 
+/// The one threshold spelling, pinned per branch so a drift on one branch
+/// cannot ride the others green: exact millions as `{n}M`, whole thousands
+/// below a million as `{n}k`, anything else plain.
+#[test]
+fn threshold_tokens_formats_m_k_and_plain() {
+    assert_eq!(format_threshold_tokens(1_000_000), "1M");
+    assert_eq!(format_threshold_tokens(2_000_000), "2M");
+    assert_eq!(format_threshold_tokens(600_000), "600k");
+    assert_eq!(format_threshold_tokens(50_000), "50k");
+    assert_eq!(format_threshold_tokens(450_500), "450500");
+    assert_eq!(format_threshold_tokens(1_500_000), "1500000");
+}
+
 /// `local_stamp` is the one prose-stamp formatter: epoch seconds → `YYYY-MM-DD
 /// HH:MM:SS` in local wall clock. Pinned on a fixed epoch so the SHAPE asserts
 /// independently of the operator's zone — the wall-clock digits shift with the
@@ -329,6 +433,7 @@ fn account_tier_reports_no_tier_for_an_unfetched_plan() {
             expires_at: None,
             scopes: None,
             subscription_type: Some("something_new".into()),
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     assert_eq!(account_tier(&unclassified), None);
@@ -361,6 +466,7 @@ fn account_tier_falls_through_an_unclassified_fetched_plan_to_the_token() {
                 expires_at: None,
                 scopes: None,
                 subscription_type: Some(sub.into()),
+                ..crate::profile::OAuthToken::default_extra()
             }),
         })
     };
@@ -410,6 +516,7 @@ fn account_tier_reads_back_a_free_logins_stored_token() {
             expires_at: None,
             scopes: None,
             subscription_type: Some("free".into()),
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     assert_eq!(account_tier(&free), Some(PlanTier::Free));
@@ -449,7 +556,145 @@ fn account_tier_still_renders_every_known_tier() {
             expires_at: None,
             scopes: None,
             subscription_type: Some("pro".into()),
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     assert_eq!(account_tier(&token_only), Some(PlanTier::Pro));
+}
+
+/// The splitter family's bytes, pinned here because every routing test asserts
+/// `third_party_dead_chain_copy`'s output against a call of the same
+/// constructor: those pin WHICH sentence is selected and nothing about what it
+/// renders, so a reword ships green through all of them. The two older
+/// sentences carry end-to-end literal pins at their routing sites; this is the
+/// third one's only guard, and all three are owner-ruled verbatim.
+#[test]
+fn the_split_state_sentences_render_their_ruled_bytes() {
+    let name = crate::profile::ProfileName::from("qwen");
+    assert_eq!(
+        third_party_keyless(&name),
+        "profile has no api key: qwen (run `clauth login qwen --api-key <key>`)"
+    );
+    assert_eq!(
+        third_party_dead_chain(&name),
+        "stored OAuth chain is dead, its api key still works: qwen \
+         (run `clauth login qwen --api-key <key>` to clear the quarantine)"
+    );
+    assert_eq!(
+        third_party_dead_console(&name),
+        "console session expired, stored OAuth chain is dead: qwen \
+         (run `clauth login qwen` to re-capture the console; the api key still serves inference)"
+    );
+}
+
+// ── start-walk rendering ───────────────────────────────────────────────────
+
+#[test]
+fn start_block_labels_are_the_tui_chip_words() {
+    assert_eq!(start_block_label(&StartBlock::Disabled), "disabled");
+    assert_eq!(start_block_label(&StartBlock::AuthBroken), "auth broken");
+    assert_eq!(start_block_label(&StartBlock::Canceled), "canceled");
+    assert_eq!(
+        start_block_label(&StartBlock::KickRejected),
+        "claude code blocked"
+    );
+    assert_eq!(
+        start_block_label(&StartBlock::NotOauth),
+        "not an oauth account"
+    );
+    assert_eq!(start_block_label(&StartBlock::WeeklySpent), "weekly spent");
+    assert_eq!(
+        start_block_label(&StartBlock::WeeklySoft { pct: 99.0 }),
+        "weekly 99%"
+    );
+    assert_eq!(
+        start_block_label(&StartBlock::FiveHour { pct: 100.0 }),
+        "5h 100%"
+    );
+    assert_eq!(
+        start_block_label(&StartBlock::ScopedSpent {
+            label: "7d opus".to_owned(),
+            pct: 100.0,
+        }),
+        "7d opus 100%, other models ok"
+    );
+}
+
+#[test]
+fn render_start_walk_matches_the_approved_layout() {
+    let rows = vec![
+        StartCandidate {
+            name: crate::profile::ProfileName::from("D1"),
+            block: Some(StartBlock::ScopedSpent {
+                label: "7d opus".to_owned(),
+                pct: 100.0,
+            }),
+            age: OauthAge::Dated(240_000),
+            stale: false,
+            fresh: true,
+        },
+        StartCandidate {
+            name: crate::profile::ProfileName::from("D2"),
+            block: None,
+            age: OauthAge::Dated(240_000),
+            stale: false,
+            fresh: true,
+        },
+        StartCandidate {
+            name: crate::profile::ProfileName::from("D3"),
+            block: None,
+            age: OauthAge::Dated(10_800_000),
+            stale: true,
+            fresh: false,
+        },
+    ];
+    assert_eq!(
+        render_start_walk(&rows, Some(1)),
+        "  D1  7d opus 100%, other models ok   usage 4m ago\n* D2  ok                              usage 4m ago\n  D3  ok                              usage 3h ago (stale)"
+    );
+}
+
+#[test]
+fn start_lines_match_the_approved_copy() {
+    let rows = vec![
+        StartCandidate {
+            name: crate::profile::ProfileName::from("D1"),
+            block: Some(StartBlock::ScopedSpent {
+                label: "7d opus".to_owned(),
+                pct: 100.0,
+            }),
+            age: OauthAge::Dated(240_000),
+            stale: false,
+            fresh: true,
+        },
+        StartCandidate {
+            name: crate::profile::ProfileName::from("D2"),
+            block: None,
+            age: OauthAge::Dated(240_000),
+            stale: false,
+            fresh: true,
+        },
+    ];
+    let two = ["opus".to_owned(), "sonnet".to_owned()];
+    let one = ["opus".to_owned()];
+    let none: [String; 0] = [];
+    assert_eq!(
+        start_pick_line("D2", &two),
+        "would start on 'D2' for opus + sonnet"
+    );
+    assert_eq!(start_pick_line("D1", &one), "would start on 'D1' for opus");
+    assert_eq!(start_pick_line("D1", &none), "would start on 'D1'");
+    assert_eq!(
+        start_launch_line("D2", &two),
+        "clauth: starting on 'D2' for opus + sonnet"
+    );
+    assert_eq!(start_launch_line("D1", &none), "clauth: starting on 'D1'");
+    assert_eq!(
+        start_refusal(&one, &rows),
+        "--auto found no chain member with headroom for opus\n  D1  7d opus 100%, other models ok   usage 4m ago\n  D2  ok                              usage 4m ago"
+    );
+    assert_eq!(
+        start_refusal(&none, &[]),
+        "--auto found no chain member with headroom"
+    );
 }

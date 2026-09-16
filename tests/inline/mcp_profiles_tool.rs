@@ -283,9 +283,11 @@ fn seed_flag_states() {
     );
 }
 
-/// The three states that make `delegate` refuse a target render adjacent, so a
-/// reader sees one refusal group, and `canceled` follows them as the
-/// informational marker it is — clauth has no cancel gate. Each is absent
+/// The three account-state markers render adjacent, so a reader meets one
+/// group, and `canceled` follows them as the informational marker it is —
+/// clauth has no cancel gate. Two of the three refuse a delegate outright;
+/// `login expired` refuses only where the expired login is what the account
+/// authenticates with (`preflight_target`). Each is absent
 /// (never `false`) on an account it does not describe, the rule `keyless`
 /// already ships, and a row in none of the states is byte-unchanged.
 #[test]
@@ -305,11 +307,11 @@ fn roster_flags_name_each_state_and_leave_a_clean_row_unchanged() {
     );
 }
 
-/// The refusal group is contiguous: a profile in all three states spells them
+/// The marker group is contiguous: a profile in all three states spells them
 /// in one run, ahead of the informational `canceled`, rather than scattering
 /// them through the line.
 #[test]
-fn the_three_refusal_markers_render_as_one_group() {
+fn the_three_state_markers_render_as_one_group() {
     let line = render::profiles_prose(&serde_json::json!({
         "profiles": [{
             "name": "wreck",
@@ -345,6 +347,7 @@ fn seed_canceled_account() {
             expires_at: None,
             scopes: None,
             subscription_type: Some("pro".to_string()),
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     save_profile(&profile).expect("save profile");
@@ -415,7 +418,7 @@ fn session_scope_resolves_the_tier_through_the_which_tiers() {
 }
 
 /// A GENERIC api-key endpoint — no typed integration, so `provider` is `None`
-/// and `provider_label` renders it `anthropic` — is still an api-key account:
+/// and `provider_label` renders it `generic` — is still an api-key account:
 /// the same scheduler leg caches its usage, it has no Anthropic pool, and it has
 /// no Anthropic plan tier. A roster keyed on the display label or on
 /// `is_third_party` tells the picker both of those are unknown while holding the
@@ -445,7 +448,7 @@ fn a_generic_api_key_row_reports_its_own_figures_and_claims_no_anthropic_plan() 
     let row = lines(&call_profiles(None, None)).remove(0);
     assert_eq!(
         row,
-        "- litellm (global active) [anthropic, 127.0.0.1:4000, local endpoint]: \
+        "- litellm (global active) [generic, 127.0.0.1:4000, local endpoint]: \
          no 5h/7d limits; total: 31.45 CNY",
         "the account's own cached figures, no claim about a plan it cannot have, and the \
          locality marker its loopback base url earns — pinned here on a row the production \
@@ -458,16 +461,21 @@ fn a_generic_api_key_row_reports_its_own_figures_and_claims_no_anthropic_plan() 
 /// production paths only — the fixture is real bytes so the reader's
 /// assumptions are pinned by the wire shape, never hand-built.
 ///
-/// The bars carry `resets_at` stamps, but they are inert on this path: the
+/// The bars carry `resets_at` stamps, and they gate this path (#74 T2): the
 /// third-party rendering chain (`windows_payload` -> `third_party_headline`
-/// -> the third-party arm of `windows_prose`) never reads `resets_at`, and
-/// the only time-derived input it sees is the precomputed `stale` flag —
-/// which merely appends the suffix the contains form already tolerates — so
-/// the asserted substrings are a pure function of the stats. The countdown
-/// clause lives in `windows_prose`'s OAUTH arm only and is unreachable from
-/// a third-party row. The asserts stay contains-based on the plan label and
-/// each `label pct%` pair as belt-and-braces against any suffix the row gains
-/// later (a freshness clause, a tier), never against a countdown.
+/// -> the third-party arm of `windows_prose`) drops a bar whose reset has
+/// passed, so the asserted substrings are a pure function of the stats ONLY
+/// because the fixture is re-anchored before the write
+/// (`reanchored_bars_cache_bytes` stamps each bar at now + its own window
+/// length). A future edit to the re-anchor that let real time lapse a
+/// captured bar would drop the `label pct%` pair here — the contains asserts
+/// fail on exactly that. The precomputed `stale` flag is the only other
+/// time-derived input, and it merely appends the suffix the contains form
+/// already tolerates. The countdown clause lives in `windows_prose`'s OAUTH
+/// arm only and is unreachable from a third-party row. The asserts stay
+/// contains-based on the plan label and each `label pct%` pair as
+/// belt-and-braces against any suffix the row gains later (a freshness
+/// clause, a tier), never against a countdown.
 const CAPTURED_GLM_CACHE: &str = r#"{"is_available":true,"rows":[{"label":"30d","value":"","kind":"heading"},{"label":"search-prime","value":"1","kind":"body"},{"label":"web-reader","value":"0","kind":"body"},{"label":"zread","value":"0","kind":"body"},{"label":"7d tokens","value":"","kind":"heading"},{"label":"GLM-5.3","value":"291.5M","kind":"body"},{"label":"GLM-5.2","value":"0","kind":"body"},{"label":"GLM-4.7","value":"174.4k","kind":"body"},{"label":"total","value":"291.3M  (2.8k calls)","kind":"faint"}],"bars":[{"label":"5h","pct":0.0},{"label":"7d","pct":97.0,"resets_at":"2026-08-28T19:31:30+00:00"},{"label":"30d","pct":1.0,"resets_at":"2026-09-19T19:31:30+00:00","used":1.0,"total":1000.0}],"plan":"pro","best_effort":false}"#;
 
 /// The bars arm of `windows_payload` on the ROSTER's real cache reader: a z.ai
@@ -494,8 +502,10 @@ fn a_bars_carrying_z_ai_row_renders_the_headline_alone() {
     })
     .expect("save state");
 
-    let parsed = serde_json::from_str::<crate::providers::ThirdPartyStats>(CAPTURED_GLM_CACHE)
-        .expect("the captured z.ai cache parses");
+    let parsed: crate::providers::ThirdPartyStats = serde_json::from_slice(
+        &crate::testutil::reanchored_bars_cache_bytes(CAPTURED_GLM_CACHE),
+    )
+    .expect("the captured z.ai cache parses");
     crate::profile_cache::write_profile_cache(
         &crate::profile::ProfileName::from("glm"),
         crate::profile_cache::THIRD_PARTY_CACHE_FILE,
@@ -556,6 +566,67 @@ fn a_two_wallet_profile_renders_its_funded_wallet_figure() {
     );
 }
 
+/// The wallet-burn rate on the row a model reads: the same two-wallet cache as
+/// the funded-figure ruling, plus the balance series its own fetch leg would
+/// have recorded, renders the rate beside the funded figure through the shared
+/// windows prose — the one carrier every headroom surface reads.
+#[test]
+fn a_wallet_series_renders_its_burn_rate_on_the_roster_row() {
+    let _home = HomeSandbox::new();
+    save_profile(&Profile::new(
+        "tw".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-fixture".to_string()),
+    ))
+    .expect("save tw");
+    save_app_state(&AppState {
+        active_profile: Some("tw".into()),
+        profiles: vec!["tw".into()],
+        ..Default::default()
+    })
+    .expect("save state");
+    crate::testutil::write_captured_third_party_cache(
+        "tw",
+        crate::testutil::CAPTURED_TWO_WALLET_DS_CACHE,
+    );
+    // A day of linear drain to the captured figure: 606.18 → 498.18 CNY over
+    // ~12h, the funded wallet's own series.
+    let name = crate::profile::ProfileName::from("tw");
+    let now = crate::usage::now_ms();
+    for (hours_ago, amount) in [(12u64, 606.18f64), (6, 552.18), (1, 498.18)] {
+        crate::profile::append_wallet_readings_at(
+            &name,
+            &crate::providers::ThirdPartyStats {
+                is_available: true,
+                rows: vec![crate::providers::StatRow {
+                    label: "api balance".to_string(),
+                    value: format!("{amount:.2} CNY"),
+                    kind: crate::providers::StatRowKind::Body,
+                }],
+                bars: vec![],
+                plan: None,
+                endpoint: None,
+                best_effort: false,
+            },
+            now - hours_ago * 3_600_000,
+        );
+    }
+
+    let row = lines(&call_profiles(None, None)).remove(0);
+    assert!(
+        row.contains("api balance: 498.18 CNY · ~"),
+        "the rate rides the funded figure: {row}",
+    );
+    assert!(
+        row.contains("CNY/day"),
+        "the rate is named in the wallet's own currency: {row}",
+    );
+    assert!(
+        !row.contains("USD/day"),
+        "the unfunded USD wallet's series stays off the row: {row}",
+    );
+}
+
 /// One-wallet control for the ruling: a profile whose cache carries a single
 /// funded wallet renders exactly as it did before the rule — same figure,
 /// same row shape.
@@ -613,7 +684,7 @@ fn a_userinfo_base_url_puts_no_credentials_on_the_profiles_row() {
 
     let row = lines(&call_profiles(None, None)).remove(0);
     assert!(
-        row.contains("[anthropic, evil.tld]"),
+        row.contains("[generic, evil.tld]"),
         "the row names the host the request resolves to: {row}",
     );
     assert!(
@@ -656,11 +727,12 @@ fn an_env_authored_endpoint_renders_its_host_in_the_roster_row() {
 }
 
 /// Finding 11: the retired `which` prose mapped a null tier to `unknown`
-/// unconditionally, while `profile_line` guards the same null on
-/// `provider == "anthropic"` — a third-party account has no plan tier to lose.
-/// The session row inherits that guard by being rendered through `profile_line`,
-/// and this is what holds the inheritance: a row built any other way says
-/// `tier unknown` about an account that structurally has none.
+/// unconditionally, while `profile_line` guards the same null on the headroom
+/// payload's kind (`third_party`) — a third-party account has no plan tier to
+/// lose, whatever its provider label says. The session row inherits that guard
+/// by being rendered through `profile_line`, and this is what holds the
+/// inheritance: a row built any other way says `tier unknown` about an account
+/// that structurally has none.
 #[test]
 fn a_third_party_session_row_claims_no_unknown_it_structurally_has_none_of() {
     let home = HomeSandbox::new();

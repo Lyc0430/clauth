@@ -23,6 +23,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
+use std::process::Stdio;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -32,11 +33,23 @@ use crate::profile::clauth_dir;
 
 /// How stale `status.json` may be before the `● daemon` dot flips green→amber.
 /// The daemon stamps it every ~1s loop tick, but a single tick can legitimately
-/// block up to the keychain shell-outs' 20s total kill deadline (a
-/// read-modify-write at 10s each), so the window rides just above that. It also lands at the daemon's tightened
-/// [`WATCHDOG_DEADLINE`](super::WATCHDOG_DEADLINE), so amber reads as "wedging,
-/// about to be aborted + restarted" rather than a transient slow tick.
-const DAEMON_STALE_MS: u64 = 30_000;
+/// block on the keychain shell-outs: a rotation's mirror makes three `security`
+/// calls (read, write, read-back verify) at 10 s each, unclamped because it
+/// runs after the lock closure — 30 s worst, past
+/// `runtime::KEYCHAIN_MIRROR_BUDGET`'s 20 s term by design (see
+/// `keychain::SECURITY_TIMEOUT`'s doc). The window therefore sits one margin
+/// ABOVE [`WATCHDOG_DEADLINE`](super::WATCHDOG_DEADLINE), so that worst legal
+/// tick reads green throughout and amber means "no tick has completed within
+/// what the watchdog tolerates" — wedging, pre-abort — never "slowest legal
+/// tick".
+const DAEMON_STALE_MS: u64 = super::WATCHDOG_DEADLINE.as_millis() as u64 + 5_000;
+
+const _: () = assert!(
+    DAEMON_STALE_MS > super::WATCHDOG_DEADLINE.as_millis() as u64,
+    "the staleness window must sit strictly above the watchdog deadline: the \
+     worst legal tick (a keychain mirror spending every security deadline) must \
+     read green, never amber"
+);
 
 /// The `● daemon` header dot's three display states, derived from the daemon
 /// singleton flock (presence) + the `generated_at` stamp inside `status.json`
@@ -193,9 +206,10 @@ const CLAIM_RETRY: Duration = Duration::from_millis(100);
 const _: () = assert!(CLAIM_ATTEMPTS > 1 && !CLAIM_RETRY.is_zero());
 
 /// How long `--replace` waits for a terminated holder's flock to auto-release on
-/// death before it escalates (SIGTERM → SIGKILL) and, after the escalation,
-/// before it gives up. A dying process releases its advisory flock within a
-/// handful of scheduler ticks; 5 s is generous headroom over that.
+/// death before it escalates (SIGTERM → SIGKILL on unix, another `/F` on
+/// Windows) and, after the escalation, before it gives up. A dying process
+/// releases its advisory flock within a handful of scheduler ticks; 5 s is
+/// generous headroom over that.
 const REPLACE_WAIT: Duration = Duration::from_secs(5);
 /// Poll spacing while `--replace` waits for the freed flock. Two orders of
 /// magnitude below [`REPLACE_WAIT`], well under any human-visible delay.
@@ -235,6 +249,25 @@ pub(crate) fn claim_singleton_with(
     Ok(claim)
 }
 
+/// Test-only: claim attempts each directory has seen, keyed by directory because
+/// tests run in parallel over distinct sandboxes. Lets a test pin "the retry leg
+/// did not run" by counting attempts instead of by a wall-clock bound.
+#[cfg(test)]
+static CLAIM_ATTEMPTS_BY_DIR: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<std::path::PathBuf, u64>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// Claim attempts `dir` has seen so far (test builds only).
+#[cfg(test)]
+fn claim_attempts(dir: &Path) -> u64 {
+    CLAIM_ATTEMPTS_BY_DIR
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(dir)
+        .copied()
+        .unwrap_or(0)
+}
+
 /// One claim attempt. `standby` false (`--no-standby`) turns a lost race straight
 /// into [`Claim::Redundant`] without so much as creating the slot file.
 ///
@@ -243,6 +276,14 @@ pub(crate) fn claim_singleton_with(
 /// instance would otherwise announce a daemon that isn't there and exit 0. A
 /// hard failure exits non-zero, which a supervisor retries and an operator sees.
 fn claim_once(dir: &Path, standby: bool) -> Result<Claim> {
+    #[cfg(test)]
+    {
+        *CLAIM_ATTEMPTS_BY_DIR
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(dir.to_path_buf())
+            .or_insert(0) += 1;
+    }
     let active = crate::profile::open_state_file(&dir.join(super::LOCK_FILE))
         .context("failed to open the clauth daemon lock file")?;
     match active.try_lock() {
@@ -273,8 +314,10 @@ fn claim_once(dir: &Path, standby: bool) -> Result<Claim> {
 /// Nothing running (a free or missing lock) means nothing to replace: take the
 /// lock like a normal start. A running daemon whose pid can't be read (a torn or
 /// in-handover [`PID_FILE`] sidecar) bails rather than signal a pid it can't
-/// confirm. Otherwise it SIGTERMs the holder, waits for the flock to
-/// auto-release on death (bounded), escalates to SIGKILL once, then claims. The
+/// confirm. Otherwise it signals the holder (SIGTERM then SIGKILL on unix;
+/// `taskkill /F` on both passes on Windows, where no graceful kill exists for
+/// a console daemon), waits for the flock to auto-release on death (bounded),
+/// escalates once, then claims. The
 /// identity guard narrows the recycled-pid window [`holder_pid`] documents by
 /// requiring the pid to still be a running `clauth daemon` (not merely a clauth
 /// process — `clauth start`/`mcp`/`tui` share the binary name), so a stale pid
@@ -337,20 +380,21 @@ pub(crate) fn claim_by_replacing_retry_with(
     if let Some(lock) = wait_for_active(dir, wait, poll) {
         return Ok(Claim::Active(lock));
     }
-    // A graceful term didn't free the lock in time: force-kill, wait once more.
+    // The first pass didn't free the lock in time: escalate (SIGKILL on unix,
+    // another `taskkill /F` on Windows) and wait once more.
     let sent_kill = terminate_pid(pid, true);
     if let Some(lock) = wait_for_active(dir, wait, poll) {
         return Ok(Claim::Active(lock));
     }
     if !sent_term && !sent_kill {
         anyhow::bail!(
-            "could not signal the running clauth daemon (pid {pid}): the `kill` command is not on \
-             PATH; kill it manually, then start"
+            "could not signal the running clauth daemon (pid {pid}): no kill tool is on PATH \
+             (`kill` on unix, `taskkill` on Windows); kill it manually, then start"
         );
     }
     anyhow::bail!(
-        "the running clauth daemon (pid {pid}) did not release the lock within {}s of SIGKILL; \
-         it may be wedged uninterruptibly",
+        "the running clauth daemon (pid {pid}) did not release the lock within {}s of the force \
+         kill; it may be wedged uninterruptibly",
         wait.as_secs()
     )
 }
@@ -376,28 +420,38 @@ fn wait_for_active(dir: &Path, wait: Duration, poll: Duration) -> Option<DaemonL
 /// Send SIGTERM (`hard` false) or SIGKILL (`hard` true) to `pid`, returning
 /// whether the signal command actually ran (`false` = it could not even be
 /// spawned, e.g. `kill` off PATH — which the caller distinguishes from "signalled
-/// but the process survived"). Shelling out keeps `unsafe_code = "forbid"` intact
-/// (`libc::kill` would need `unsafe`, and `signal_hook` only *receives*), matching
+/// but the process survived"). Shelling out spends no `unsafe` here
+/// (`libc::kill` would need it, and `signal_hook` only *receives*), matching
 /// the `/usr/bin/security` shell-out pattern already in the crate. A non-zero exit
 /// (a dead pid's `ESRCH`) still counts as run: the caller polls the flock either
 /// way. Long-form flags so the call site documents itself.
 #[cfg(unix)]
 fn terminate_pid(pid: u32, hard: bool) -> bool {
     let signal = if hard { "KILL" } else { "TERM" };
-    std::process::Command::new("kill")
-        .args(["-s", signal, &pid.to_string()])
-        .status()
-        .is_ok()
+    let mut cmd = std::process::Command::new("kill");
+    cmd.args(["-s", signal, &pid.to_string()]);
+    // A soft-pass refusal (a dead pid's ESRCH) is expected noise: silence it.
+    // The hard pass stays loud — its failure is the diagnosis the generic
+    // wedged-process bail lacks.
+    if !hard {
+        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+    }
+    cmd.status().is_ok()
 }
 
 #[cfg(windows)]
 fn terminate_pid(pid: u32, hard: bool) -> bool {
+    // A console daemon has no window to accept the graceful WM_CLOSE, so a
+    // soft taskkill can never work here: every pass is a force kill. The
+    // first (soft) pass is the expected-success path and stays silenced; the
+    // hard pass only runs when that first kill failed, so it keeps stderr as
+    // the wedged-process diagnosis. stdout never carries anything the caller
+    // reads (taskkill prints its SUCCESS line there).
     let mut cmd = std::process::Command::new("taskkill");
-    cmd.args(["/PID", &pid.to_string()]);
-    // A console daemon has no window to accept the graceful WM_CLOSE, so the
-    // first (soft) pass usually no-ops and the caller escalates here with /F.
-    if hard {
-        cmd.arg("/F");
+    cmd.args(["/PID", &pid.to_string(), "/F"]);
+    cmd.stdout(Stdio::null());
+    if !hard {
+        cmd.stderr(Stdio::null());
     }
     cmd.status().is_ok()
 }
@@ -406,8 +460,8 @@ fn terminate_pid(pid: u32, hard: bool) -> bool {
 /// it, narrowing the recycled-pid window [`holder_pid`] documents. The check is
 /// on the daemon ROLE, not the binary name: `clauth start` (resident around a
 /// live Claude Code session), `clauth mcp`, and `clauth tui` all share
-/// `comm == "clauth"`, so a name-only guard would let `--replace` SIGKILL one of
-/// them if the stale pid recycled onto it. Requiring argv `clauth daemon …`
+/// `comm == "clauth"`, so a name-only guard would let `--replace` force-kill
+/// one of them if the stale pid recycled onto it. Requiring argv `clauth daemon …`
 /// excludes every other subcommand and every non-clauth process. A pid that has
 /// exited (the in-handover window: recorded pid gone, successor holds the lock)
 /// or that can't be verified reads as false, so `--replace` bails and the

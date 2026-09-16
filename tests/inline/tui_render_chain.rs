@@ -43,6 +43,7 @@ fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> Profile {
         fetch_status: None,
         provider: None,
         third_party_usage: None,
+        usage_stale: false,
     }
 }
 
@@ -66,6 +67,62 @@ fn line_text(line: &Line<'static>) -> String {
 fn resumes_line(lines: &[Line<'static>]) -> Option<String> {
     lines.iter().map(line_text).find(|t| t.contains("resumes:"))
 }
+
+/// `QueueView` is the one resolver every chip goes through: membership from
+/// the shared rule, the slot from the anchor. Pinned here because a view that
+/// answered `None` for everyone would silently remove every chip on every
+/// surface without failing a single render test.
+#[test]
+fn auto_start_queue_view_resolves_slots_from_config_and_anchor() {
+    use crate::profile::{ClaudeCredentials, OAuthToken};
+    let opted = |name: &str| {
+        let mut p = profile(name, 95.0, 10.0, 3600);
+        p.auto_start = true;
+        p.credentials = Some(ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: format!("{name}-access"),
+                refresh_token: None,
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
+            }),
+        });
+        p
+    };
+    let mut cfg = config_with(
+        vec![opted("a"), opted("b"), profile("c", 95.0, 0.0, 3600)],
+        Some("a"),
+        vec!["a", "b"],
+    );
+    cfg.state.auto_start_queue = true;
+
+    let none = std::collections::HashMap::new();
+    let view = super::super::panes::QueueView::new(&cfg, &none, None);
+    let slot = view.slot("a").expect("an opted-in member holds a slot");
+    assert_eq!((slot.position, slot.total), (1, 2));
+    assert_eq!(view.slot("b").map(|s| s.position), Some(2));
+    assert_eq!(view.slot("c"), None, "no opt-in, no slot");
+    assert_eq!(
+        slot.next_in, None,
+        "no anchor: the queue is due, nothing to count down"
+    );
+
+    // A switch-grade-blocked member holds no slot, and the queue re-sizes.
+    let lifts = std::collections::HashMap::from([("a".to_string(), 0i64)]);
+    let view = super::super::panes::QueueView::new(&cfg, &lifts, None);
+    assert_eq!(view.slot("a"), None, "blocked: no slot");
+    assert_eq!(view.slot("b").map(|s| (s.position, s.total)), Some((1, 1)));
+
+    // The toggle off is a real off switch on this surface too.
+    cfg.state.auto_start_queue = false;
+    let view = super::super::panes::QueueView::new(&cfg, &none, None);
+    assert_eq!(view.slot("a"), None);
+}
+
+// The auto-start queue line no longer renders on the Fallback card (owner
+// 2026-09-01): it moved to the Usage tab, under `plan`, and shows for any
+// account with `auto_start` on, queue toggle or no queue toggle.
 
 // Whole chain exhausted: the caption renders under whichever member is
 // selected, naming the soonest-resuming one (b resets sooner than a).
@@ -1512,14 +1569,16 @@ fn a_swap_this_very_second_reads_as_just_now() {
 }
 
 /// The age line follows the cloudy-tui Time-formatting contract: ONE unit, the
-/// largest that is at least 1, and an absolute ISO date at 30 days and beyond.
+/// largest that is at least 1, and the local prose stamp at 30 days and beyond.
 /// The two-unit `humanize_duration` the countdowns use would render `1d 4h ago`
 /// here and never reach a date at all — it stays on the countdowns, where a
 /// duration is what is being shown.
 ///
 /// Every relative fixture sits MID-unit so the wall clock cannot walk it across
-/// a boundary mid-test; the ISO case uses a fixed epoch, so its expectation is a
-/// literal rather than a date recomputed from the code under test.
+/// a boundary mid-test; the stamp case uses a fixed epoch, so its expectation
+/// derives through chrono's own `format` rather than a literal — a literal would
+/// tie the pin to the runner's zone, and the second derivation is what keeps it
+/// a claim about the code instead of a copy of the code's arithmetic.
 #[test]
 fn the_last_swap_age_renders_one_unit_and_a_date_past_thirty_days() {
     let age_line = |at: u64| -> String {
@@ -1541,8 +1600,15 @@ fn the_last_swap_age_renders_one_unit_and_a_date_past_thirty_days() {
     assert_eq!(age_line(ago(2 * 3_600_000 + 1_800_000)), "2h ago");
     assert_eq!(age_line(ago(3 * 86_400_000 + 43_200_000)), "3d ago");
     assert_eq!(age_line(ago(12 * 86_400_000)), "1w ago");
-    // 2023-11-14T22:13:20Z — permanently past 30 days, so the arm is the date.
-    assert_eq!(age_line(1_700_000_000_000), "2023-11-14");
+    // 2023-11-14T22:13:20Z — permanently past 30 days, so the arm is the local
+    // stamp, derived through chrono's own `format` (a second derivation of the
+    // same claim), so the pin holds in any zone, UTC included.
+    let expected = chrono::DateTime::from_timestamp(1_700_000_000, 0)
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    assert_eq!(age_line(1_700_000_000_000), expected);
 }
 
 /// An account hosting nothing says nothing — no row at all rather than

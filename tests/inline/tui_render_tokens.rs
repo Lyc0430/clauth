@@ -6,9 +6,7 @@ use super::{
     determinate_bar, hour_lines, indeterminate_bar, model_detail_cost, model_lines, today_cost,
     today_lines, total_lines, trend_lines, window_cost,
 };
-use crate::pricing::{
-    Constraint, HourTokens, MatchClause, PriceEntry, PriceTable, PricedModel, RateSnapshot,
-};
+use crate::pricing::{Constraint, HourTokens, PriceEntry, PriceTable, PricedModel, RateSnapshot};
 use crate::profile::{AppConfig, AppState};
 use crate::tokens::{
     DayActivity, DaySummary, DayTokens, HourlyModel, ModelTokens, PeriodDay, PeriodModel,
@@ -28,12 +26,12 @@ fn line_text(line: &Line<'_>) -> String {
 // ── price-table builders ─────────────────────────────────────────────────────
 
 /// One exact-match model from its price entries (ids resolve
-/// case-insensitively via `MatchClause::Equals` on the lowered id).
+/// case-insensitively).
 fn priced_model(id: &str, entries: Vec<PriceEntry>) -> PricedModel {
     PricedModel {
         id: id.to_owned(),
-        match_: MatchClause::Equals(id.to_lowercase()),
         prices: entries,
+        effective_at: None,
     }
 }
 
@@ -45,6 +43,7 @@ fn flat_entry(input: f64, output: f64, cache_read: f64, cache_write: f64) -> Pri
         cache_read,
         cache_write,
         constraint: None,
+        window_only: false,
     }
 }
 
@@ -71,6 +70,7 @@ fn windowed_model(id: &str, peak: (f64, f64), off_peak: (f64, f64)) -> PricedMod
                     start: "00:30:00Z".to_owned(),
                     end: "16:30:00Z".to_owned(),
                 }),
+                window_only: false,
             },
         ],
     )
@@ -78,14 +78,30 @@ fn windowed_model(id: &str, peak: (f64, f64), off_peak: (f64, f64)) -> PricedMod
 
 /// A table from `models`, captured today with no history.
 fn table_of(models: Vec<PricedModel>) -> PriceTable {
-    PriceTable::capture(models, crate::tokens::today_date(), 0, Vec::new())
+    PriceTable::capture(
+        models,
+        Vec::new(),
+        Vec::new(),
+        crate::pricing::CanonicalMap::default(),
+        crate::tokens::today_date(),
+        0,
+        Vec::new(),
+    )
 }
 
 /// A table whose newest snapshot is `models` and whose older snapshots are
 /// given explicitly (`capture` appends nothing — the last history entry must
 /// equal `models`).
 fn table_with_history(models: Vec<PricedModel>, history: Vec<RateSnapshot>) -> PriceTable {
-    PriceTable::capture(models, crate::tokens::today_date(), 0, history)
+    PriceTable::capture(
+        models,
+        Vec::new(),
+        Vec::new(),
+        crate::pricing::CanonicalMap::default(),
+        crate::tokens::today_date(),
+        0,
+        history,
+    )
 }
 
 // ── period-row builders ──────────────────────────────────────────────────────
@@ -102,6 +118,7 @@ fn period_row(model: &str, days: Vec<PeriodDay>) -> PeriodModel {
             acc.output += d.split.output;
             acc.cache_read += d.split.cache_read;
             acc.cache_create += d.split.cache_create;
+            acc.shape = acc.shape.merge(d.split.shape);
             acc
         },
     );
@@ -209,6 +226,7 @@ fn populated_stats() -> TokenStats {
             output: 70_000_000,
             cache_read: 4_000_000_000,
             cache_create: 500_000_000,
+            shape: Default::default(),
         }],
         daily,
         activity,
@@ -415,6 +433,7 @@ fn model_lines_dash_unpriced_models_when_a_table_is_loaded() {
                 output: 0,
                 cache_read: 0,
                 cache_create: 0,
+                shape: Default::default(),
             })
         })
         .collect();
@@ -712,6 +731,7 @@ fn today_card_hourly_sum_matches_the_flat_model_totals() {
             output: 1_000_000,
             cache_read: 1_000,
             cache_create: 1_000,
+            shape: Default::default(),
         }],
         ..Default::default()
     };
@@ -1262,4 +1282,142 @@ fn placeholder_shows_the_full_width_bouncing_bar() {
     );
     assert!(out.contains('['), "the bracketed spinner frame renders");
     assert!(out.contains('█'), "the bouncing block renders");
+}
+
+// ── shape marker render ───────────────────────────────────────────────────────
+
+/// A model-detail row whose aggregate split is A1/A2-shaped renders the
+/// `cache write not reported` marker; a healthy row renders nothing.
+#[test]
+fn model_detail_marks_cache_write_not_reported() {
+    let a1_row = PeriodModel {
+        model: "glm-5.3".to_owned(),
+        in_out: 500,
+        split: ModelTokens {
+            model: "glm-5.3".to_owned(),
+            input: 500,
+            output: 100,
+            cache_read: 1_000,
+            cache_create: 0,
+            shape: crate::tokens::UsageShape::WholePromptInput,
+        },
+        split_complete: true,
+        days: vec![],
+    };
+    let mut term = Terminal::new(TestBackend::new(60, 24)).unwrap();
+    term.draw(|f| {
+        super::draw_model_detail(
+            f,
+            f.area(),
+            Some(&a1_row),
+            2_000,
+            None,
+            false,
+            TokenPeriod::Daily,
+        );
+    })
+    .unwrap();
+    let out = crate::testutil::buffer_rows(term.backend().buffer()).concat();
+    assert!(
+        out.contains("cache write not reported"),
+        "A1 row carries the marker, got: {out}"
+    );
+
+    let a2_row = PeriodModel {
+        model: "deepseek-v4-pro".to_owned(),
+        in_out: 500,
+        split: ModelTokens {
+            model: "deepseek-v4-pro".to_owned(),
+            input: 500,
+            output: 100,
+            cache_read: 40_000,
+            cache_create: 0,
+            shape: crate::tokens::UsageShape::NoCacheWrites,
+        },
+        split_complete: true,
+        days: vec![],
+    };
+    let mut term = Terminal::new(TestBackend::new(60, 24)).unwrap();
+    term.draw(|f| {
+        super::draw_model_detail(
+            f,
+            f.area(),
+            Some(&a2_row),
+            40_600,
+            None,
+            false,
+            TokenPeriod::Daily,
+        );
+    })
+    .unwrap();
+    let out = crate::testutil::buffer_rows(term.backend().buffer()).concat();
+    assert!(
+        out.contains("cache write not reported"),
+        "A2 row carries the marker, got: {out}"
+    );
+
+    let healthy_row = PeriodModel {
+        model: "claude-opus-4".to_owned(),
+        in_out: 500,
+        split: ModelTokens {
+            model: "claude-opus-4".to_owned(),
+            input: 500,
+            output: 100,
+            cache_read: 40_000,
+            cache_create: 5_000,
+            shape: crate::tokens::UsageShape::Healthy,
+        },
+        split_complete: true,
+        days: vec![],
+    };
+    let mut term = Terminal::new(TestBackend::new(60, 24)).unwrap();
+    term.draw(|f| {
+        super::draw_model_detail(
+            f,
+            f.area(),
+            Some(&healthy_row),
+            45_600,
+            None,
+            false,
+            TokenPeriod::Daily,
+        );
+    })
+    .unwrap();
+    let out = crate::testutil::buffer_rows(term.backend().buffer()).concat();
+    assert!(
+        !out.contains("cache write not reported"),
+        "healthy row renders no marker, got: {out}"
+    );
+}
+
+/// An incomplete split (stats-cache day) renders no marker: the shape is
+/// unknown there, and an unlabelled guess is the silent-correction failure
+/// the marker exists to prevent.
+#[test]
+fn model_detail_marks_nothing_on_incomplete_split() {
+    let row = PeriodModel {
+        model: "glm-5.3".to_owned(),
+        in_out: 500,
+        split: ModelTokens::default(),
+        split_complete: false,
+        days: vec![],
+    };
+    let mut term = Terminal::new(TestBackend::new(60, 24)).unwrap();
+    term.draw(|f| {
+        super::draw_model_detail(
+            f,
+            f.area(),
+            Some(&row),
+            2_000,
+            None,
+            false,
+            TokenPeriod::Daily,
+        );
+    })
+    .unwrap();
+    let out = crate::testutil::buffer_rows(term.backend().buffer()).concat();
+    assert!(
+        !out.contains("cache write not reported"),
+        "incomplete split renders no marker, got: {out}"
+    );
 }

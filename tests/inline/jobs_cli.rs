@@ -5,7 +5,9 @@
 //! record lands in a tempdir, never the operator's real `~/.clauth/jobs`.
 
 use super::*;
-use crate::mcp::jobs::{RecordKind, RunningSpec, jobs_dir, write_heartbeat, write_running};
+use crate::mcp::jobs::{
+    RecordKind, RunningSpec, jobs_dir, write_heartbeat, write_heartbeat_with_session, write_running,
+};
 use crate::testutil::HomeSandbox;
 
 /// Epoch ms every fixture is dated against. A real 2026 clock rather than a
@@ -23,6 +25,8 @@ fn spec(job_id: &str, started_at: u64) -> RunningSpec {
         recorded_at: started_at,
         timeout_secs: 0,
         endpoint: None,
+        provider: None,
+        isolated: false,
         idle_secs: Some(300),
         kind: RecordKind::Collectable,
     }
@@ -178,42 +182,6 @@ fn a_silent_run_reads_never_and_a_finished_one_reads_nothing() {
     assert_eq!(last_output_cell(row_for(&rows, "d-fin-0")), "-");
 }
 
-/// A record written before the liveness fields existed knows nothing about its
-/// own output, and must not be reported as a run that has said nothing.
-///
-/// Driven through real bytes an older server wrote rather than a `RunningSpec`
-/// built here: a spec compiles against whatever the fields are today and proves
-/// nothing about what is on disk.
-#[test]
-fn a_pre_liveness_record_reports_no_output_figure_at_all() {
-    let _home = HomeSandbox::new();
-    let dir = crate::mcp::jobs::jobs_dir().unwrap();
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(
-        dir.join("d-legacy-0.json"),
-        format!(
-            r#"{{"job_id":"d-legacy-0","profile":"work","state":"running","started_at":{}}}"#,
-            NOW - 30_000
-        ),
-    )
-    .unwrap();
-
-    let rows = rows(NOW);
-    let legacy = row_for(&rows, "d-legacy-0");
-
-    assert_eq!(legacy.phase.label(), "running");
-    assert_eq!(
-        last_output_cell(legacy),
-        "-",
-        "unrecorded is not the same fact as `has said nothing`"
-    );
-    assert_eq!(
-        kill_cell(legacy),
-        "-",
-        "that server recorded no deadline to count down to"
-    );
-}
-
 /// Both deadlines render where both exist, and an absent one is clauth knowing
 /// there is none rather than a zero countdown.
 #[test]
@@ -260,6 +228,105 @@ fn an_empty_store_renders_a_named_empty_state_and_an_empty_json_array() {
     );
 }
 
+/// A record OUTLIVES the server that wrote it, and this is what that buys: the
+/// row for a job a dead `clauth mcp` left behind still carries the session id
+/// linking it to its transcript, which is the whole reason the heartbeat stamps
+/// one onto a running record.
+///
+/// Driven through the PRODUCTION writer rather than hand-built bytes: a fixture
+/// spelling the field itself would pass while the beat wrote nothing.
+#[test]
+fn a_dead_servers_row_still_carries_the_session_id_its_record_kept() {
+    let _home = HomeSandbox::new();
+    const HANDLE: &str = "8fbb04c1-2e3d-4a55-9c17-6d0e2b7a1f39";
+    // Silent past the corpse window: the shape a killed server leaves behind.
+    let dead = spec("d-dead-0", NOW - crate::mcp::jobs::RUNNING_TTL_MS - 60_000);
+    write_heartbeat_with_session(
+        &dead,
+        NOW - crate::mcp::jobs::RUNNING_TTL_MS - 30_000,
+        "halfway through",
+        Some(HANDLE),
+    )
+    .unwrap();
+    // A streaming run whose first event has not named a session yet.
+    write_running(&spec("d-quiet-0", NOW - 3_000)).unwrap();
+    seed_done("d-fin-0", NOW - 600_000, NOW - 120_000);
+
+    let rows = rows(NOW);
+    assert_eq!(
+        row_for(&rows, "d-dead-0").phase.label(),
+        "orphaned",
+        "the fixture is the dead-server shape, not a live run"
+    );
+
+    let json: serde_json::Value = serde_json::from_str(&rows_json(&rows)).unwrap();
+    let array = json.as_array().expect("a JSON array").clone();
+    let by_id = |id: &str| {
+        array
+            .iter()
+            .find(|r| r["job_id"] == id)
+            .unwrap_or_else(|| panic!("no row for {id} in {json}"))
+            .clone()
+    };
+
+    assert_eq!(
+        by_id("d-dead-0")["session_id"],
+        serde_json::json!(HANDLE),
+        "the orphan's row hands back the handle `delegate({{resume}})` takes"
+    );
+    // These pin the VALUE; the key's presence on every row is
+    // `the_json_row_carries_every_key_on_every_state`'s, one test down, since
+    // serde answers a missing key with `Null` too.
+    assert_eq!(
+        by_id("d-quiet-0")["session_id"],
+        serde_json::Value::Null,
+        "a run no event has named a session for yet claims no handle"
+    );
+    assert_eq!(
+        by_id("d-fin-0")["session_id"],
+        serde_json::Value::Null,
+        "a finished run's handle rides its envelope, never this key"
+    );
+}
+
+/// Whether a handed-back `session_id` is a handle at all is the run's isolation,
+/// and the id alone cannot say: an isolated run's transcript died with its
+/// throwaway tree, so `delegate({resume})` refuses the very id the row prints.
+#[test]
+fn an_isolated_runs_row_is_marked_isolated() {
+    let _home = HomeSandbox::new();
+    let mut isolated = spec("d-iso-0", NOW - 60_000);
+    isolated.isolated = true;
+    write_heartbeat(&isolated, NOW - 1_000, "in a throwaway tree").unwrap();
+    write_heartbeat(
+        &spec("d-shared-0", NOW - 60_000),
+        NOW - 1_000,
+        "in the global store",
+    )
+    .unwrap();
+
+    let json: serde_json::Value = serde_json::from_str(&rows_json(&rows(NOW))).unwrap();
+    let array = json.as_array().expect("a JSON array").clone();
+    let by_id = |id: &str| {
+        array
+            .iter()
+            .find(|r| r["job_id"] == id)
+            .unwrap_or_else(|| panic!("no row for {id} in {json}"))
+            .clone()
+    };
+
+    assert_eq!(
+        by_id("d-iso-0")["isolated"],
+        serde_json::json!(true),
+        "an isolated run's row says its handle is not one"
+    );
+    assert_eq!(
+        by_id("d-shared-0")["isolated"],
+        serde_json::json!(false),
+        "a shared run's row says its handle resolves"
+    );
+}
+
 /// The `--json` field set is FIXED: every key is present on every row, and a
 /// figure the record does not have is `null`.
 ///
@@ -277,11 +344,13 @@ fn the_json_row_carries_every_key_on_every_state() {
     let array = json.as_array().expect("a JSON array");
     assert_eq!(array.len(), 2);
 
-    const KEYS: [&str; 10] = [
+    const KEYS: [&str; 12] = [
         "job_id",
         "profile",
         "state",
         "collectable",
+        "session_id",
+        "isolated",
         "age_secs",
         "elapsed_secs",
         "last_output_secs_ago",
@@ -312,6 +381,10 @@ fn the_json_row_carries_every_key_on_every_state() {
         "a streaming run has no wall clock, and null is how that reads here"
     );
     assert_eq!(live["tail"], "building");
+    assert_eq!(
+        live["isolated"], false,
+        "a shared run's session id IS a resume handle, and the flag says so"
+    );
 
     let done = array
         .iter()

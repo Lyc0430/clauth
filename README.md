@@ -35,11 +35,11 @@ Most account tools do one half. clauth pairs instant **switching between multipl
 
 - 🔄 **Switch** accounts in one keypress or `clauth <name>`: OAuth (Pro / Max / Team / Enterprise) or a custom API endpoint, plan tier detected for you
 - 📊 **Monitor** live 5h / 7d rate-limit bars, a global token dashboard with API-equivalent cost, plus a live Claude status-incident feed
-- 🤖 **Auto-switch** down a fallback chain the moment an account hits its limit, with weekly-window and spend-ceiling gates so a long run never stalls and never surprises you with a bill
+- 🤖 **Auto-switch** down a fallback chain the moment an account hits its limit, with weekly-window and spend-ceiling gates so a long run never stalls and never surprises you with a bill. Opted-in accounts queue their auto-start, opening 5h windows `5h / accounts` apart instead of all at once
 - 🧩 **Run in parallel**: several accounts at once in isolated config dirs, or a clean headless session with none of your global memory, plugins, or hooks
 - 🔌 **From inside Claude**: an MCP plugin lets a live session list, switch, or delegate a whole prompt (even headless) to another account, and tells a session when the account behind it changed
-- 🖥️ **Headless**: `clauth daemon` runs the refresh and auto-switch loop with no TUI and publishes `status.json` for a menu-bar app to read
-- 🛠️ **Quality-of-life**: browse and resume past sessions under any account, per-profile model routing, shell completions, signed self-updates, multi-instance safe
+- 🖥️ **Headless**: `clauth daemon` runs the refresh and auto-switch loop with no TUI and publishes `status.json` for a menu-bar app to read, or serves that feed and the account switch to another machine over HTTPS with `--listen`
+- 🛠️ **Quality-of-life**: browse and resume past sessions under any account, per-profile model routing, `start --auto` to pick the account by the models a session will run, shell completions, signed self-updates, multi-instance safe
 
 Full reference: **[the wiki](https://github.com/uwuclxdy/clauth/wiki)**.
 
@@ -64,12 +64,13 @@ Binary installs update themselves in the background, checksum and signature veri
 
 ## Quickstart
 
-Capture your current Claude Code session as a profile:
+Capture your current Claude Code login as a profile:
 
 ```bash
-clauth
-# Select "+ new from current profile", enter a name, e.g. "work"
+clauth capture work
 ```
+
+or in the TUI: `clauth`, Setup tab, `+ new`, then the `+ capture current login` row.
 
 Repeat while logged in to a different account, then switch in the TUI (<kbd>⏎</kbd> + confirm) or directly by name:
 
@@ -98,10 +99,10 @@ clauth start --isolated personal -p < prompt.txt
 | `clauth` | open the TUI |
 | `clauth <profile>` | switch and exit |
 | `clauth start <profile>` | run `claude` under that account, in its own config dir |
-| `clauth login <profile>` | add or re-authenticate an account, browser or API key |
+| `clauth login <profile>` | add or re-authenticate an account, browser or API key; the browser login also takes a code from a link opened on any device (ssh, no browser) |
 | `clauth list` / `clauth which` | account table with cached usage / who owns this session |
 | `clauth sessions`, `resume`, `info` | browse past Claude Code sessions and resume one anywhere |
-| `clauth daemon` | headless refresh + auto-switch loop |
+| `clauth daemon` | headless refresh + auto-switch loop, optionally serving the REST API (`--listen`) |
 
 Every command and flag: [Quickstart](https://github.com/uwuclxdy/clauth/wiki/Quickstart#commands).
 
@@ -120,11 +121,13 @@ The active profile shows in orange. Usage bars are cached locally, so they stay 
 
 ## Claude Code plugin
 
-clauth ships a plugin that exposes your profiles to a live Claude Code session via MCP. Install it from the TUI: Plugin tab, `plugin` row, <kbd>f</kbd>, confirm. The plugin's `SessionStart` hook self-heals a broken registration on every session start.
+clauth ships a plugin that exposes your profiles to a live Claude Code session via MCP. Install it from the TUI: Plugin tab, `plugin` row, <kbd>f</kbd>, confirm. That drives Claude Code's own installer against a plugin tree clauth materializes locally, so there is nothing to add by hand. `/plugin marketplace add uwuclxdy/clauth` then `/plugin install clauth@clauth` works too; it registers the same plugin against this repo instead, and clauth re-points it at the local tree the next time it runs. Either way the plugin's tools are `clauth mcp`, so the binary has to be on your `PATH`.
+
+A registration that breaks repairs itself: `clauth mcp` heals one at startup, so does the daemon's tick, and `clauth start` heals one before `claude` launches. That last one covers what a hook cannot, since a marketplace too broken to load means the plugin never loads and its hooks never fire.
 
 | Tool | What it does | Quota |
 |------|--------------|-------|
-| `profiles` | every account with cached 5h/7d usage, provider, tier, live-session flag, observed throughput, and the states a delegate there is refused for (disabled, login expired, no api key) plus a canceled subscription; `scope: "session"` names the account this session runs on | zero (disk cache) |
+| `profiles` | every account with cached 5h/7d usage, provider, tier, live-session flag, observed throughput, and the account states worth a look before spending (disabled and no api key, both of which refuse a delegate; login expired, which refuses one except on an account that runs its own endpoint with its own key; a canceled subscription, which never refuses); `scope: "session"` names the account this session runs on | zero (disk cache) |
 | `switch_profile` | relink the global active profile; the reply says what it does to this session | zero |
 | `delegate` | hand a headless prompt to another account and return the answer (or a `job_id`) | **real usage window on the target account** |
 | `monitor` | check, collect or wait on backgrounded delegates' results, or wait on clauth's state (active profile, its usage cache, the credentials file) | zero (filesystem) |
@@ -173,7 +176,7 @@ More, including what to check when something misbehaves: [FAQ](https://github.co
 | [Interface and keys](https://github.com/uwuclxdy/clauth/wiki/Interface-And-Keys) | the eight tabs, every keybinding, the action menus |
 | [Configuration](https://github.com/uwuclxdy/clauth/wiki/Configuration) | both TOML files key by key, model routing, storage layout |
 | [Auto-switch](https://github.com/uwuclxdy/clauth/wiki/Auto-Switch) | thresholds, exclusion rules, burn-aware mode, spend ceilings |
-| [Daemon](https://github.com/uwuclxdy/clauth/wiki/Daemon) | `clauth daemon` and the `status.json` read contract |
+| [Daemon](https://github.com/uwuclxdy/clauth/wiki/Daemon) | `clauth daemon`, the REST API, and the `status.json` read contract |
 | [Claude Code plugin](https://github.com/uwuclxdy/clauth/wiki/Claude-Code-Plugin) | the MCP server and `delegate` in full |
 | [herdr plugin](https://github.com/uwuclxdy/clauth/wiki/Herdr-Plugin) | the clauth popup in herdr, the key, the per-pane account tag |
 | [Tokens and cost](https://github.com/uwuclxdy/clauth/wiki/Tokens-And-Cost) | where the dashboard reads from, what the cost figure means |
@@ -183,9 +186,11 @@ More, including what to check when something misbehaves: [FAQ](https://github.co
 
 ```bash
 cargo build --release
-cargo clippy --all-targets   # CI gates clippy -D warnings + fmt --check + test on every push
+cargo clippy --all-targets
 cargo test
 ```
+
+CI gates `fmt --check`, `clippy -D warnings`, the test suite, `cargo-deny` and `cargo audit` on every push to `mommy` and every pull request; a doc-only change is skipped.
 
 > [!TIP] `cargo test showcase -- --ignored --nocapture` drives the real interactive TUI on fake data against a throwaway home dir (no network, never compiled into the binary). Handy for screenshots.
 

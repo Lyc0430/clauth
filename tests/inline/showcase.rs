@@ -24,8 +24,8 @@ use tempfile::TempDir;
 use super::{TICK, app, render};
 use crate::profile::{AppConfig, AppState, Profile, ProfileName};
 use crate::usage::{
-    ExtraUsage, FetchStatus, PlanInfo, PlanTier, ProfileActivity, ScopedWindow, SpendInfo,
-    UsageInfo, UsageWindow, now_ms,
+    ExtraUsage, FetchLeg, FetchStatus, PlanInfo, PlanTier, ProfileActivity, ScopedWindow,
+    SpendInfo, UsageInfo, UsageWindow, mark_activity, now_ms, selected_activity,
 };
 
 // ── Launch ──────────────────────────────────────────────────────────────────
@@ -318,10 +318,13 @@ fn oauth_profile(
             spend,
             codex_limit_reached: None,
             codex_reset_credits: None,
+            open_at: None,
+            fetched_at: None,
         }),
         fetch_status,
         provider: None,
         third_party_usage: None,
+        usage_stale: false,
     }
 }
 
@@ -351,6 +354,7 @@ fn api_profile(name: &str) -> Profile {
         fetch_status: None,
         provider: None,
         third_party_usage: None,
+        usage_stale: false,
     }
 }
 
@@ -378,6 +382,7 @@ fn failed_profile(name: &str) -> Profile {
         fetch_status: Some(FetchStatus::Failed),
         provider: None,
         third_party_usage: None,
+        usage_stale: false,
     }
 }
 
@@ -510,12 +515,17 @@ fn seed_usage(application: &app::App) {
 fn seed_timers(application: &app::App) {
     let now = now_ms();
     if let Ok(mut next) = application.next_refresh_per_profile.lock() {
-        next.insert("work".to_string(), now + 43_000); // ~43s
-        next.insert("side-project".to_string(), now + 78_000); // ~78s
+        next.insert(FetchLeg::OAuth.key(ProfileName::from("work")), now + 43_000); // ~43s
+        next.insert(
+            FetchLeg::OAuth.key(ProfileName::from("side-project")),
+            now + 78_000,
+        ); // ~78s
     }
-    if let Ok(mut activity) = application.activity.lock() {
-        activity.insert("personal".to_string(), ProfileActivity::Fetching);
-    }
+    mark_activity(
+        &application.activity,
+        &ProfileName::from("personal"),
+        ProfileActivity::Fetching,
+    );
 }
 
 /// Seed `history_cache` with mock usage data so `compute_burn_rates_from_history`
@@ -767,16 +777,27 @@ fn demo_data_drives_all_actions() {
     assert!(!app.reconcile_done && !app.bootstrap_started);
 
     // Pre-drive: timer slot has a spinner for the active profile and a countdown for an idle one.
+    // Config (rank 400) ranks OUTER of Activity (600), so the profile is read
+    // and the guard dropped before the activity lock is taken. By name, not by
+    // index: a `demo_config` reorder must not retarget the assertion silently.
+    let active_profile = {
+        let cfg = app.config();
+        cfg.profiles
+            .iter()
+            .find(|p| p.name.as_str() == "personal")
+            .expect("demo config has 'personal'")
+            .clone()
+    };
     assert_eq!(
-        app.activity.lock().unwrap().get("personal").copied(),
-        Some(ProfileActivity::Fetching),
+        selected_activity(&app.activity.lock().unwrap(), &active_profile),
+        ProfileActivity::Fetching,
         "active profile must show a spinner in the timer slot"
     );
     assert!(
         app.next_refresh_per_profile
             .lock()
             .unwrap()
-            .contains_key("work"),
+            .contains_key(&FetchLeg::OAuth.key(ProfileName::from("work"))),
         "idle profiles must show a refresh countdown in the timer slot"
     );
 

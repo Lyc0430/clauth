@@ -10,6 +10,7 @@ use ratatui::widgets::{Block, List, ListItem, ListState, Padding, Paragraph, Wra
 
 use super::super::app::{App, InputState};
 use super::super::theme;
+use crate::profile::AppConfig;
 
 /// Account-picker column width for a master-detail tab: ~30% of the body,
 /// clamped 20-40 cells (cloudy-tui master-detail contract).
@@ -149,6 +150,59 @@ pub(super) fn name_color(active: bool) -> Style {
     }
 }
 
+/// The interleaved auto-start queue (`usage::auto_start_queue`) as one render pass sees it:
+/// who is in the queue and how long until it may open its next 5h window.
+///
+/// Built ONCE per pass rather than per row, because membership is a sort over
+/// every account and the Fallback card's detail asks it for the selected member
+/// on every frame.
+pub(super) struct QueueView {
+    members: Vec<crate::profile::ProfileName>,
+    anchor: Option<i64>,
+    interval_ms: u64,
+    now_secs: i64,
+}
+
+impl QueueView {
+    /// `anchor` is passed IN rather than read here: it lives behind
+    /// AutoStartQueue(240) and every caller already holds Config(400), so reading it
+    /// inside would invert the global lock order (`lockorder`, which
+    /// debug-asserts). Callers take it with [`crate::usage::queue_anchor_cached`]
+    /// before locking the config, next to the `switch_grade_kick_lifts` read
+    /// they already make there.
+    ///
+    /// `kick_lifts` doubles as the blocked set: its keys are exactly the
+    /// switch-grade kick blocks (`switch_grade_kick_lifts` and the scheduler's
+    /// own `kick_rejected_names` share one predicate), which is what the
+    /// election excludes from the queue.
+    pub(super) fn new(
+        cfg: &AppConfig,
+        kick_lifts: &std::collections::HashMap<String, i64>,
+        anchor: Option<i64>,
+    ) -> Self {
+        let blocked: Vec<crate::profile::ProfileName> =
+            kick_lifts.keys().map(|k| k.as_str().into()).collect();
+        Self {
+            members: crate::usage::auto_start_queue_members(cfg, &blocked),
+            anchor,
+            interval_ms: cfg.state.refresh_interval_ms,
+            now_secs: crate::usage::now_epoch_secs(),
+        }
+    }
+
+    /// `name`'s queue slot, or `None` when it holds none (not opted in, cannot
+    /// open a window, or the queue toggle is off).
+    pub(super) fn slot(&self, name: &str) -> Option<crate::usage::QueueSlot> {
+        crate::usage::queue_slot(
+            &self.members,
+            name,
+            self.anchor,
+            self.interval_ms,
+            self.now_secs,
+        )
+    }
+}
+
 /// Canonical `[ label ]` wording for the diagnostic states whose text pill
 /// surfaces on more than one tab (Usage / Fallback / Config; the Overview marker
 /// shares only the `reason_marker` glyph, no text). One source so the same
@@ -157,14 +211,14 @@ pub(super) fn name_color(active: bool) -> Style {
 /// the explanation, so the label itself stays short. The hint layer stays
 /// per-surface on purpose: `chain::reason_fix` and `usage::diag_fix` map
 /// different enums with different config context.
-pub(super) const DIAG_DISABLED: &str = "disabled";
-pub(super) const DIAG_CANCELED: &str = "canceled";
-pub(super) const DIAG_AUTH_BROKEN: &str = "auth broken";
-pub(super) const DIAG_BUDGET_SPENT: &str = "extra usage spent";
-pub(super) const DIAG_KICK: &str = "claude code blocked";
-pub(super) const DIAG_WEEKLY_SPENT: &str = "weekly spent";
-pub(super) const DIAG_WEEKLY_SOFT: &str = "past the weekly switch line, still serving";
-pub(super) const DIAG_STALE: &str = "stale data";
+///
+/// The words themselves live in [`crate::format`] beside every other
+/// cross-surface spelling; re-exported here so the tab-local `use super::panes::`
+/// imports stay put.
+pub(super) use crate::format::{
+    DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK, DIAG_STALE,
+    DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT,
+};
 
 /// cloudy-tui status pill `[ label ]`: brackets in `TEXT_DIM`, the label in the
 /// caller's semantic style (bold for a charged state). Returns the three spans

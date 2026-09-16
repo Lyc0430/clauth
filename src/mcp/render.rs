@@ -326,32 +326,70 @@ fn roster_lines(profiles: &[ProfileSnapshot], auth: &SessionAuth) -> String {
 }
 
 /// One-line cached headline for a third-party profile from
-/// `third_party_cache.json`: non-empty bars join as `label pct%`, else the first
-/// funded wallet row (an empty wallet a two-wallet provider lists first must not
-/// win the headline over the funded one), else the first stat row that carries a
-/// value; the plan label prefixes the line when present. Value-less rows (e.g.
-/// DeepSeek's `USD balance` heading) are skipped so the headline never renders a
-/// dangling `label:` with nothing after it.
+/// `third_party_cache.json`: LIVE bars join as `label pct%` (a lapsed bar is
+/// the previous window's last reading and drops), and when no live bar remains
+/// the chain falls through to the first funded wallet row (an empty wallet a
+/// two-wallet provider lists first must not win the headline over the funded
+/// one), then the first stat row that carries a value; the plan label prefixes
+/// the line when present. Value-less rows (e.g. DeepSeek's `USD balance`
+/// heading) are skipped so the headline never renders a dangling `label:` with
+/// nothing after it.
 pub(crate) fn third_party_headline(s: &ThirdPartyStats) -> String {
-    let body = if !s.bars.is_empty() {
-        s.bars
-            .iter()
-            .map(|b| format!("{} {}", b.label, format_pct(b.pct)))
-            .collect::<Vec<_>>()
-            .join(", ")
+    // The verdict row `ThirdPartyStats::unfunded` appends, identified by its
+    // value rather than its `Danger` kind: OpenRouter marks its own overdrawn
+    // `api balance` row `Danger` too, so keying on the kind would skip the
+    // figure and headline a period total instead.
+    let refusal = s
+        .rows
+        .iter()
+        .find(|r| r.value == crate::providers::LOW_BALANCE)
+        .map(|r| r.value.as_str());
+
+    // A bar whose reset has passed is the previous window's last reading
+    // (#74): it drops the same way the OAuth row drops, so the headline
+    // renders the account's live headroom rather than a stale figure. All
+    // bars lapsed leaves the wallet/row arms, which is the honest answer
+    // for an account no live bar speaks for.
+    let live_bars = s
+        .bars
+        .iter()
+        .filter(|b| crate::profile_json::usage_bar_is_live(b))
+        .map(|b| format!("{} {}", b.label, format_pct(b.pct)))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut body = if !live_bars.is_empty() {
+        live_bars
     } else if let Some(wallet) = crate::providers::funded_wallets(&s.rows).into_iter().next() {
         format!("{}: {}", wallet.label, wallet.value)
-    } else if let Some(row) = s.rows.iter().find(|r| !r.value.is_empty()) {
+    } else if let Some(row) = s
+        .rows
+        .iter()
+        .find(|r| !r.value.is_empty() && Some(r.value.as_str()) != refusal)
+    {
         if row.label.is_empty() {
             row.value.clone()
         } else {
             format!("{}: {}", row.label, row.value)
         }
-    } else if !s.is_available {
-        "unavailable".to_string()
     } else {
         String::new()
     };
+
+    // The refusal rides BESIDE the figure, never in place of it: the reader
+    // here is picking a delegate target and needs both how short the account is
+    // and that the call will be refused. The figure arm above skips the verdict
+    // row for the same reason, since letting it fill that slot rendered the
+    // refusal twice. A provider that sets the flag without saying why falls
+    // back to the bare word.
+    if !s.is_available {
+        let verdict = refusal.unwrap_or("unavailable");
+        body = if body.is_empty() {
+            verdict.to_string()
+        } else {
+            format!("{body} ({verdict})")
+        };
+    }
 
     match (&s.plan, body.is_empty()) {
         (Some(plan), false) => format!("{plan}: {body}"),
@@ -601,11 +639,18 @@ pub(crate) fn live_usage_prose(lu: &Value, lead: &str) -> String {
             pct_clause(five),
             pct_clause(seven)
         ));
-        // An age dates a FIGURE. With neither window cached there is no figure
-        // to date, and stamping the cache's age onto two `unknown`s would read
-        // as a measurement clauth does not have.
+        // An age rides this clause whichever shape the pair takes. With a
+        // figure it dates the figure; with both shares reading `unknown` —
+        // never cached, or cached and lapsed past their own resets — it dates
+        // the unknown itself (owner ruling 2026-09-08: the cache's age is the
+        // one signal separating an all-lapsed pair from a never-fetched
+        // account). The `stale` word rides the figure-bearing clause only: a
+        // verdict qualifies a figure, and beside two unknowns it would claim
+        // one the prose does not show.
         if five.is_some() || seven.is_some() {
             out.push_str(&freshness_clause(lu));
+        } else {
+            out.push_str(&age_clause(lu));
         }
     }
     if let Some(w) = lu.get("throughput_warning").and_then(Value::as_str) {
@@ -660,22 +705,11 @@ pub(crate) fn digest_prose(d: &Value) -> String {
 /// and a label naming a tool the handshake does not list sends the model
 /// searching for one.
 pub(crate) fn monitor_state_prose(p: &Value) -> String {
-    let state = match p.get("status").and_then(Value::as_str) {
-        Some("changed") => format!("monitor: {}", digest_prose(&p["since_your_last_call"])),
-        Some("armed") => {
-            "monitor armed: baseline set on this first digest call, nothing to compare against yet"
-                .to_string()
-        }
-        _ => {
-            let waited = p.get("waited_secs").and_then(Value::as_u64).unwrap_or(0);
-            format!("monitor: no change after {waited}s")
-        }
-    };
     let listing = jobs_listing_prose(p);
     if listing.is_empty() {
-        return state;
+        return "no delegate jobs".to_string();
     }
-    format!("{state}\n{listing}")
+    listing
 }
 
 /// The delegate jobs clauth is holding, one line each, or nothing at all when
@@ -683,7 +717,7 @@ pub(crate) fn monitor_state_prose(p: &Value) -> String {
 ///
 /// Empty rather than a "no jobs" line: a session that never delegated should
 /// pay nothing for a listing it has no use for, which is the only-when-true rule
-/// the roster flags already render by. Each line opens with ``job `<id>` `` —
+/// `profile_line`'s own flags render by. Each line opens with ``job `<id>` `` —
 /// the same opener `monitor_batch_prose` uses — so the id a caller has
 /// to copy out is always in the same place.
 ///
@@ -717,6 +751,15 @@ fn jobs_listing_prose(p: &Value) -> String {
         // five words.
         if state == "blocking" {
             out.push_str(" (its own caller takes the result)");
+        }
+        // The orphaned row is the one where the session id is the only handle
+        // left: the server that wrote the record is gone. On a running row it
+        // would invite resuming a session the live run still holds, so it stays
+        // unsaid there — the JSON row still carries the key either way.
+        if state == "orphaned"
+            && let Some(sid) = row.get("session_id").and_then(Value::as_str)
+        {
+            out.push_str(&format!("; resume with session id `{sid}`"));
         }
         out.push_str(&age_phrase(row));
     }
@@ -767,15 +810,22 @@ fn freshness_clause(v: &Value) -> String {
             String::new()
         };
     };
-    let when = if secs == 0 {
-        "just now".to_string()
-    } else {
-        format!("{} ago", humanize_duration(secs as i64))
-    };
+    let when = cached_when(secs);
     if stale {
         format!(" (cached {when}, stale)")
     } else {
         format!(" (cached {when})")
+    }
+}
+
+/// The `when` half of every `cached` clause: zero reads as just-written,
+/// anything older is a duration. One spelling, so the headroom prose, a dated
+/// unknown and a routing refusal all date a figure the same way.
+pub(crate) fn cached_when(secs: u64) -> String {
+    if secs == 0 {
+        "just now".to_string()
+    } else {
+        format!("{} ago", humanize_duration(secs as i64))
     }
 }
 
@@ -786,12 +836,7 @@ fn age_clause(v: &Value) -> String {
     let Some(secs) = v.get("fetched_secs_ago").and_then(Value::as_u64) else {
         return String::new();
     };
-    let when = if secs == 0 {
-        "just now".to_string()
-    } else {
-        format!("{} ago", humanize_duration(secs as i64))
-    };
-    format!(" (cached {when})")
+    format!(" (cached {})", cached_when(secs))
 }
 
 /// The headroom clause, off the discriminated payload
@@ -804,7 +849,7 @@ fn age_clause(v: &Value) -> String {
 ///
 /// A third-party account is told it has no 5h/7d limit only when clauth knows
 /// it has none. A provider that publishes usage windows of its own (z.ai,
-/// Alibaba) HAS the limits whether or not this one response carried any, so a
+/// Alibaba, MiniMax) HAS the limits whether or not this one response carried any, so a
 /// denial beside its figure is false; a provider answering with a wallet or a
 /// counter (DeepSeek, ollama, a generic endpoint) has none, and saying so is
 /// what stops its figure reading as one more window someone can wait out. The
@@ -812,8 +857,12 @@ fn age_clause(v: &Value) -> String {
 /// plus the response's bars at the source — matching the rendered figure for a
 /// `5h` substring would make the copy decide its own meaning.
 ///
-/// A freshness clause rides the FIGURE it dates and nothing else: stamping a
-/// cache's age onto `unknown` asserts a measurement clauth does not have.
+/// A freshness clause rides the FIGURE it dates, and the `stale` word never
+/// rides an unknown: a verdict qualifies a figure, and beside one the prose
+/// does not print it would claim a number the reader cannot see. The AGE may
+/// date an unknown (owner ruling 2026-09-08: date the unknowns, so a reader
+/// can tell how stale the unknown is) — the same split
+/// [`live_usage_prose`]'s all-lapsed arm implements.
 fn windows_prose(windows: &Value) -> String {
     match windows.get("kind").and_then(Value::as_str) {
         Some("third_party") => {
@@ -822,7 +871,7 @@ fn windows_prose(windows: &Value) -> String {
                 .and_then(Value::as_str)
                 .filter(|b| !b.is_empty())
             else {
-                return "usage unknown".to_string();
+                return format!("usage unknown{}", age_clause(windows));
             };
             let mut out = if windows
                 .get("provider_windows")
@@ -833,6 +882,15 @@ fn windows_prose(windows: &Value) -> String {
             } else {
                 format!("no 5h/7d limits; {figure}")
             };
+            // The wallet-burn rate rides the figure it qualifies — the same
+            // first-class-figure shape the Usage tab's rate rows carry, so a
+            // reader picking a delegate target judges the runway themselves.
+            if let (Some(per_day), Some(currency)) = (
+                windows.get("wallet_burn_per_day").and_then(Value::as_f64),
+                windows.get("wallet_burn_currency").and_then(Value::as_str),
+            ) {
+                out.push_str(&format!(" · ~{per_day:.1} {currency}/day"));
+            }
             out.push_str(&freshness_clause(windows));
             out
         }
@@ -843,7 +901,7 @@ fn windows_prose(windows: &Value) -> String {
                 .map(Vec::as_slice)
                 .unwrap_or_default();
             if ws.is_empty() {
-                return "usage unknown".to_string();
+                return format!("usage unknown{}", age_clause(windows));
             }
             let mut out = ws
                 .iter()
@@ -927,10 +985,11 @@ fn throughput_prose(rows: &[Value]) -> String {
 /// structurally has none.
 ///
 /// The tier guard asks the headroom payload's `kind`, never the display
-/// `provider`: [`crate::profile_json::provider_label`] renders every
-/// unrecognised endpoint as `anthropic`, so a generic api-key account (a local
-/// llama, an aggregator) would be told its Anthropic plan tier is unknown when
-/// it has no Anthropic plan at all.
+/// `provider`: [`crate::profile_json::provider_label`] types the ACCOUNT off
+/// the managed `base_url` field alone, so an account whose endpoint lives only
+/// in an `[env] ANTHROPIC_BASE_URL` entry still reads `anthropic` there and
+/// would be told its Anthropic plan tier is unknown when it has no Anthropic
+/// plan at all. `kind` names which usage shape the account actually has.
 fn profile_line(row: &Value) -> String {
     let name = row.get("name").and_then(Value::as_str).unwrap_or("unknown");
     let active = row.get("active").and_then(Value::as_bool).unwrap_or(false);
@@ -973,10 +1032,11 @@ fn profile_line(row: &Value) -> String {
     {
         out.push_str("; live session");
     }
-    // The three states `delegate` refuses on render as one contiguous run, so a
-    // reader meets one refusal group rather than three markers scattered
-    // through the line. `canceled` follows them because clauth has no cancel
-    // gate: it informs the pick, it does not block it.
+    // The three account-state markers render as one contiguous run, so a
+    // reader meets one group rather than three scattered through the line.
+    // Which of them refuses a delegate, and on which exemption, is
+    // `preflight_target`'s rule. `canceled` follows them because clauth has no
+    // cancel gate: it informs the pick, it does not block it.
     if row
         .get("disabled")
         .and_then(Value::as_bool)
@@ -1376,6 +1436,44 @@ fn denial_names(denials: Option<&Value>) -> Option<String> {
     Some(parts.join(", "))
 }
 
+/// The cost clause an envelope earns: ` (cost $X)`, ` (equivalent Anthropic API
+/// rate cost: $X)`, or ` (equivalent Anthropic API rate cost: $X, endpoint
+/// unknown)`, empty when the envelope carries no `total_cost_usd`.
+///
+/// `total_cost_usd` is the CHILD CLI's own figure, priced against Anthropic's
+/// card whatever endpoint served the call, so a DeepSeek or z.ai target's number
+/// is a wrong-basis figure a caller reads as the bill. Which endpoint answered
+/// is `delegate_call_endpoint`'s answer, arriving as data through the fold — this
+/// file derives no figure the JSON did not carry. Three readings, kept apart for
+/// the same reason `live_usage_prose` keeps its three.
+pub(crate) fn cost_clause(e: &Value) -> String {
+    let Some(cost) = e.get("total_cost_usd").and_then(Value::as_f64) else {
+        return String::new();
+    };
+    let cost_s = fmt_cost(cost);
+    match e
+        .get("live_usage")
+        .and_then(|lu| lu.get("endpoint"))
+        .and_then(Value::as_str)
+    {
+        Some("anthropic") => format!(" (cost ${cost_s})"),
+        Some(_) => format!(" (equivalent Anthropic API rate cost: ${cost_s})"),
+        None => format!(" (equivalent Anthropic API rate cost: ${cost_s}, endpoint unknown)"),
+    }
+}
+
+/// Prose for a `result: "file"` reply: the path, the sha256, and the envelope's
+/// cost clause — the model Reads the file for the body.
+pub(crate) fn result_file_prose(path: &str, sha256: &str, e: &Value) -> String {
+    let mut out = format!("result written to {path} (sha256 {sha256})");
+    let cost = cost_clause(e);
+    if !cost.is_empty() {
+        out.push(';');
+        out.push_str(&cost);
+    }
+    out
+}
+
 /// Prose for a delegate envelope: the verdict (`finished` / `failed` / `timed
 /// out`), the self-report, cost and tokens, then the kill/resume markers. The
 /// raw envelope may carry more of claude's own fields; those stay in the JSON
@@ -1413,36 +1511,25 @@ pub(crate) fn envelope_prose(e: &Value) -> String {
         _ => "unknown".to_string(),
     });
 
-    if let Some(cost) = e.get("total_cost_usd").and_then(Value::as_f64) {
-        let cost_s = fmt_cost(cost);
-        // `total_cost_usd` is the CHILD CLI's own figure, priced against
-        // Anthropic's card whatever endpoint served the call, so a DeepSeek or
-        // z.ai target's number is a wrong-basis figure a caller reads as the
-        // bill. The endpoint arrives as data through the fold — this file
-        // derives no figure the JSON did not carry.
-        //
-        // Three readings, kept apart for the same reason `live_usage_prose`
-        // keeps its three: only a POSITIVE `anthropic` earns the bare clause;
-        // a named other endpoint earns the equivalence clause, which states the
-        // figure is the Anthropic-card price; an unfolded envelope, or a target
-        // clauth could not classify, knows no name, so it keeps the clause and
-        // adds `endpoint unknown`.
-        match e
-            .get("live_usage")
-            .and_then(|lu| lu.get("endpoint"))
-            .and_then(Value::as_str)
-        {
-            Some("anthropic") => out.push_str(&format!(" (cost ${cost_s})")),
-            Some(_) => out.push_str(&format!(" (equivalent Anthropic API rate cost: ${cost_s})")),
-            None => out.push_str(&format!(
-                " (equivalent Anthropic API rate cost: ${cost_s}, endpoint unknown)"
-            )),
-        }
-    }
+    out.push_str(&cost_clause(e));
     if let Some(u) = e.get("usage") {
         let tokens = usage_prose(u);
         if !tokens.is_empty() {
             out.push_str(&format!(", usage: {tokens}"));
+            // The child's token counts are its own self-report. The tokenizer
+            // is whichever model actually ran. `live_usage.served_by`, the
+            // call-resolved label, names who served it. A non-anthropic label
+            // qualifies the bytes so the count is not read as Anthropic's
+            // tokenization.
+            if let Some(p) = e
+                .get("live_usage")
+                .and_then(|lu| lu.get("served_by"))
+                .and_then(Value::as_str)
+                && !p.is_empty()
+                && p != "anthropic"
+            {
+                out.push_str(&format!(" (served by {p})"));
+            }
         }
     }
     if let Some(p) = e.get("partial_result").and_then(Value::as_str) {
@@ -1494,8 +1581,7 @@ pub(crate) fn delegate_prose(p: &Value) -> String {
             .unwrap_or("unknown");
         let status = p.get("status").and_then(Value::as_str).unwrap_or("unknown");
         // A raw start epoch carries no news a reader acts on; the JSON spelling
-        // keeps it. The handle's own spelling is unchanged: the bundled
-        // `asyncRewake` hook scans this prose for `d-<base36-ms>-<n>` tokens.
+        // keeps it. The handle's own spelling is unchanged.
         let mut out = format!("delegate to `{profile}` {status}, job `{job_id}`");
         if let Some(lu) = p.get("live_usage") {
             out.push_str("; ");
@@ -1542,10 +1628,10 @@ pub(crate) fn delegate_refusal_prose(p: &Value) -> String {
 /// target's own headroom.
 ///
 /// The headroom clauses follow the id list rather than sitting inside each
-/// parenthesis: the ids and the account names are what the caller (and the
-/// `asyncRewake` hook) reads first, and a footer spliced between them would
-/// bury the handles. The digest is the reply's, not a row's — it is folded once
-/// at the top level, because reporting consumes the delta.
+/// parenthesis: the ids and the account names are what the caller reads first,
+/// and a footer spliced between them would bury the handles. The digest is the
+/// reply's, not a row's: it is folded once at the top level, on `DigestMode`'s
+/// reporting rule.
 pub(crate) fn delegate_fanout_prose(p: &Value) -> String {
     let jobs = p
         .get("jobs")
@@ -1606,6 +1692,15 @@ pub(crate) fn delegate_fanout_results_prose(p: &Value) -> String {
 /// Prose for `monitor`'s one-id mode: the running status, the done envelope, or
 /// an invalid/unknown job_id refusal.
 pub(crate) fn monitor_job_prose(p: &Value) -> String {
+    // A crashed tombstone's owner copy is the whole line: no `delegate to`,
+    // `finished`/`failed`, or target footer may qualify it.
+    if p.get("crashed").and_then(Value::as_bool).unwrap_or(false) {
+        return p
+            .get("result")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+    }
     if p.get("job_id").and_then(Value::as_str).is_some()
         && p.get("status").and_then(Value::as_str).is_some()
     {
@@ -1640,13 +1735,10 @@ pub(crate) fn monitor_job_prose(p: &Value) -> String {
 /// far each deadline still is, that account's headroom, and — on its own
 /// indented line — the newest thing the delegate wrote.
 ///
-/// A run can be missing either deadline and still be perfectly healthy, so each
-/// absence is NAMED rather than left to read as a lost figure: a streaming run
-/// has no wall clock at all (the idle guard is its only deadline), and a run
-/// whose caller pinned its own `--output-format` has no idle one (silence there
-/// carries no information). Missing BOTH is the only case that means clauth is
-/// short a fact rather than reporting one: every deadline is recorded together
-/// at reserve time, so that job was started by a clauth which recorded neither.
+/// Output age always renders: every record heartbeats `last_output_at`, and a
+/// delegate has no deadlines anymore, so there is no pre-deadline-era record to
+/// special-case. A deadline countdown renders only where an OLD record still
+/// carries one; a new record simply omits it.
 pub(super) fn running_status_prose(p: &Value) -> String {
     let job_id = p.get("job_id").and_then(Value::as_str).unwrap_or("unknown");
     let status = p.get("status").and_then(Value::as_str).unwrap_or("unknown");
@@ -1659,23 +1751,15 @@ pub(super) fn running_status_prose(p: &Value) -> String {
         out.push_str(&format!(" on `{profile}`"));
     }
     out.push_str(&format!(", elapsed {elapsed}"));
-    let wall = p.get("wall_kill_in_secs").and_then(Value::as_u64);
-    let idle = p.get("idle_kill_in_secs").and_then(Value::as_u64);
-    if wall.is_none() && idle.is_none() {
-        out.push_str(", liveness not recorded (started under an older clauth)");
-    } else {
-        match p.get("last_output_secs_ago").and_then(Value::as_u64) {
-            Some(secs) => out.push_str(&format!(", last output {secs}s ago")),
-            None => out.push_str(", no output yet"),
-        }
-        match idle {
-            Some(secs) => out.push_str(&format!(", idle-kill in {secs}s")),
-            None => out.push_str(", no idle deadline"),
-        }
-        match wall {
-            Some(secs) => out.push_str(&format!(", wall-kill in {secs}s")),
-            None => out.push_str(", no wall clock"),
-        }
+    match p.get("last_output_secs_ago").and_then(Value::as_u64) {
+        Some(secs) => out.push_str(&format!(", last output {secs}s ago")),
+        None => out.push_str(", no output yet"),
+    }
+    if let Some(secs) = p.get("idle_kill_in_secs").and_then(Value::as_u64) {
+        out.push_str(&format!(", idle-kill in {secs}s"));
+    }
+    if let Some(secs) = p.get("wall_kill_in_secs").and_then(Value::as_u64) {
+        out.push_str(&format!(", wall-kill in {secs}s"));
     }
     if let Some(q) = p.get("quota") {
         out.push_str(&format!("; quota: {}", windows_prose(q)));
@@ -1696,19 +1780,6 @@ pub(super) fn running_status_prose(p: &Value) -> String {
 /// run, so no newline can break the block shape either.
 fn escape_quoted(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-/// One asked job's verdict for a cancelling `monitor`'s opening line: what the
-/// wait OBSERVED, with the seconds that call actually waited for that job —
-/// never the grace constant. The id takes the module's backtick convention;
-/// the owner record fixes the words. Both spellings render here and nowhere
-/// else, so the fixed pair cannot drift.
-pub(super) fn kill_verdict(job_id: &str, killed: bool, waited_secs: u64) -> String {
-    if killed {
-        format!("killed `{job_id}` after {waited_secs}s")
-    } else {
-        format!("failed to kill `{job_id}` after {waited_secs}s")
-    }
 }
 
 /// Prose for a `monitor` several-ids reply: one BLOCK per requested id, naming
@@ -1736,6 +1807,16 @@ pub(crate) fn monitor_batch_prose(p: &Value) -> String {
     let mut out = results
         .iter()
         .map(|r| {
+            // The same owner copy, rendered raw: the batch row prefix and
+            // `finished`/`failed` qualify a result, and this line IS the whole
+            // result.
+            if r.get("crashed").and_then(Value::as_bool).unwrap_or(false) {
+                return r
+                    .get("result")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string();
+            }
             let job_id = r.get("job_id").and_then(Value::as_str).unwrap_or("unknown");
             match r.get("status").and_then(Value::as_str) {
                 Some("done") => format!("job `{job_id}` {}", envelope_prose(r)),

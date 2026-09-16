@@ -35,8 +35,8 @@ fn detached_task_still_running_at_teardown_never_touches_the_real_home() {
     // test's unrelated background task instead of this one.
     let release_gate = arm_detach_gate();
 
-    let reserved =
-        reserve_background_job(&profile, None, None, true, None).expect("reserve background job");
+    let reserved = reserve_background_job(&profile, None, None, Isolation::Shared)
+        .expect("reserve background job");
     let job_id = reserved.spec.job_id.clone();
     // `spawn_blocking` needs an entered Tokio runtime; the runtime itself must
     // outlive the spawn (dropping it can wait on outstanding blocking tasks,
@@ -54,9 +54,11 @@ fn detached_task_still_running_at_teardown_never_touches_the_real_home() {
                 cwd: None,
                 env: HashMap::new(),
                 extra_args: Vec::new(),
-                timeout_secs: None,
-                idle_secs: None,
                 resume: None,
+                subagent_type: None,
+                allowed_tools: None,
+                permission_mode: None,
+                result_file: false,
                 isolation: Isolation::Isolated,
                 depth: 0,
             },
@@ -242,6 +244,8 @@ fn a_job_left_running_fails_the_finalized_assertion() {
         recorded_at: 1,
         timeout_secs: 60,
         endpoint: None,
+        provider: None,
+        isolated: false,
         idle_secs: None,
         kind: jobs::RecordKind::Collectable,
     })

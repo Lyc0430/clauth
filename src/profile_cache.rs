@@ -6,6 +6,7 @@
 //! module owns that shared IO once; the two layers only differ in their cache
 //! filename and the concrete type.
 
+use std::any::TypeId;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -23,6 +24,15 @@ pub(crate) const THIRD_PARTY_CACHE_FILE: &str = "third_party_cache.json";
 /// adoption — the identity anchor that lets an unattended adopt refuse a live
 /// login belonging to a DIFFERENT account (`oauth::try_adopt_live_rotation`).
 pub(crate) const ACCOUNT_ID_CACHE_FILE: &str = "account_id.json";
+
+/// The last adopt refusal announced for this profile, as one of the reason
+/// keys `oauth::try_adopt_live_rotation` refuses with (a bare JSON string).
+/// The refusal is a STANDING state while the live slot stays unadoptable, and
+/// the rotation legs that reach it run in DIFFERENT processes (the daemon
+/// scheduler and the TUI's in-process scheduler), so the once-per-state
+/// announcement is recorded on disk where every process reads it instead of
+/// in either process's memory.
+pub(crate) const ADOPT_REFUSAL_FILE: &str = "adopt_refusal.json";
 
 /// Epoch-ms of this profile's last `/profile` fetch attempt (a bare JSON number).
 /// Derived data: the durable half of `usage::fetch`'s once-per-hour-per-profile
@@ -43,6 +53,8 @@ pub(crate) const KICK_BLOCK_CACHE_FILE: &str = "kick_block.json";
 /// and `clauth status --json` — which otherwise derive freshness from the usage
 /// cache's mtime alone and so report a warm cache behind a dead session as
 /// `Fresh`: a live measurement, over a credential that will never come back.
+/// The refusal splitter `oauth::third_party_dead_chain_copy` is a third reader:
+/// a matched verdict demotes the dead-chain sentence to the keyless one.
 ///
 /// This is NOT a freshness claim and cannot go stale in the dangerous
 /// direction: it is a terminal verdict BOUND to one credential, so a re-login
@@ -173,10 +185,42 @@ pub(crate) fn profile_cache_path(name: &ProfileName, file: &str) -> Option<PathB
     crate::profile::profile_dir(name).ok().map(|p| p.join(file))
 }
 
+/// The cache file each usage-cache payload type is written to, so a call site
+/// pairing the wrong constant with the wrong type fails the read instead of
+/// deserializing a foreign file into an all-default value. An all-`serde(default)`
+/// payload (e.g. [`crate::usage::UsageInfo`]) parses ANY JSON object into a
+/// valid-looking all-default answer, so the constant↔type mismatch is invisible
+/// to a parse and no test can catch it — the defect a two-part fix once shipped
+/// half-swallowed by. Payloads with required fields fail a mismatched read on
+/// their own (`ThirdPartyStats`'s `is_available`/`rows`), and `u64` /
+/// `serde_json::Value` parse anything by design; neither needs an entry.
+///
+/// A `TypeId` table rather than a trait bound: a `CachePayload` trait could not
+/// be implemented here for the one payload private to another module
+/// (`throughput::ThroughputStore`), and the bound would force an edit in its
+/// home. The table keeps the guard beside the constants it protects.
+fn expected_cache_file<T: 'static>() -> Option<&'static str> {
+    match TypeId::of::<T>() {
+        t if t == TypeId::of::<crate::usage::UsageInfo>() => Some(USAGE_CACHE_FILE),
+        t if t == TypeId::of::<crate::providers::ThirdPartyStats>() => Some(THIRD_PARTY_CACHE_FILE),
+        _ => None,
+    }
+}
+
 /// Read + deserialize `<profile_dir>/<file>`. `None` on missing file or any
 /// read/parse error — the caller treats both as "no cache" (matches the prior
-/// per-layer loaders exactly).
-pub(crate) fn load_profile_cache<T: DeserializeOwned>(name: &ProfileName, file: &str) -> Option<T> {
+/// per-layer loaders exactly) — and `None` again when `file` is not the cache
+/// this payload type is written to, so a wrong constant cannot read an
+/// all-default value out of a foreign file (see [`expected_cache_file`]).
+pub(crate) fn load_profile_cache<T: DeserializeOwned + 'static>(
+    name: &ProfileName,
+    file: &str,
+) -> Option<T> {
+    if let Some(expected) = expected_cache_file::<T>()
+        && expected != file
+    {
+        return None;
+    }
     profile_cache_path(name, file).and_then(|p| {
         let text = std::fs::read_to_string(p).ok()?;
         serde_json::from_str::<T>(&text).ok()
@@ -240,3 +284,7 @@ pub(crate) fn profile_cache_mtime_ms(name: &ProfileName, file: &str) -> Option<u
         .ok()
         .map(|d| d.as_millis() as u64)
 }
+
+#[cfg(test)]
+#[path = "../tests/inline/profile_cache.rs"]
+mod tests;

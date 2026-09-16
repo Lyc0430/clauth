@@ -107,8 +107,26 @@ fn bash_and_zsh_complete_a_profile_after_start_with_fallback() {
         "bash must list profiles after --with-fallback, not only after --isolated",
     );
     assert!(
-        ZSH.contains(r#""${words[2]}" == start && "${words[3]}" == (--isolated|--with-fallback)"#),
-        "zsh's fourth-word profile arm must accept --with-fallback as the third word",
+        ZSH.contains(
+            r#""${words[2]}" == start && "${words[3]}" == (--isolated|--with-fallback|--explain)"#
+        ),
+        "zsh's fourth-word profile arm must accept every flag that can precede a name",
+    );
+}
+
+/// `--auto` takes the profile's PLACE, so the shells must NOT offer a profile
+/// after it — everything following it belongs to `claude`. Pinned because the
+/// obvious edit (adding `--auto` beside `--with-fallback` in the profile arm)
+/// reads as consistent and is wrong.
+#[test]
+fn no_shell_completes_a_profile_after_start_auto() {
+    assert!(
+        !BASH.contains(r#"[ "$prev" = "--auto" ]"#),
+        "bash must not list profiles after --auto",
+    );
+    assert!(
+        !ZSH.contains("--auto)"),
+        "zsh's fourth-word profile arm must not accept --auto as the third word",
     );
 }
 
@@ -822,4 +840,18 @@ fn the_parity_scan_still_catches_a_bare_apostrophe_beside_the_escape_idiom() {
         ),
         "the idiom alone is balanced zsh and must not red"
     );
+}
+
+/// `--manual` is gone from the login surface: no shell script may mention it,
+/// and the zsh + fish login descriptions read the bare browser-OAuth wording.
+#[test]
+fn every_shell_drops_the_manual_login_flag() {
+    for script in [&BASH, &ZSH, &FISH] {
+        assert!(
+            !script.contains("--manual"),
+            "the --manual flag must not appear in any completion script"
+        );
+    }
+    assert!(ZSH.contains("'login[log in via browser OAuth or an API key]'"));
+    assert!(FISH.contains("-a login -d \"Log in via browser OAuth or an API key\""));
 }

@@ -9,9 +9,17 @@
 //! `clauth start <profile> <claude args…>` forwards every token `start` does
 //! not declare to `claude` untouched, leading hyphens included.
 
+use std::net::SocketAddr;
+use std::path::PathBuf;
+
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::runtime::Isolation;
+
+/// Where a value-less `--listen` binds. Every interface, because the flag's
+/// whole purpose is a client on a different machine; a loopback default would
+/// parse fine and then serve nobody.
+pub(crate) const DEFAULT_LISTEN: &str = "0.0.0.0:8443";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -57,13 +65,16 @@ pub(crate) enum Command {
     /// Add a new account, or re-authenticate an existing one in place
     ///
     /// Neither switches to it. Bare (no --base-url/--api-key) runs the browser
-    /// OAuth flow and writes the minted tokens into the profile; passing either
-    /// endpoint flag captures an API-key account instead, prompting for
-    /// whatever a flag omitted (the key is read echo-off).
+    /// OAuth flow and writes the minted tokens into the profile; the bare login
+    /// also prints a link to open on any device and takes the code that page
+    /// shows. Passing either endpoint flag captures an API-key account instead,
+    /// prompting for whatever a flag omitted (the key is read echo-off).
     ///
     /// An existing name re-authenticates in place: the fresh credential set
     /// replaces the old one while the profile's chain slot, env, and model
-    /// settings survive. On an Alibaba Model Studio profile a bare login opens
+    /// settings survive. A browser login also leaves a stored endpoint and a
+    /// working api key standing, since it renews the subscription login and
+    /// that account's inference runs on the key. On an Alibaba Model Studio profile a bare login opens
     /// that console instead, capturing the session its usage figures need; that
     /// session expires 48 hours after the aliyun sign-in behind it rather than
     /// after this login, so it can arrive with minutes left. That profile's
@@ -75,6 +86,20 @@ pub(crate) enum Command {
     /// session is captured from is read off the endpoint, so a name with no
     /// endpoint yet has no console to open.
     Login(LoginArgs),
+
+    /// Save the login Claude Code is using now as a new profile
+    ///
+    /// Reads the live ~/.claude/.credentials.json — plus whatever endpoint and
+    /// api key Claude Code is running on — and stores it under <name>, with no
+    /// browser flow. This is the way to adopt a login `claude` already minted,
+    /// including the one a first account is refused over when the live file
+    /// holds a login no profile owns. The first profile becomes the active
+    /// account; a later one needs `clauth <name>` to switch to. An existing
+    /// name is refused — re-authenticating one is `clauth login <name>`.
+    Capture {
+        /// Profile to save the current login under.
+        profile: String,
+    },
 
     /// Remove a profile and all its credentials
     Delete {
@@ -223,6 +248,9 @@ pub(crate) enum Command {
     ///
     /// Refreshes usage, auto-switches on exhaustion, and writes
     /// ~/.clauth/status.json. Exits at once when a daemon is already running.
+    /// `--listen` also serves the REST API to the devices `clauth devices`
+    /// pairs (see the Daemon wiki page); `--status` prints and exits without
+    /// running a scheduler.
     Daemon {
         /// Wait instead, and take over when the running daemon exits. For a
         /// launchd/systemd unit paired with a manual run.
@@ -236,8 +264,74 @@ pub(crate) enum Command {
         #[arg(long, conflicts_with = "status")]
         replace: bool,
         /// Print the running daemon, or exit 1 with no output when none is.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "listen")]
         status: bool,
+        /// Also serve the REST API over TLS; bare --listen means 0.0.0.0:8443
+        ///
+        /// For running the daemon on one machine and a client (clauth-tray) on
+        /// another. TLS comes from this host's lego certificate — from
+        /// /etc/lego/certificates on macOS and Linux, and from
+        /// %AppData%\lego\certificates on Windows, either overridable in
+        /// ~/.clauth/tls.json. Every request but a pairing needs a paired
+        /// device's token; see `clauth devices`.
+        ///
+        /// The value-less spelling binds every interface, matching what the
+        /// flag is for — a client on another machine. It is the same exposure
+        /// the spelled-out form always had, just less to type; the flag itself
+        /// still has to be passed, so nothing listens by accident.
+        #[arg(
+            long,
+            value_name = "ADDR:PORT",
+            num_args = 0..=1,
+            default_missing_value = DEFAULT_LISTEN,
+        )]
+        listen: Option<SocketAddr>,
+        /// Serve this certificate instead of the host's lego certificate
+        ///
+        /// For hosts where the lego derivation cannot work rather than merely
+        /// points somewhere else: on a tailnet node `hostname -f` answers a name
+        /// no certificate covers, and `tailscale cert` writes a `<name>.crt` and
+        /// `<name>.key` with no issuer file and none of lego's naming.
+        ///
+        /// Both files are read as PEM. Given these, nothing else is consulted —
+        /// not `hostname -f`, not the directory in ~/.clauth/tls.json, and no
+        /// issuer file beside the certificate. Requires --key and --listen.
+        #[arg(long, value_name = "PATH", requires = "key", requires = "listen")]
+        cert: Option<PathBuf>,
+        /// The private key for --cert (PKCS#8, PKCS#1 or SEC1)
+        #[arg(long, value_name = "PATH", requires = "cert", requires = "listen")]
+        key: Option<PathBuf>,
+        /// Print the OpenAPI document the REST API serves, and start nothing.
+        #[arg(
+            long,
+            conflicts_with_all = [
+                "standby",
+                "no_standby",
+                "replace",
+                "status",
+                "listen",
+                "cert",
+                "key",
+            ]
+        )]
+        dump_openapi: bool,
+    },
+
+    /// Pair, list, and revoke the devices that may call the REST API
+    ///
+    /// Every `clauth daemon --listen` request but a pairing authenticates as
+    /// one named device, and each device holds a tier fixed here, on this
+    /// machine: `view` reads the status feed, `control` may also switch
+    /// accounts.
+    /// Bare, it lists the devices. No token is ever printed back: clauth keeps
+    /// only a SHA-256 of each.
+    #[command(args_conflicts_with_subcommands = true)]
+    Devices {
+        /// Emit a JSON array instead of the table.
+        #[arg(long)]
+        json: bool,
+        #[command(subcommand)]
+        cmd: Option<DevicesCommand>,
     },
 
     /// Print the usage / auto-switch snapshot as JSON
@@ -344,13 +438,28 @@ pub(crate) struct StartArgs {
     /// a chain member is marked preferred (the home account), the session also
     /// returns to it once it reads clear and fresh again. Needs a running
     /// `clauth daemon` to decide the switches, and a profile that is already a
-    /// chain member. Not available with --isolated, on a non-OAuth account, on
-    /// macOS, or on a Windows host without symlink privilege — each of those is
-    /// refused by name at launch.
+    /// chain member. Not available with --isolated, on a non-OAuth account,
+    /// or on a Windows host without symlink privilege — each of those is refused
+    /// by name at launch.
     #[arg(long, conflicts_with = "isolated")]
     pub(crate) with_fallback: bool,
+    /// Pick the account instead of naming one: the first fallback-chain member
+    /// with headroom for the models this session will run (`--model`, the model
+    /// in your settings, the subagent model).
+    ///
+    /// It takes the place of the profile name, so separate `claude`'s own args
+    /// with `--` whenever the first of them starts with a hyphen:
+    /// `clauth start --auto -- -p "hi"`. Without a name in that slot there is
+    /// nothing to tell a passthrough `-p` from a misspelled clauth flag, and
+    /// guessing would silently eat one of them.
+    #[arg(long)]
+    pub(crate) auto: bool,
+    /// Print the account a start would launch on, and why, without launching it.
+    #[arg(long)]
+    pub(crate) explain: bool,
     /// Profile to launch under.
-    pub(crate) profile: String,
+    #[arg(required_unless_present = "auto")]
+    pub(crate) profile: Option<String>,
     /// Args handed to `claude` verbatim.
     #[arg(
         trailing_var_arg = true,
@@ -358,6 +467,14 @@ pub(crate) struct StartArgs {
         value_name = "CLAUDE_ARGS"
     )]
     pub(crate) claude_args: Vec<String>,
+}
+
+/// Which account a `clauth start` runs under: the name the operator typed, or
+/// the one the fallback-chain walk picks for the models the session may run.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StartTarget {
+    Named(String),
+    Auto,
 }
 
 impl StartArgs {
@@ -368,6 +485,33 @@ impl StartArgs {
             Isolation::Isolated
         } else {
             Isolation::Shared
+        }
+    }
+
+    /// The account to start on. `--auto` defers it to the fallback-chain walk;
+    /// without it the positional is required, so the `unwrap_or_default` is
+    /// unreachable rather than a fallback.
+    pub(crate) fn target(&self) -> StartTarget {
+        if self.auto {
+            StartTarget::Auto
+        } else {
+            StartTarget::Named(self.profile.clone().unwrap_or_default())
+        }
+    }
+
+    /// Args for `claude`.
+    ///
+    /// `--auto` leaves no profile to fill, but clap fills positionals in
+    /// declaration order and binds the first trailing value to that slot
+    /// anyway — so `clauth start --auto -- -p "hi"` parks `-p` in `profile` and
+    /// leaves `claude` a bare `hi`. Folding it back is what makes the `--`
+    /// spelling come out whole on the other side.
+    pub(crate) fn passthrough(&self) -> Vec<String> {
+        match (&self.profile, self.auto) {
+            (Some(first), true) => std::iter::once(first.clone())
+                .chain(self.claude_args.iter().cloned())
+                .collect(),
+            _ => self.claude_args.clone(),
         }
     }
 }
@@ -441,8 +585,8 @@ pub(crate) enum HerdrCommand {
     ///
     /// herdr's installer prints every command the plugin would run as you and
     /// asks before registering it; this passes that prompt straight through
-    /// rather than answering it. Run from a clauth checkout it links the local
-    /// `herdr-plugin/` directory instead of fetching the published one.
+    /// rather than answering it. A plugin already linked from a local checkout
+    /// refuses the install: it names the tree and the two ways out.
     Install {
         /// Key that opens the dashboard, in herdr's own binding syntax
         /// (`prefix+a`, `ctrl+alt+c`). Prompted for when omitted.
@@ -459,7 +603,7 @@ pub(crate) enum HerdrCommand {
 
     /// Uninstall the plugin from herdr and drop the config clauth added
     ///
-    /// Runs herdr's uninstall, then takes the keybinding and sidebar row `install` wrote back out of herdr's `config.toml`, leaving anything else in the file alone.
+    /// Takes the keybinding and sidebar row `install` wrote back out of herdr's `config.toml`, leaving anything else in the file alone, then runs herdr's uninstall.
     Uninstall {
         /// Uninstall the plugin and leave herdr's config.toml untouched.
         #[arg(long)]
@@ -491,5 +635,45 @@ pub(crate) enum HerdrConfigCommand {
         /// Knob name: popup_width, pane_tag, tag_watch_secs, border_label,
         /// delegate_dot, delegate_row_text.
         key: String,
+    },
+}
+
+/// `clauth devices <cmd>`: the ways a device joins or leaves.
+#[derive(Subcommand, Debug)]
+pub(crate) enum DevicesCommand {
+    /// Print a one-time pairing code and wait until a device redeems it
+    ///
+    /// The code is 8 characters, valid for 5 minutes, used once, and dropped
+    /// after 5 wrong tries; a new `pair` replaces a code still waiting. The
+    /// device posts it to `POST /api/v1/pair` on this host's
+    /// `clauth daemon --listen` and gets its token in the answer. The code
+    /// prints alone on stdout and the wait reports on stderr; Ctrl-C withdraws
+    /// the code if it is still waiting.
+    Pair {
+        /// Name for the device: letters, digits and - _ . @ +.
+        name: String,
+        /// Pair it with control, which can switch accounts rather than only
+        /// read. Until the code is used, whoever enters it first gets control.
+        #[arg(long)]
+        control: bool,
+    },
+
+    /// Mint a token for a device on this machine and print it once
+    ///
+    /// For a client configured by hand. The token prints alone on stdout;
+    /// clauth keeps only its SHA-256 and cannot show it again.
+    Add {
+        /// Name for the device: letters, digits and - _ . @ +.
+        name: String,
+        /// Mint it with control, which can switch accounts rather than only
+        /// read.
+        #[arg(long)]
+        control: bool,
+    },
+
+    /// Remove a device; its next request is refused
+    Revoke {
+        /// Device to remove.
+        name: String,
     },
 }

@@ -30,7 +30,7 @@ use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE};
 use crate::testutil::{HomeSandbox, set_mtime};
 use crate::usage::UsageInfo;
 
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// A fixed old stamp and its successor: distinct values, so a `set_mtime` move
 /// can never collide with a same-instant write. (`SystemTime + Duration` is
@@ -160,30 +160,11 @@ fn call_switch(server: &ClauthServer, name: &str) -> String {
 }
 
 /// `monitor` on named jobs (its job mode).
-fn call_monitor_ids(server: &ClauthServer, job_ids: &[&str], wait_secs: u64) -> String {
-    block_text(&drive(server.monitor_with(
-        MonitorArgs {
-            job_ids: Some(job_ids.iter().map(|s| (*s).to_string()).collect()),
-            wait_secs: Some(wait_secs),
-            return_on: None,
-            cancel: None,
-        },
-        ProgressSink::none(),
-    )))
-}
-
-/// `monitor` with no `job_ids` — the state-waiting mode absorbed from the old
-/// `watch` tool.
-fn call_monitor_state(server: &ClauthServer, wait_secs: u64) -> String {
-    block_text(&drive(server.monitor_with(
-        MonitorArgs {
-            job_ids: None,
-            wait_secs: Some(wait_secs),
-            return_on: None,
-            cancel: None,
-        },
-        ProgressSink::none(),
-    )))
+fn call_monitor_ids(server: &ClauthServer, job_ids: &[&str]) -> String {
+    block_text(&drive(server.monitor_with(MonitorArgs {
+        job_ids: Some(job_ids.iter().map(|s| (*s).to_string()).collect()),
+        cancel: None,
+    })))
 }
 
 /// A background `delegate`, the one reply shape whose digest each handle site
@@ -212,7 +193,6 @@ fn call_delegate_background(
             DelegateArgs {
                 profiles: Some(profiles.iter().map(|p| (*p).to_string()).collect()),
                 prompt: Some("hi".to_string()),
-                prompt_file: None,
                 model: None,
                 cwd: Some(
                     home.home()
@@ -222,9 +202,11 @@ fn call_delegate_background(
                 ),
                 env: None,
                 args: None,
-                timeout_secs: None,
-                idle_secs: None,
-                resume: None,
+                session_id: None,
+                subagent_type: None,
+                allowed_tools: None,
+                permission_mode: None,
+                result: None,
                 isolated: None,
                 background: Some(true),
             },
@@ -390,6 +372,7 @@ fn seed_switchable_pair() {
                 expires_at: None,
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         });
         save_profile(&p).expect("save profile");
@@ -455,48 +438,6 @@ fn a_refused_switch_reports_external_changes() {
     );
 }
 
-#[test]
-fn state_wait_first_call_arms_the_baseline() {
-    let _home = HomeSandbox::new();
-    seeded_world();
-    let server = ClauthServer::new();
-
-    let armed = call_monitor_state(&server, 0);
-    assert!(
-        armed.contains("monitor armed"),
-        "arming is not a comparison: {armed}",
-    );
-}
-
-/// The long-poll half of the contract: a change landing mid-wait wakes the
-/// call at the next poll slice, not at the deadline.
-#[test]
-fn state_wait_returns_as_soon_as_something_moves() {
-    let _home = HomeSandbox::new();
-    seeded_world();
-    let server = ClauthServer::new();
-    let _ = call_session(&server);
-
-    let path = credentials_path();
-    let mover = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(300));
-        set_mtime(&path, t1());
-    });
-    let start = Instant::now();
-    let text = call_monitor_state(&server, 60);
-    let elapsed = start.elapsed();
-    assert!(
-        text.contains("monitor: since your last call: credentials file rewritten"),
-        "the mid-wait change must be caught: {text}",
-    );
-    assert!(
-        elapsed < Duration::from_secs(10),
-        "a change 300ms in must return at the next poll slice, not the 60s \
-         deadline (took {elapsed:?})",
-    );
-    mover.join().expect("mover thread");
-}
-
 /// The usage-cache observable is KEYED on the profile it was read from: two
 /// profiles' caches are different files, so a profile change is no
 /// `usage_cache` event. Reporting the incomparable pair as a refresh would be
@@ -510,7 +451,7 @@ fn a_profile_change_is_never_reported_as_a_usage_cache_refresh() {
 
     // Another profile, carrying its own cache at its own stamp.
     seed_state("other", t1());
-    let reported = call_monitor_state(&server, 0);
+    let reported = call_session(&server);
     assert!(
         reported.contains("since your last call: active profile `work` → `other`"),
         "the profile change is the news: {reported}",
@@ -610,45 +551,12 @@ fn a_third_party_profiles_leftover_oauth_cache_is_not_the_file_watched() {
     );
 }
 
-#[test]
-fn state_wait_timeout_reports_unchanged_with_waited_secs() {
-    let _home = HomeSandbox::new();
-    seeded_world();
-    let server = ClauthServer::new();
-    let _ = call_session(&server);
-
-    let start = Instant::now();
-    let text = call_monitor_state(&server, 1);
-    assert!(
-        text.contains("monitor: no change after"),
-        "timeout says so: {text}"
-    );
-    assert!(
-        start.elapsed() >= Duration::from_secs(1),
-        "the wait must actually elapse before the unchanged answer: {text}",
-    );
-}
-
-#[test]
-fn state_wait_answers_prose() {
-    let _home = HomeSandbox::new();
-    seeded_world();
-    let server = ClauthServer::new();
-
-    let changed = call_monitor_state(&server, 0);
-    assert!(
-        serde_json::from_str::<serde_json::Value>(&changed).is_err(),
-        "the state-wait reply must be prose, not a JSON blob: {changed}",
-    );
-}
-
-/// No lock may span a sleep in the digest machinery: the state wait runs up
-/// to 3600s, and a baseline lock held across its slices would stall every other
-/// digest-bearing reply on the server. The shape is what's checkable — a
-/// timing probe stays green under a slice-wise violation, because the mutex
-/// futex hands the lock to a parked waiter inside one 200ms slice — so this is
-/// a source guard (the out.rs pattern): the sleeping function must not lock,
-/// and the locking functions must not sleep.
+/// No lock may span a sleep in the digest machinery: the baseline lock must
+/// never be held across anything that can sleep, or one slow reply stalls every
+/// other digest-bearing reply on the server. The shape is what's checkable — a
+/// timing probe stays green under a slice-wise violation — so this is a source
+/// guard (the out.rs pattern): the sleeping function must not lock, and the
+/// locking functions must not sleep.
 ///
 /// Ceiling: it reads `src/mcp/digest.rs` textually, so it catches a lock or a
 /// sleep landing in the named function bodies, not one laundered through a
@@ -684,23 +592,6 @@ fn the_sleeping_function_never_locks_and_the_locking_functions_never_sleep() {
             .join("\n")
     }
 
-    let watch = body(src, "watch");
-    assert!(
-        !watch.contains(".lock()") && !watch.contains("lock("),
-        "watch sleeps, so it must not hold the baseline lock anywhere in its \
-         body: {watch}",
-    );
-    // The new spelling, since slice 2 turned the wait loops async so they can
-    // await a progress notification: a blocking sleep here would park the
-    // reactor thread for the whole wait, and no guard may straddle the await.
-    // The slice itself is the sink's shared `sleep_or_cancelled`, which is also
-    // what makes an abandoned call end here instead of running out its hour, so
-    // a raw sleep back in this body would silently drop cancellation too.
-    assert!(
-        watch.contains("sleep_or_cancelled") && !watch.contains("std::thread::sleep"),
-        "watch sleeps through the shared cancel-aware slice, never by blocking \
-         its thread: {watch}",
-    );
     for locker in ["report", "reseed"] {
         let body = body(src, locker);
         assert!(
@@ -723,16 +614,17 @@ fn monitor_done_envelope_reports_the_digest() {
         "is_error": false,
         "result": "all done",
     });
-    jobs::write_done("d-digest-0", "work", 1, None, envelope.clone()).expect("write job");
-    let first = call_monitor_ids(&server, &["d-digest-0"], 0);
+    jobs::write_done("d-digest-0", "work", 1, None, None, false, envelope.clone())
+        .expect("write job");
+    let first = call_monitor_ids(&server, &["d-digest-0"]);
     assert!(
         !first.contains("since your last call"),
         "first digest call seeds, even through a collected job: {first}",
     );
 
-    jobs::write_done("d-digest-1", "work", 1, None, envelope).expect("write job");
+    jobs::write_done("d-digest-1", "work", 1, None, None, false, envelope).expect("write job");
     set_mtime(&credentials_path(), t1());
-    let second = call_monitor_ids(&server, &["d-digest-1"], 0);
+    let second = call_monitor_ids(&server, &["d-digest-1"]);
     assert!(
         second.contains("since your last call: credentials file rewritten"),
         "the done envelope reports what moved since the first call: {second}",
@@ -746,6 +638,8 @@ fn seed_done_job(id: &str) {
         "work",
         1,
         None,
+        None,
+        false,
         serde_json::json!({ "profile": "work", "is_error": false, "result": "all done" }),
     )
     .expect("write job");
@@ -761,7 +655,7 @@ fn monitor_batch_carries_one_top_level_digest() {
 
     seed_done_job("d-batch-0");
     seed_done_job("d-batch-1");
-    let first = call_monitor_ids(&server, &["d-batch-0", "d-batch-1"], 0);
+    let first = call_monitor_ids(&server, &["d-batch-0", "d-batch-1"]);
     assert_eq!(
         first.matches("since your last call").count(),
         0,
@@ -771,7 +665,7 @@ fn monitor_batch_carries_one_top_level_digest() {
     set_mtime(&credentials_path(), t1());
     seed_done_job("d-batch-2");
     seed_done_job("d-batch-3");
-    let second = call_monitor_ids(&server, &["d-batch-2", "d-batch-3"], 0);
+    let second = call_monitor_ids(&server, &["d-batch-2", "d-batch-3"]);
     assert_eq!(
         second.matches("since your last call").count(),
         1,
@@ -797,14 +691,14 @@ fn monitor_batch_prose_renders_the_digest() {
     let server = ClauthServer::new();
 
     seed_done_job("d-bprose-0");
-    let _ = call_monitor_ids(&server, &["d-bprose-0"], 0);
+    let _ = call_monitor_ids(&server, &["d-bprose-0"]);
 
     set_mtime(&credentials_path(), t1());
     seed_done_job("d-bprose-1");
     // One id renders through the single-job spelling, which carries live
     // usage inline (the several-ids lines stay short instead).
     assert_eq!(
-        call_monitor_ids(&server, &["d-bprose-1"], 0),
+        call_monitor_ids(&server, &["d-bprose-1"]),
         "delegate to `work` finished: all done; target `work`: 5h unknown, 7d unknown; \
          since your last call: credentials file rewritten",
     );
@@ -909,6 +803,7 @@ fn an_abandoned_blocking_delegate_reply_never_consumes_the_digest() {
             serde_json::json!({"profile": "work", "result": "done"}),
             &crate::profile::ProfileName::from("work"),
             delegate_call_endpoint("work", &std::collections::HashMap::new()),
+            None,
             0,
             super::delegate_digest_mode(&tracker, abandoned),
         )

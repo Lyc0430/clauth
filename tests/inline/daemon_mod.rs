@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Characterization of the daemon's per-tick work (`Daemon::tick` and the
 //! drains extracted to `src/daemon/tick.rs`) — the top reliability path.
 //!
@@ -15,8 +17,8 @@ use crate::profile::{
     AppConfig, AppState, ClaudeCredentials, OAuthToken, Profile, claude_dir, clauth_dir,
     reload_fingerprint, save_app_state, save_profile,
 };
-use crate::testutil::{HomeSandbox, blank_profile, set_mtime};
-use crate::usage::{ProfileActivity, clear_activity, mark_activity, now_ms};
+use crate::testutil::{HomeSandbox, blank_profile, set_mtime, through_handle};
+use crate::usage::{FetchLeg, ProfileActivity, mark_activity, mark_fetch_activity, now_ms};
 
 use super::Daemon;
 
@@ -57,6 +59,7 @@ fn oauth_creds(access: &str) -> ClaudeCredentials {
             expires_at: Some(future_expiry()),
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     }
 }
@@ -123,10 +126,14 @@ fn active_of(d: &Daemon) -> Option<String> {
 // ── tick(): the extracted loop body ───────────────────────────────────────────
 
 /// `tick` on an idle daemon with empty queues writes `status.json` and changes
-/// nothing else — the pure no-op characterization of one loop iteration.
+/// nothing else — the pure no-op characterization of one loop iteration. Stays
+/// cross-platform: the armed throttle is what keeps the tick's heal inert here,
+/// since the gate's pointer read cannot be sandboxed on Windows.
 #[test]
 fn tick_with_empty_queues_writes_status_and_leaves_active_unchanged() {
     let _home = HomeSandbox::new();
+    crate::plugin_host::arm_heal_throttle_for_test();
+    crate::herdr::arm_heal_throttle_for_test();
     let config = persist(
         vec![profile_with_creds("alpha", "at-alpha")],
         Some("alpha"),
@@ -146,6 +153,197 @@ fn tick_with_empty_queues_writes_status_and_leaves_active_unchanged() {
         active_of(&daemon).as_deref(),
         Some("alpha"),
         "no queued switch → active profile is unchanged by a tick"
+    );
+}
+
+/// The tick is a heal call site: one tick over a broken registration reaches
+/// `claude` through the detached heal. Deleting the call from `tick` reds here,
+/// which a healthy-registration variant could never do — that one is green
+/// whether or not the tick calls anything. Unix-only: the fake `claude` is a
+/// shell shim.
+#[cfg(unix)]
+#[test]
+fn tick_heals_a_broken_plugin_registration() {
+    use crate::testutil::{FakeClaude, join_background_tasks, seed_broken_plugin_registration};
+
+    let home = HomeSandbox::new();
+    let fake = FakeClaude::new(&home);
+    crate::plugin_host::reset_heal_throttle_for_test();
+    // The tick drives the herdr heal too; its throttle is armed so this test
+    // stays spawn-free beside the claude heal it pins (the herdr heal's
+    // fail-closed test assert needs the injected path, which no sandbox pins).
+    crate::herdr::arm_heal_throttle_for_test();
+    seed_broken_plugin_registration();
+    let config = persist(
+        vec![profile_with_creds("alpha", "at-alpha")],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+
+    daemon.tick();
+    join_background_tasks();
+
+    assert!(
+        !fake.log().is_empty(),
+        "one tick over a broken registration must reach the heal"
+    );
+}
+
+// ── tick vs a wedged flock holder ─────────────────────────────────────────────
+
+/// A tick draining both queues against a wedged flock holder completes within
+/// the watchdog deadline: the first drain's wait spends the tick's shared
+/// window, and the second drain is SKIPPED rather than handed a fresh wait —
+/// pre-fix, two full waits (2 × 25 s) aborted the daemon mid-switch past the
+/// 30 s watchdog. The switch is re-queued and the switch-off stays pending, so
+/// the next tick retries both with a fresh window. Short seams pose the wedge:
+/// the budget override shrinks the tick's window to 300 ms and the lock-timeout
+/// override keeps a broken full wait observable in ~1 s instead of the real
+/// 25 s.
+#[test]
+fn tick_skips_the_second_drain_once_a_wedged_flock_spends_the_budget() {
+    let _home = HomeSandbox::new();
+    crate::lock::set_subprocess_budget_override(Some(Duration::from_millis(300)));
+    crate::lock::set_state_lock_timeout_override(Some(Duration::from_secs(1)));
+    crate::plugin_host::arm_heal_throttle_for_test();
+    crate::herdr::arm_heal_throttle_for_test();
+
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    // A second open file description holding the state flock — conflicts with
+    // the daemon's acquisition exactly as a wedged peer would.
+    let dir = clauth_dir().expect("clauth dir");
+    let holder = crate::profile::open_state_file(&dir.join(crate::lock::LOCK_FILENAME))
+        .expect("open holder handle");
+    holder.lock().expect("hold the flock");
+
+    let mut daemon = daemon_for(config);
+    stage_switch(&daemon, "beta");
+    *daemon
+        .pending_switch_off
+        .lock()
+        .expect("pending_switch_off") = true;
+
+    let start = std::time::Instant::now();
+    daemon.tick();
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "the tick must complete despite the wedge (within the seam-posed deadline), took {elapsed:?}"
+    );
+    assert_eq!(
+        queued_targets(&daemon),
+        vec!["beta".to_string()],
+        "the wedged switch is re-queued for the next tick"
+    );
+    assert!(
+        *daemon
+            .pending_switch_off
+            .lock()
+            .expect("pending_switch_off"),
+        "the skipped switch-off stays queued for the next tick (the pre-fix drain consumed \
+         the flag before timing out)"
+    );
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("alpha"),
+        "no switch landed"
+    );
+
+    crate::lock::set_subprocess_budget_override(None);
+    crate::lock::set_state_lock_timeout_override(None);
+    drop(holder);
+}
+
+/// The healthy twin: with the flock free, a tick draining both queues runs
+/// BOTH drains exactly as before the bound — the switch lands, then the
+/// switch-off lands, and nothing is skipped or re-ordered. This pins the
+/// byte-identical healthy path the aggregate bound must not disturb.
+#[test]
+fn tick_drains_both_queues_when_the_flock_is_free() {
+    let _home = HomeSandbox::new();
+    crate::plugin_host::arm_heal_throttle_for_test();
+    crate::herdr::arm_heal_throttle_for_test();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+    stage_switch(&daemon, "beta");
+    *daemon
+        .pending_switch_off
+        .lock()
+        .expect("pending_switch_off") = true;
+
+    daemon.tick();
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        None,
+        "the switch AND the switch-off both landed"
+    );
+    assert_eq!(
+        queued_targets(&daemon),
+        Vec::<String>::new(),
+        "the executed switch leaves nothing queued"
+    );
+    assert!(
+        !*daemon
+            .pending_switch_off
+            .lock()
+            .expect("pending_switch_off"),
+        "the executed switch-off clears the flag"
+    );
+}
+
+// ── drains_exhausted: the pure skip predicate ─────────────────────────────────
+
+/// The pure skip predicate, both triggers: a spent tick window (`Some(0)`)
+/// skips the next drain, and so does a spent watchdog deadline — whatever the
+/// window holds. A tick with neither runs its next drain; `None` (no budget
+/// armed, as in a direct drain call from a test) never skips on the window.
+#[test]
+fn drains_exhausted_names_both_skip_triggers() {
+    let t = std::time::Instant::now();
+    let deadline = t + Duration::from_secs(29);
+    assert!(
+        super::drains_exhausted(Some(Duration::ZERO), t, deadline),
+        "a spent window skips the next drain"
+    );
+    assert!(
+        !super::drains_exhausted(Some(Duration::from_secs(5)), t, deadline),
+        "an unspent window before the deadline does not skip"
+    );
+    assert!(
+        !super::drains_exhausted(None, t, deadline),
+        "no budget armed (a direct drain call) does not skip"
+    );
+    assert!(
+        super::drains_exhausted(Some(Duration::from_secs(5)), deadline, deadline),
+        "a spent deadline skips whatever the window holds (now == deadline)"
+    );
+    assert!(
+        super::drains_exhausted(
+            Some(Duration::from_secs(5)),
+            deadline + Duration::from_secs(1),
+            deadline
+        ),
+        "a spent deadline skips whatever the window holds (now past the deadline)"
     );
 }
 
@@ -316,6 +514,7 @@ fn drain_pending_switch_proceeds_over_a_stale_clauth_symlink() {
             expires_at: Some(future_expiry()),
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
     let alpha_dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("alpha"))
@@ -379,6 +578,7 @@ fn drain_pending_switch_proceeds_over_a_macos_regular_file_mirror() {
             expires_at: Some(future_expiry()),
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
     let alpha_dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("alpha"))
@@ -531,8 +731,14 @@ fn busy_target_requeued_not_dropped() {
         "the busy switch is re-queued, not dropped after one attempt"
     );
 
-    // Fetch completes → the re-queued switch lands on the next tick.
-    clear_activity(&daemon.activity, &crate::profile::ProfileName::from("beta"));
+    // Fetch completes → the re-queued switch lands on the next tick. The fetch
+    // leg is what `mark_activity(.., Fetching)` opened, so the leg's own
+    // completion boundary is what closes it.
+    mark_fetch_activity(
+        &daemon.activity,
+        &FetchLeg::OAuth.key(crate::profile::ProfileName::from("beta")),
+        ProfileActivity::Idle,
+    );
     daemon.drain_pending_switch();
     assert_eq!(
         active_of(&daemon).as_deref(),
@@ -897,7 +1103,12 @@ fn a_redundant_instance_exits_without_touching_the_shared_tree() {
     let held = crate::profile::open_state_file(&dir.join(super::LOCK_FILE)).expect("open lock");
     held.try_lock().expect("hold the singleton lock");
 
-    super::serve(super::StartMode::ExitIfRunning).expect("a redundant instance exits clean");
+    super::serve(
+        super::StartMode::ExitIfRunning,
+        None,
+        &super::api::tls::CertSource::Lego,
+    )
+    .expect("a redundant instance exits clean");
 
     assert!(
         ghost.exists(),
@@ -1098,5 +1309,243 @@ fn drain_pending_switch_off_does_not_resurrect_a_deleted_row() {
             .find(&crate::profile::ProfileName::from("gamma"))
             .is_none(),
         "the deleted profile's row must not come back through the switch-off state save"
+    );
+}
+
+// ── CLAUTH_NO_API ───────────────────────────────────────────────────────────
+
+/// The kill switch pinned at its CALL SITE, not just its predicate: with
+/// `CLAUTH_NO_API=1` and a `--listen` address, `serve`'s listener decision must
+/// yield the no-api arm — no certificate read, nothing for
+/// `api::serve_prepared` to bind or import later. Deleting the `api_enabled()`
+/// guard from the start path (leaving the predicate test green) re-arms a
+/// listener the operator could only kill by editing the unit.
+///
+/// `Lego` (not a generated chain) and no `HomeSandbox` on purpose: under the
+/// opt-out the decision never reads the certificate, so the arm is decided by
+/// the env var alone. The pin's RED CHAIN is the certificate read: `prepare`
+/// looks up this host's FQDN, then finds lego's directory through
+/// `~/.clauth/tls.json` (which resolves `home_dir()`), so a regression that
+/// deletes the guard dies at the sandbox panic — "test resolved the operator's
+/// real home" — before any certificate file is opened, or at the `expect`
+/// below when the FQDN lookup fails first. Both `assert`s never evaluate on
+/// that edit; the panic is the red, and a legitimate one. A sandbox would
+/// deadlock the guard another way: `HomeSandbox` holds `HOME_TEST_LOCK` for
+/// the test's life and `with_no_api_env` takes it again.
+#[test]
+fn the_kill_switch_suppresses_the_listener_at_the_start_path() {
+    with_no_api_env(Some("1"), || {
+        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().expect("addr");
+        let (prepared, no_api) =
+            super::listener_setup(Some(addr), &super::api::tls::CertSource::Lego)
+                .expect("the opt-out is a decision, not a failure");
+        assert!(
+            prepared.is_none(),
+            "CLAUTH_NO_API=1 must suppress the listener at the start path"
+        );
+        assert_eq!(
+            no_api,
+            Some(addr),
+            "the opt-out still names the address it declined to serve"
+        );
+    });
+}
+
+/// `set_var`/`remove_var` are unsafe in Rust 2024 because they aren't
+/// thread-safe in a multi-threaded process. Serialized here by `HOME_TEST_LOCK`
+/// (the one mutex every env mutator across the suite takes) and undone before
+/// the closure returns, so no other thread observes a torn value.
+fn with_no_api_env<F: FnOnce()>(val: Option<&str>, f: F) {
+    let _guard = crate::profile::HOME_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let saved = std::env::var(super::NO_API_ENV).ok();
+    // SAFETY: test-only, serialized by the lock above, restored unconditionally.
+    unsafe {
+        match val {
+            Some(v) => std::env::set_var(super::NO_API_ENV, v),
+            None => std::env::remove_var(super::NO_API_ENV),
+        }
+    }
+    f();
+    // SAFETY: same as above.
+    unsafe {
+        match &saved {
+            Some(v) => std::env::set_var(super::NO_API_ENV, v),
+            None => std::env::remove_var(super::NO_API_ENV),
+        }
+    }
+}
+
+/// `CLAUTH_NO_API=1` and nothing else disables the listener.
+///
+/// The exact-`"1"` rule matters more here than for its siblings: this is the
+/// kill switch an operator reaches for when a listening socket has to go and the
+/// unit passing `--listen` cannot be edited. A build that also honoured `"true"`
+/// or `"0"` would silently drop the listener for someone who set it to `0`
+/// meaning "off, don't disable" — and the symptom is a remote client going dark,
+/// not an error anywhere.
+#[test]
+fn the_rest_api_is_disabled_only_by_exactly_one() {
+    with_no_api_env(None, || {
+        assert!(super::api_enabled(), "unset → the listener is available");
+    });
+    with_no_api_env(Some("1"), || {
+        assert!(!super::api_enabled(), "CLAUTH_NO_API=1 → no listener");
+    });
+    for other in ["0", "true", "yes", "", "11", " 1"] {
+        with_no_api_env(Some(other), || {
+            assert!(
+                super::api_enabled(),
+                "CLAUTH_NO_API={other:?} is not the opt-out spelling"
+            );
+        });
+    }
+}
+
+// ── publish_status: the switch-side republish ────────────────────────────────
+
+/// The feed currently sitting in the sandbox, as a `Value`.
+fn feed_on_disk() -> serde_json::Value {
+    let path = clauth_dir().expect("clauth dir").join("status.json");
+    serde_json::from_str(&std::fs::read_to_string(&path).expect("read status.json"))
+        .expect("status.json is json")
+}
+
+/// Seed a feed the daemon could have written, naming `active` at `stamp`.
+fn seed_feed(active: &str, stamp: &str) {
+    let dir = clauth_dir().expect("clauth dir");
+    crate::profile::mkdir_700(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("status.json"),
+        format!(r#"{{"schema":1,"generated_at":"{stamp}","active_profile":"{active}","pending_switch":null,"wrap_off":false,"refresh_interval_ms":120000,"profiles":[]}}"#),
+    )
+    .expect("seed status.json");
+}
+
+/// A switch landing outside the daemon republishes the feed, but keeps the
+/// daemon's last `generated_at`: readers (`clauth-tray`, the TUI's daemon dot)
+/// treat a fresh stamp as proof a daemon is alive, and stamping `now` from the
+/// CLI would forge that proof with no daemon running.
+#[test]
+fn a_non_daemon_publish_preserves_the_daemons_last_stamp() {
+    let _home = HomeSandbox::new();
+    let stamp = "2026-09-01T00:00:00+00:00";
+    seed_feed("alpha", stamp);
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "a-1"),
+            profile_with_creds("beta", "b-1"),
+        ],
+        Some("beta"),
+        120_000,
+    );
+
+    through_handle(config, super::publish_status);
+
+    let body = feed_on_disk();
+    assert_eq!(
+        body["generated_at"],
+        serde_json::json!(stamp),
+        "the stamp is the daemon's last write, not this publish's"
+    );
+    assert_eq!(body["active_profile"], serde_json::json!("beta"));
+}
+
+/// With nothing to preserve (no daemon has ever published here), the switch-side
+/// publish stamps the epoch rather than `now`: the file still names the account
+/// the operator switched to, while the staleness rule still reads "no daemon".
+#[test]
+fn a_non_daemon_publish_with_no_prior_feed_stamps_the_epoch() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![profile_with_creds("alpha", "a-1")],
+        Some("alpha"),
+        120_000,
+    );
+
+    through_handle(config, super::publish_status);
+
+    let body = feed_on_disk();
+    assert_eq!(
+        body["generated_at"],
+        serde_json::json!("1970-01-01T00:00:00+00:00")
+    );
+    assert_eq!(body["active_profile"], serde_json::json!("alpha"));
+}
+
+/// The daemon-owned form (the one the API's own switch republishes through)
+/// stamps `now` even over an old file: a live daemon's write is itself the
+/// freshness signal, so stamp preservation belongs to `publish_status` alone.
+#[test]
+fn a_direct_feed_write_stamps_now() {
+    let _home = HomeSandbox::new();
+    let stamp = "2026-09-01T00:00:00+00:00";
+    seed_feed("alpha", stamp);
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "a-1"),
+            profile_with_creds("beta", "b-1"),
+        ],
+        Some("beta"),
+        120_000,
+    );
+
+    super::write_status_feed(&config, None);
+
+    let body = feed_on_disk();
+    assert_ne!(
+        body["generated_at"],
+        serde_json::json!(stamp),
+        "a daemon-side write is a freshness signal in itself"
+    );
+    assert_eq!(body["active_profile"], serde_json::json!("beta"));
+}
+
+#[test]
+fn a_daemonless_publish_yields_to_a_feed_written_after_its_build_started() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            blank_profile(&crate::profile::ProfileName::from("a")),
+            blank_profile(&crate::profile::ProfileName::from("b")),
+        ],
+        Some("b"),
+        30_000,
+    );
+
+    let feed = clauth_dir().expect("feed dir").join("status.json");
+    let incumbent: &[u8] = br#"{"sentinel": "incumbent"}"#;
+    std::fs::write(&feed, incumbent).expect("seed incumbent feed");
+    set_mtime(&feed, SystemTime::now() + Duration::from_secs(3600));
+
+    let candidate: &[u8] = br#"{"active_profile": "b", "body": "candidate"}"#;
+    super::publish_status_json_if_current(&config, candidate, SystemTime::now());
+    assert_eq!(
+        std::fs::read(&feed).expect("reread feed"),
+        incumbent,
+        "a feed written after the build started must survive the late commit"
+    );
+
+    set_mtime(&feed, SystemTime::now() - Duration::from_secs(3600));
+    super::publish_status_json_if_current(&config, candidate, SystemTime::now());
+    assert_eq!(
+        std::fs::read(&feed).expect("reread feed"),
+        candidate,
+        "an older feed yields to the fresh body"
+    );
+
+    // The licensing rule is "stamped strictly before this build started": an
+    // exactly-equal stamp must skip too (on a coarse-stamp filesystem an
+    // equal stamp cannot prove the write preceded the build).
+    let other: &[u8] = br#"{"sentinel": "second"}"#;
+    std::fs::write(&feed, other).expect("reseed feed for the equality direction");
+    let boundary = SystemTime::now();
+    set_mtime(&feed, boundary);
+    super::publish_status_json_if_current(&config, candidate, boundary);
+    assert_eq!(
+        std::fs::read(&feed).expect("reread feed"),
+        other,
+        "an exactly-equal stamp must skip, not publish"
     );
 }

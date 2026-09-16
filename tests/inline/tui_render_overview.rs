@@ -8,7 +8,7 @@ use ratatui::style::Modifier;
 
 use crate::fallback::BlockedReason;
 use crate::profile::{AppState, ClaudeCredentials, OAuthToken, ProfileName};
-use crate::usage::{FetchStatus, UsageInfo, epoch_secs_to_iso, now_epoch_secs};
+use crate::usage::{FetchLeg, FetchStatus, UsageInfo, epoch_secs_to_iso, now_epoch_secs};
 use std::collections::BTreeMap;
 
 /// ISO reset `secs` in the future.
@@ -178,6 +178,41 @@ fn drain_rate_covers_third_party_windows_from_avg_pace() {
     );
 }
 
+/// A SEEDED third-party 5h window — `profile.usage` filled by the mirror the
+/// scheduler runs on provider-derived windows — must still rate from the
+/// window's own average pace: no third-party leg ever appends
+/// `usage_history.jsonl`, so the recency-weighted branch would resolve no rate
+/// at all and the countdown would lose the drain hue the bar-synthesized form
+/// carries. The guard is the cache-family predicate, not `usage.is_none()`.
+#[test]
+fn drain_rate_seeded_third_party_window_keeps_avg_pace() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut p = third_party_profile(60.0, 30.0);
+    p.usage = Some(UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 60.0,
+            resets_at: Some(reset_in(9_000)),
+        }),
+        seven_day: None,
+        ..Default::default()
+    });
+    let config = config_with(vec![p], None, vec![]);
+    let app = App::new(config);
+    let profile = &app.config().profiles[0];
+    let w = profile.usage.as_ref().unwrap().five_hour.clone().unwrap();
+    let rate = drain_rate(
+        &app,
+        &crate::profile::ProfileName::from("tp"),
+        profile,
+        LABEL_5H,
+        &w,
+    )
+    .expect("the avg pace answers for a seeded third-party window");
+    // 60% over the 2.5h elapsed half of a 5h window is past its 50% ideal
+    // line, so the cap applies: 70 / 3h ≈ 23.3 %/h, never `None`.
+    assert!((rate - 23.333).abs() < 0.1, "5h rate in %/h: {rate}");
+}
+
 /// An OAuth 5h window keeps the recency-weighted recent burn, not the avg pace:
 /// with no history recorded, it stays uncolored rather than falling back.
 #[test]
@@ -245,6 +280,7 @@ fn third_party_profile(five_pct: f64, seven_pct: f64) -> Profile {
             endpoint: None,
             best_effort: false,
         }),
+        usage_stale: false,
     }
 }
 
@@ -298,6 +334,7 @@ fn deepseek_profile(name: &str, totals: &[&str]) -> Profile {
             endpoint: None,
             best_effort: false,
         }),
+        usage_stale: false,
     }
 }
 
@@ -364,6 +401,7 @@ fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> Profile {
         fetch_status: None,
         provider: None,
         third_party_usage: None,
+        usage_stale: false,
     }
 }
 
@@ -436,6 +474,59 @@ fn partially_exhausted_chain_hides_resumes_hint() {
     assert!(
         resumes_line(&lines).is_none(),
         "must not show when the chain isn't fully exhausted"
+    );
+}
+
+/// A wallet-bearing active shows its runway beside the chain caption: the
+/// funded balance, its burn rate, and however long the two hold — the wallet
+/// sibling of the switch projection. No threshold, no warning hue; the
+/// operator judges the figure.
+#[test]
+fn a_wallet_bearing_active_shows_its_drains_line() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let ds = deepseek_profile("ds", &["63.34 CNY"]);
+    let config = config_with(vec![ds], Some("ds"), vec!["ds"]);
+    let mut app = App::new(config);
+    let now = crate::usage::now_ms();
+    // A dense hourly series for the funded wallet, falling 4.5 CNY/h —
+    // chronological, the order `load_wallet_history` hands the cache.
+    app.wallet_cache.insert(
+        "ds".to_string(),
+        (1..=12u64)
+            .rev()
+            .map(|hours_ago| crate::usage::WalletSample {
+                ts: now - hours_ago * 3_600_000,
+                label: "api balance".to_string(),
+                amount: 63.34 + 4.5 * hours_ago as f64,
+                currency: "CNY".to_string(),
+            })
+            .collect(),
+    );
+    let lines = fallback_flow_lines(&app, 60);
+    let drains = lines
+        .iter()
+        .map(line_text)
+        .find(|t| t.contains("drains in ~"))
+        .expect("a wallet-bearing active shows its runway");
+    assert!(
+        drains.contains("api balance drains in ~"),
+        "the line names the wallet it measures: {drains}"
+    );
+}
+
+/// An active with no balance series shows no drains line — a cold series is
+/// not a runway claim.
+#[test]
+fn a_wallet_bearing_active_without_a_series_shows_no_drains_line() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let ds = deepseek_profile("ds", &["63.34 CNY"]);
+    let config = config_with(vec![ds], Some("ds"), vec!["ds"]);
+    let app = App::new(config);
+    let lines = fallback_flow_lines(&app, 60);
+    assert!(
+        !lines.iter().map(line_text).any(|t| t.contains("drains in")),
+        "no series, no runway: {:?}",
+        lines.iter().map(line_text).collect::<Vec<_>>()
     );
 }
 
@@ -592,10 +683,10 @@ fn cached_row_colors_countdown_amber_and_underlines_nothing() {
     a.fetch_status = Some(FetchStatus::Cached);
     let config = config_with(vec![a], None, vec![]);
     let app = App::new(config);
-    app.next_refresh_per_profile
-        .lock()
-        .unwrap()
-        .insert("a".to_string(), now_ms() + 30_000);
+    app.next_refresh_per_profile.lock().unwrap().insert(
+        FetchLeg::OAuth.key(ProfileName::from("a")),
+        now_ms() + 30_000,
+    );
     let widths = OverviewWidths::new(80, &app);
     let line = render_overview_row(&app, 0, &widths, false, true);
     assert!(
@@ -626,10 +717,10 @@ fn failed_row_colors_countdown_red() {
     a.fetch_status = Some(FetchStatus::Failed);
     let config = config_with(vec![a], None, vec![]);
     let app = App::new(config);
-    app.next_refresh_per_profile
-        .lock()
-        .unwrap()
-        .insert("a".to_string(), now_ms() + 30_000);
+    app.next_refresh_per_profile.lock().unwrap().insert(
+        FetchLeg::OAuth.key(ProfileName::from("a")),
+        now_ms() + 30_000,
+    );
     let widths = OverviewWidths::new(80, &app);
     let line = render_overview_row(&app, 0, &widths, false, true);
     let bracket = line
@@ -770,12 +861,14 @@ fn credentialed_profile(name: &str, subscription_type: &str) -> Profile {
                 expires_at: None,
                 scopes: None,
                 subscription_type: Some(subscription_type.into()),
+                ..crate::profile::OAuthToken::default_extra()
             }),
         }),
         usage: None,
         fetch_status: None,
         provider: None,
         third_party_usage: None,
+        usage_stale: false,
     }
 }
 
@@ -900,6 +993,7 @@ fn oauth_creds() -> ClaudeCredentials {
             expires_at: None,
             scopes: None,
             subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
         }),
     }
 }
@@ -1177,8 +1271,14 @@ fn disabled_row_blanks_the_refresh_countdown_at_full_width() {
     let app = App::new(config);
     // Both profiles carry a live countdown in the shared map.
     if let Ok(mut m) = app.next_refresh_per_profile.lock() {
-        m.insert("a".to_string(), now_ms() + 42_000);
-        m.insert("b".to_string(), now_ms() + 42_000);
+        m.insert(
+            FetchLeg::OAuth.key(ProfileName::from("a")),
+            now_ms() + 42_000,
+        );
+        m.insert(
+            FetchLeg::OAuth.key(ProfileName::from("b")),
+            now_ms() + 42_000,
+        );
     }
     let widths = OverviewWidths::new(110, &app);
 
@@ -1769,6 +1869,36 @@ fn the_live_column_is_dropped_rather_than_clipped_when_it_does_not_fit() {
     }
 }
 
+/// The live column must be monotone in the list-area inner width (`total`):
+/// once it is present at some width it is present at every wider width, and it
+/// never disappears as the terminal narrows. The tier ladders jump several
+/// cells at a time, so the raw fit predicate alone would blink the column on
+/// and off while resizing.
+///
+/// This inner width is 4 cells narrower than the terminal width the render
+/// smoke test sweeps: the accounts panel takes 2 border cells + 2 horizontal
+/// padding cells. Floors here therefore read 4 lower than that test's.
+#[test]
+fn live_column_width_is_monotone_in_inner_width() {
+    for max_name in 8..=22 {
+        let mut prev = None;
+        for total in 30..=200 {
+            let width = live_column_width(max_name, total);
+            if let Some(prev_w) = prev
+                && width != prev_w
+            {
+                assert_eq!(
+                    (prev_w, width),
+                    (0, LIVE_W),
+                    "live column must only appear (0 -> LIVE_W), never drop or \
+                     flip, at name {max_name}, total {total} ({prev_w} -> {width})",
+                );
+            }
+            prev = Some(width);
+        }
+    }
+}
+
 // ── DeepSeek balance in the 5h column ──────────────────────────────────────
 
 /// The cell sitting under the `5h` header on `row`, padding included. Finds the
@@ -2167,4 +2297,259 @@ fn codex_rows_read_the_roster_and_its_own_cache() {
         rows[1].plan.is_none() && rows[1].five_hour.is_none(),
         "a never-polled account shows no data rather than a fabricated reading"
     );
+}
+
+/// The 7d cell text, padding included, under the `7d` header; empty when the
+/// column is dropped. Mirrors `five_hour_cell_text` so the pin proves the cell
+/// sits under its own header, not just that a stamp exists somewhere on the row.
+fn seven_day_cell_text(widths: &OverviewWidths, row: &Line<'static>) -> String {
+    if widths.seven_day == 0 {
+        return String::new();
+    }
+    let header = line_text(&overview_header(widths, false));
+    let col = header
+        .find("7d")
+        .expect("the accounts table carries a `7d` header");
+    line_text(row)
+        .chars()
+        .skip(col)
+        .take(widths.seven_day)
+        .collect()
+}
+
+/// A 12-char account row under `reset_display = both` must never lose its 5h
+/// wall-clock stamp (`· HH:MM`) while the 7d column still paints only the bare
+/// `XX%`. The 7d tier at inner totals 93..101 reserved 17 cells for a bar but
+/// painted 4 (the bar gate is `widths.seven_day >= 18`), so the 5h clock bonus
+/// starved and the stamp dropped between 96 and 97 terminal cols with nothing
+/// gained.
+///
+/// Sweeps TERMINAL widths 40..=170; each render runs in the list-area inner
+/// width 4 cells narrower (the accounts panel's 2 border cells + 1 padding cell
+/// per side, same offset the render smoke test pins). Asserts the 7d stamp map
+/// stays monotone and every 5h-stamp loss is paid for by a newly appeared 7d
+/// bar, then pins the 96/97 boundary in both directions.
+#[test]
+fn five_hour_stamp_never_lost_without_a_7d_bar_gain() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut p = profile("aaaaaaaaaaaa", 40.0, 60.0, 3 * 3600 + 1800);
+    if let Some(ref mut usage) = p.usage {
+        usage.seven_day = Some(UsageWindow {
+            utilization: 60.0,
+            resets_at: Some(reset_in(4 * 86400 + 43200)),
+        });
+    }
+    let mut config = config_with(vec![p], None, vec![]);
+    config.state.reset_display = Some(crate::profile::ResetDisplay::Both);
+    let app = App::new(config);
+
+    let mut five_stamp = Vec::with_capacity((170 - 40 + 1) as usize);
+    let mut seven_stamp = Vec::with_capacity((170 - 40 + 1) as usize);
+    let mut seven_bar = Vec::with_capacity((170 - 40 + 1) as usize);
+
+    for terminal in 40u16..=170 {
+        let widths = OverviewWidths::new(terminal - 4, &app);
+        let row = render_overview_row(&app, 0, &widths, false, false);
+        let five = five_hour_cell_text(&widths, false, &row);
+        let seven = seven_day_cell_text(&widths, &row);
+        five_stamp.push(five.contains('·'));
+        seven_stamp.push(seven.contains('·'));
+        seven_bar.push(seven.contains('['));
+    }
+
+    // The 7d stamp never blinks: once it appears at some width it stays at
+    // every wider width, like the live column.
+    for i in 1..seven_stamp.len() {
+        assert!(
+            !seven_stamp[i - 1] || seven_stamp[i],
+            "7d stamp disappears at terminal width {}",
+            40 + i
+        );
+    }
+
+    // A width that drops the 5h stamp must newly show the 7d bar at that same
+    // width, so the loss is a real trade, never a bare gutter.
+    for i in 1..five_stamp.len() {
+        if five_stamp[i - 1] && !five_stamp[i] {
+            assert!(
+                seven_bar[i] && !seven_bar[i - 1],
+                "5h stamp lost with no new 7d bar at terminal width {}",
+                40 + i
+            );
+        }
+    }
+
+    // The measured boundary, pinned in both directions: 96 and 97 cols both
+    // keep the stamp. Before the fix 97 dropped it while 96 kept it.
+    assert!(five_stamp[96 - 40], "5h stamp present at 96 cols");
+    assert!(
+        five_stamp[97 - 40],
+        "5h stamp present at 97 cols (the defect width)"
+    );
+}
+
+// ── peak-rate marker (▲) ─────────────────────────────────────────────────────
+
+/// A table whose `deepseek` store key holds one model with a flat base plus a
+/// `start`–`end` window: "00:00"–"24:00" covers every hour (peak whatever the
+/// real clock says), "12:00"–"12:00" no hour (never peak) — the two
+/// deterministic fixtures the marker tests need, time-independent by
+/// construction. The store-key shape is the point: the indicator is
+/// provider-bound, so the table must carry the provider's own store row.
+fn windowed_table(start: &str, end: &str) -> crate::pricing::PriceTable {
+    crate::pricing::PriceTable::store_key_table(
+        "deepseek",
+        crate::pricing::PricedModel {
+            id: "deepseek-v4-pro".to_owned(),
+            prices: vec![
+                crate::pricing::PriceEntry {
+                    input: 0.5,
+                    output: 1.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                    constraint: None,
+                    window_only: false,
+                },
+                crate::pricing::PriceEntry {
+                    input: 1.0,
+                    output: 2.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                    constraint: Some(crate::pricing::Constraint::TimeWindow {
+                        start: start.to_owned(),
+                        end: end.to_owned(),
+                    }),
+                    window_only: false,
+                },
+            ],
+            effective_at: None,
+        },
+        "2026-01-01",
+    )
+}
+
+/// A profile on the deepseek endpoint — the provider whose store rows the
+/// fixture tables carry — over the shared `profile` fixture shape. The peak
+/// marker is provider-bound: what the profile pins never feeds it.
+fn peak_profile(name: &str) -> Profile {
+    let mut p = profile(name, 40.0, 20.0, 3600);
+    p.base_url = Some("https://api.deepseek.com/anthropic".into());
+    p.provider = Some(crate::providers::Provider::DeepSeek);
+    p
+}
+
+/// An active profile on peak hours keeps its `●` — the active dot outranks
+/// the peak marker, so `▲` never takes its slot.
+#[test]
+fn active_dot_outranks_the_peak_marker() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let config = config_with(vec![peak_profile("a")], Some("a"), vec![]);
+    let mut app = App::new(config);
+    app.price_table = Some(windowed_table("00:00", "24:00"));
+    let widths = OverviewWidths::new(80, &app);
+    let line = render_overview_row(&app, 0, &widths, false, true);
+    let text = line_text(&line);
+    assert!(text.contains('●'), "active peak row keeps ●: {text}");
+    assert!(
+        !text.contains('▲'),
+        "the dot outranks the peak marker: {text}"
+    );
+    let marker = line.spans.iter().find(|s| s.content == "●").unwrap();
+    assert_eq!(marker.style.fg, Some(theme::accent_2_color()));
+}
+
+/// A non-active profile on peak hours shows `▲` — the marker names the
+/// surcharged rate on every row the active dot doesn't already claim.
+#[test]
+fn peak_marker_renders_on_inactive_rows() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let config = config_with(
+        vec![peak_profile("a"), peak_profile("b")],
+        Some("a"),
+        vec![],
+    );
+    let mut app = App::new(config);
+    app.price_table = Some(windowed_table("00:00", "24:00"));
+    let widths = OverviewWidths::new(80, &app);
+    let line = render_overview_row(&app, 1, &widths, false, true);
+    let text = line_text(&line);
+    assert!(text.contains('▲'), "inactive peak row renders ▲: {text}");
+    assert!(
+        !text.contains('●'),
+        "no active dot on the inactive row: {text}"
+    );
+    let marker = line.spans.iter().find(|s| s.content == "▲").unwrap();
+    assert_eq!(marker.style.fg, theme::warning().fg);
+}
+
+/// A disabled non-active profile on peak hours keeps its `▲` glyph, but the
+/// `hue` closure flattens it to dim like every other marker on a disabled row.
+#[test]
+fn disabled_peak_row_dims_the_marker() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut p = peak_profile("a");
+    p.disabled = true;
+    let config = config_with(vec![p], None, vec![]);
+    let mut app = App::new(config);
+    app.price_table = Some(windowed_table("00:00", "24:00"));
+    let widths = OverviewWidths::new(80, &app);
+    let line = render_overview_row(&app, 0, &widths, false, true);
+    let text = line_text(&line);
+    assert!(text.contains('▲'), "disabled peak row keeps ▲: {text}");
+    let marker = line.spans.iter().find(|s| s.content == "▲").unwrap();
+    assert_eq!(
+        marker.style.fg,
+        theme::dim().fg,
+        "the ▲ dims like every marker on a disabled row"
+    );
+}
+
+/// A profile whose window is never active (off-peak by fixture) keeps its
+/// `●` and renders no `▲` — off-peak is the resting state and stays clean.
+#[test]
+fn off_peak_row_keeps_the_active_dot() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    // An empty window ("12:00"–"12:00") is active at no hour.
+    let config = config_with(vec![peak_profile("a")], Some("a"), vec![]);
+    let mut app = App::new(config);
+    app.price_table = Some(windowed_table("12:00", "12:00"));
+    let widths = OverviewWidths::new(80, &app);
+    let text = line_text(&render_overview_row(&app, 0, &widths, false, true));
+    assert!(text.contains('●'), "off-peak active row keeps ●: {text}");
+    assert!(!text.contains('▲'), "no peak marker off-peak: {text}");
+}
+
+/// A usage alert (`!`) outranks the peak marker, like every other marker.
+#[test]
+fn bell_outranks_the_peak_marker() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let config = config_with(vec![peak_profile("a")], Some("a"), vec![]);
+    let mut app = App::new(config);
+    app.price_table = Some(windowed_table("00:00", "24:00"));
+    app.bell_fired.insert("a".into(), true);
+    let widths = OverviewWidths::new(80, &app);
+    let text = line_text(&render_overview_row(&app, 0, &widths, false, true));
+    assert!(text.contains('!'), "{text}");
+    assert!(
+        !text.contains('▲'),
+        "bell yields to nothing but ⊖×⊘: {text}"
+    );
+}
+
+/// Without a price table (still loading, or a failed fetch) no row claims
+/// peak — an element with no status shows nothing.
+#[test]
+fn no_table_no_peak_marker() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = config_with(vec![peak_profile("a")], Some("a"), vec![]);
+    let app = App::new(config);
+    let widths = OverviewWidths::new(80, &app);
+    let text = line_text(&render_overview_row(&app, 0, &widths, false, true));
+    assert!(!text.contains('▲'), "no table, no marker: {text}");
+    assert!(text.contains('●'), "the active dot is untouched: {text}");
 }
