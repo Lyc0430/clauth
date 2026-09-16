@@ -427,6 +427,13 @@ pub(crate) struct PlanInfo {
     /// contract the `PlanTier` serde note carries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) subscription_status: Option<String>,
+    /// The codex account's plan, verbatim from `wham/usage`'s `plan_type`
+    /// (`plus`/`pro`/`go`/`prolite`/`team`/`business`/…). Held as its own field
+    /// rather than folded into [`PlanTier`], whose every label spells
+    /// "Claude <tier>" — which would render a ChatGPT Pro account as "Claude
+    /// Pro". A claude profile never sets it; a codex profile never sets `tier`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) codex_plan: Option<String>,
 }
 
 impl PlanInfo {
@@ -457,6 +464,17 @@ pub(crate) struct UsageInfo {
     pub(crate) extra_usage: Option<ExtraUsage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) spend: Option<SpendInfo>,
+    /// codex's `rate_limit_reached_type.type` when the server says the account
+    /// is blocked (`rate_limit_reached`, `workspace_owner_credits_depleted`, …).
+    /// The BLOCK itself is already folded into the window's utilization; this is
+    /// the reason, for a surface that wants to say why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) codex_limit_reached: Option<String>,
+    /// Banked reset credits (`rate_limit_reset_credits.available_count`): passes
+    /// the account can spend to reopen a window early. Rides the same response,
+    /// so it costs no extra request; clauth reads it and never spends one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) codex_reset_credits: Option<i64>,
     /// The authoritative 5h-window open instant, in epoch seconds. Present only
     /// on the synthetic stamp a landed kick wrote ([`crate::usage::scheduler`]'s
     /// `mark_window_open`): a history line carrying it is clauth's own durable
@@ -828,7 +846,8 @@ struct RawProfileOrg {
 /// distinguish a 401 (refresh + retry) from a connection blip (cache); a 429
 /// gets its own variant carrying the server's `retry-after` hint (rate-limited,
 /// cache — never rotate, defer the next attempt).
-pub(super) enum FetchError {
+#[derive(Debug)]
+pub(crate) enum FetchError {
     Status(u16),
     /// HTTP 429. `retry_after` is the server's `retry-after` header when
     /// present (delta-seconds or an IMF HTTP-date); an unparseable value is
@@ -1139,6 +1158,8 @@ fn plan_from_profile(p: &RawProfile) -> PlanInfo {
             org.and_then(|o| o.rate_limit_tier.as_deref()),
         ),
         subscription_status: org.and_then(|o| o.subscription_status.clone()),
+        // The claude leg never reads a codex plan.
+        codex_plan: None,
     }
 }
 
@@ -1198,6 +1219,9 @@ fn assemble_usage(
                 window_dollars: windows.window_dollars,
                 extra_usage: raw.extra_usage,
                 spend,
+                // Codex-only readings: the claude body carries neither.
+                codex_limit_reached: None,
+                codex_reset_credits: None,
                 open_at: None,
                 fetched_at: None,
             })
@@ -1217,7 +1241,7 @@ fn assemble_usage(
 /// `/usage` 429 no longer suppresses `/profile`: the profile leg still runs and
 /// its plan rides the error, so a canceled (`claude_free`) account — observed to
 /// 429 `/usage` on every tick so far — is finally observed.
-pub(super) fn fetch_raw(
+pub(crate) fn fetch_raw(
     name: &ProfileName,
     access_token: &str,
     prev_plan: Option<PlanInfo>,

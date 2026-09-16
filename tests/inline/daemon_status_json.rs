@@ -67,7 +67,11 @@ fn build_status_top_level_shape_and_active() {
     assert_eq!(
         top,
         [
+            "active_codex_profile",
             "active_profile",
+            "clauth_version",
+            "codex_fallback_chain",
+            "codex_wrap_off",
             "generated_at",
             "pending_switch",
             "profiles",
@@ -99,6 +103,7 @@ fn build_status_top_level_shape_and_active() {
             "fallback",
             "fetch_status",
             "fetched_at",
+            "harness",
             "has_live_session",
             "name",
             "next_refresh_at",
@@ -1387,6 +1392,159 @@ fn published_entries_deserialize_into_the_typed_contract() {
     assert_eq!(win_keys, ["label", "resets_at", "utilization_pct"]);
 }
 
+/// The codex half of the feed is ADDITIVE (decision 10): the top-level
+/// `active_profile`/`wrap_off` stay the CLAUDE slots, the per-harness ones sit
+/// beside them, and codex entries are APPENDED so a reader that predates codex
+/// takes the prefix it always took.
+#[test]
+fn the_codex_surface_is_additive_and_appended() {
+    let home = crate::testutil::HomeSandbox::new();
+    let dir = home.home().join(".clauth");
+    crate::profile::mkdir_700(&dir).expect("mkdir .clauth");
+    std::fs::write(
+        dir.join("codex-profiles.toml"),
+        "active_profile = \"cx1\"\nprofiles = [\"cx1\", \"cx2\"]\nfallback_chain = [\"cx1\", \"cx2\"]\nwrap_off = true\n",
+    )
+    .expect("write codex state");
+
+    let config = crate::profile::AppConfig {
+        state: crate::profile::AppState {
+            profiles: vec!["cl".into()],
+            active_profile: Some("cl".into()),
+            ..Default::default()
+        },
+        profiles: vec![crate::testutil::blank_profile(
+            &crate::profile::ProfileName::from("cl"),
+        )],
+    };
+    let v = serde_json::to_value(build_status(&config, 300_000, None, false))
+        .expect("the status body serializes");
+
+    assert_eq!(
+        v["active_profile"], "cl",
+        "the top-level slot stays CLAUDE's"
+    );
+    assert_eq!(v["wrap_off"], false, "…and so does the top-level wrap-off");
+    assert_eq!(v["active_codex_profile"], "cx1");
+    assert_eq!(v["codex_wrap_off"], true, "the codex slot carries its own");
+    assert_eq!(
+        v["codex_fallback_chain"].as_array().unwrap().len(),
+        2,
+        "the codex chain is published beside the claude one"
+    );
+    assert!(
+        v["clauth_version"].as_str().is_some_and(|s| !s.is_empty()),
+        "the writer names itself, so an old daemon is distinguishable from an empty roster"
+    );
+
+    let profiles = v["profiles"].as_array().unwrap();
+    assert_eq!(profiles[0]["name"], "cl");
+    assert_eq!(profiles[0]["harness"], "claude");
+    assert_eq!(
+        profiles.iter().filter(|p| p["harness"] == "codex").count(),
+        2,
+        "both codex accounts are entries, after the claude ones"
+    );
+    let cx1 = profiles.iter().find(|p| p["name"] == "cx1").expect("cx1");
+    assert_eq!(
+        cx1["active"], true,
+        "the codex active marker is the codex slot's"
+    );
+    // One load feeds both halves: the entries' flags name exactly the profile
+    // the top-level slot names, in one body.
+    let flagged: Vec<&str> = profiles
+        .iter()
+        .filter(|p| p["harness"] == "codex" && p["active"] == true)
+        .filter_map(|p| p["name"].as_str())
+        .collect();
+    assert_eq!(flagged, [v["active_codex_profile"].as_str().unwrap()]);
+    assert_eq!(cx1["provider"], "openai");
+    assert_eq!(
+        cx1["rolling_token"], false,
+        "a rolling sidecar is a claude mechanism; codex holds one chain in one auth.json"
+    );
+    assert!(
+        cx1["tier"].is_null(),
+        "no reading yet means no plan — never a fabricated Claude tier"
+    );
+}
+
+/// The codex `tier`: the plan a poll cached is authoritative, the id_token's
+/// `chatgpt_plan_type` claim stands in while no poll has answered (settled
+/// question 5), and no claim plus no cache stays `null`. `auth_status` reads
+/// `broken` off the quarantine record ahead of the cache-derived grades.
+#[test]
+fn codex_entries_fall_back_to_the_id_token_plan_and_publish_broken() {
+    let home = crate::testutil::HomeSandbox::new();
+    let dir = home.home().join(".clauth");
+    crate::profile::mkdir_700(&dir).expect("mkdir .clauth");
+    std::fs::write(
+        dir.join("codex-profiles.toml"),
+        "profiles = [\"claimed\", \"polled\", \"bare\", \"dead\"]\n",
+    )
+    .expect("write codex state");
+    let with_plan = |plan: &str| {
+        let id_token = crate::testutil::codex_jwt(&format!(
+            r#"{{"https://api.openai.com/auth":{{"chatgpt_account_id":"acc","chatgpt_plan_type":"{plan}"}}}}"#
+        ));
+        format!(
+            r#"{{"tokens":{{"id_token":"{id_token}","access_token":"at","refresh_token":"rt"}}}}"#
+        )
+    };
+    // Captured, never polled: the claim (normalized like the live plan).
+    crate::testutil::write_codex_store("claimed", &with_plan(" Plus "));
+    // Polled: the cache wins over a claim that disagrees.
+    crate::testutil::write_codex_store("polled", &with_plan("plus"));
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("polled"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::map_codex_usage(
+            r#"{"plan_type":"pro","rate_limit":{"primary_window":{"used_percent":3,"limit_window_seconds":18000,"reset_after_seconds":3600}}}"#,
+            crate::usage::now_epoch_secs(),
+        )
+        .expect("maps"),
+    );
+    // No claim, no cache.
+    crate::testutil::write_codex_store(
+        "bare",
+        r#"{"tokens":{"access_token":"at","refresh_token":"rt"}}"#,
+    );
+    // A chain the server declared dead.
+    crate::testutil::write_codex_store(
+        "dead",
+        &crate::testutil::codex_auth_body(&crate::testutil::jwt_with_exp(1_700_000_060), "rt.a"),
+    );
+    let invalidated = |_t: &str| -> Result<
+        crate::codex_auth::CodexTokenResponse,
+        crate::codex_auth::CodexRefreshError,
+    > { Err(crate::codex_auth::CodexRefreshError::Dead("invalidated")) };
+    assert_eq!(
+        crate::codex_auth::standby_pass(
+            "dead",
+            1_700_000_000_000,
+            "2026-08-13T00:00:00Z".into(),
+            &invalidated
+        ),
+        crate::codex_auth::StandbyOutcome::Failed
+    );
+
+    let codex = crate::codex_profiles::CodexState::load().expect("load");
+    let entries = build_codex_entries(&codex, 300_000);
+    let by_name = |name: &str| {
+        entries
+            .iter()
+            .find(|e| e.name.as_str() == name)
+            .unwrap_or_else(|| panic!("{name} is an entry"))
+    };
+    assert_eq!(by_name("claimed").tier.as_deref(), Some("plus"));
+    assert_eq!(by_name("claimed").auth_status, "unknown");
+    assert_eq!(by_name("polled").tier.as_deref(), Some("pro"));
+    assert_eq!(by_name("polled").auth_status, "ok");
+    assert_eq!(by_name("bare").tier, None);
+    assert_eq!(by_name("dead").auth_status, "broken");
+    assert_eq!(by_name("dead").tier, None);
+}
+
 /// The feed must publish the queue the ELECTION is running, not a wider one.
 /// `auto_start_queue_members` drops switch-grade kick-blocked profiles, and the
 /// scheduler and the TUI both supply that set — the feed used to pass an empty
@@ -1549,7 +1707,11 @@ fn status_body_matches_legacy_json_bytes() {
         active_profile: Some("work".to_string()),
         pending_switch: Some("later".to_string()),
         wrap_off: true,
+        active_codex_profile: Some("cx".to_string()),
+        codex_fallback_chain: vec!["cx".into()],
+        codex_wrap_off: true,
         refresh_interval_ms: 300_000,
+        clauth_version: "9.9.9".to_string(),
         profiles: vec![
             ProfileEntry {
                 name: "all-some".into(),
@@ -1558,6 +1720,7 @@ fn status_body_matches_legacy_json_bytes() {
                 provider: "anthropic".to_string(),
                 base_url: Some("https://api.anthropic.com".to_string()),
                 tier: Some("Max 5x".to_string()),
+                harness: "claude".to_string(),
                 has_live_session: true,
                 auth_status: "ok".to_string(),
                 fetch_status: Some("Fresh".to_string()),
@@ -1596,6 +1759,7 @@ fn status_body_matches_legacy_json_bytes() {
                 provider: "anthropic".to_string(),
                 base_url: None,
                 tier: None,
+                harness: "claude".to_string(),
                 has_live_session: false,
                 auth_status: "ok".to_string(),
                 fetch_status: None,
@@ -1616,6 +1780,7 @@ fn status_body_matches_legacy_json_bytes() {
                 provider: "anthropic".to_string(),
                 base_url: None,
                 tier: None,
+                harness: "codex".to_string(),
                 has_live_session: false,
                 auth_status: "ok".to_string(),
                 fetch_status: None,
@@ -1636,9 +1801,11 @@ fn status_body_matches_legacy_json_bytes() {
     };
     let expected = concat!(
         r#"{"schema":2,"generated_at":"2026-09-13T00:00:00Z","active_profile":"work","#,
-        r#""pending_switch":"later","wrap_off":true,"refresh_interval_ms":300000,"profiles":["#,
+        r#""pending_switch":"later","wrap_off":true,"active_codex_profile":"cx","#,
+        r#""codex_fallback_chain":["cx"],"codex_wrap_off":true,"refresh_interval_ms":300000,"#,
+        r#""clauth_version":"9.9.9","profiles":["#,
         r#"{"name":"all-some","active":true,"rolling_token":true,"provider":"anthropic","#,
-        r#""base_url":"https://api.anthropic.com","tier":"Max 5x","has_live_session":true,"#,
+        r#""base_url":"https://api.anthropic.com","tier":"Max 5x","harness":"claude","has_live_session":true,"#,
         r#""auth_status":"ok","fetch_status":"Fresh","stale":true,"fetched_at":"2026-09-13T00:00:00Z","#,
         r#""next_refresh_at":"2026-09-13T00:05:00Z","auto_start":true,"#,
         r#""auto_start_queue":{"position":1,"next_open_at":"2026-09-13T00:05:00Z"},"#,
@@ -1647,12 +1814,12 @@ fn status_body_matches_legacy_json_bytes() {
         r#"{"label":"7d","utilization_pct":13.123456789,"resets_at":null}],"#,
         r#""third_party":{"available":true}},"#,
         r#"{"name":"all-none","active":false,"rolling_token":false,"provider":"anthropic","#,
-        r#""base_url":null,"tier":null,"has_live_session":false,"auth_status":"ok","#,
+        r#""base_url":null,"tier":null,"harness":"claude","has_live_session":false,"auth_status":"ok","#,
         r#""fetch_status":null,"stale":false,"fetched_at":null,"next_refresh_at":null,"#,
         r#""auto_start":false,"auto_start_queue":null,"bell_threshold":null,"fallback":null,"#,
         r#""windows":[],"third_party":null},"#,
         r#"{"name":"null-stamp","active":false,"rolling_token":false,"provider":"anthropic","#,
-        r#""base_url":null,"tier":null,"has_live_session":false,"auth_status":"ok","#,
+        r#""base_url":null,"tier":null,"harness":"codex","has_live_session":false,"auth_status":"ok","#,
         r#""fetch_status":null,"stale":false,"fetched_at":null,"next_refresh_at":null,"#,
         r#""auto_start":true,"auto_start_queue":{"position":2,"next_open_at":null},"#,
         r#""bell_threshold":null,"fallback":null,"windows":[],"third_party":null}]}"#,
@@ -1665,12 +1832,18 @@ fn status_body_matches_legacy_json_bytes() {
         active_profile: None,
         pending_switch: None,
         wrap_off: false,
+        active_codex_profile: None,
+        codex_fallback_chain: vec![],
+        codex_wrap_off: false,
         refresh_interval_ms: 60_000,
+        clauth_version: "9.9.9".to_string(),
         profiles: vec![],
     };
     let expected = concat!(
         r#"{"schema":2,"generated_at":"2026-09-13T00:00:00Z","active_profile":null,"#,
-        r#""pending_switch":null,"wrap_off":false,"refresh_interval_ms":60000,"profiles":[]}"#,
+        r#""pending_switch":null,"wrap_off":false,"active_codex_profile":null,"#,
+        r#""codex_fallback_chain":[],"codex_wrap_off":false,"refresh_interval_ms":60000,"#,
+        r#""clauth_version":"9.9.9","profiles":[]}"#,
     );
     assert_eq!(serde_json::to_string(&body).unwrap(), expected);
 }
@@ -1883,6 +2056,7 @@ fn status_body_never_leaks_a_credential() {
         plan: Some(crate::usage::PlanInfo {
             tier: crate::usage::PlanTier::Pro,
             subscription_status: Some("active".to_string()),
+            codex_plan: None,
         }),
         five_hour: Some(window(utilization, 3)),
         seven_day: Some(window(13.0, 72)),
@@ -2245,6 +2419,7 @@ fn status_schema_agrees_with_the_serialized_body() {
         plan: Some(crate::usage::PlanInfo {
             tier: crate::usage::PlanTier::Pro,
             subscription_status: Some("active".to_string()),
+            codex_plan: None,
         }),
         five_hour: Some(window(42.0, 3)),
         seven_day: Some(window(13.0, 72)),

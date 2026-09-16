@@ -225,7 +225,7 @@ pub(crate) struct DeviceName(String);
 
 impl DeviceName {
     pub(crate) fn parse(raw: &str) -> Result<Self> {
-        crate::actions::validate_profile_name(raw, &[], None)?;
+        crate::actions::validate_name_chars(raw)?;
         let name = raw.trim();
         if name.eq_ignore_ascii_case(LEGACY_NAME) {
             bail!(

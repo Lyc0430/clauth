@@ -8,6 +8,7 @@
 **Reference**
 - [Configuration](Configuration)
 - [Auto-switch](Auto-Switch)
+- [Codex](Codex)
 - [Tokens and cost](Tokens-And-Cost)
 - [Security](Security)
 

@@ -393,6 +393,7 @@ fn account_tier_reads_the_fetched_tier_only_the_canceled_marker_is_on_the_status
         plan: Some(PlanInfo {
             tier: PlanTier::Free,
             subscription_status: Some("canceled".to_string()),
+            codex_plan: None,
         }),
         ..Default::default()
     });
@@ -405,6 +406,7 @@ fn account_tier_reads_the_fetched_tier_only_the_canceled_marker_is_on_the_status
         plan: Some(PlanInfo {
             tier: PlanTier::Free,
             subscription_status: None,
+            codex_plan: None,
         }),
         ..Default::default()
     });
@@ -443,6 +445,7 @@ fn account_tier_reports_no_tier_for_an_unfetched_plan() {
         plan: Some(PlanInfo {
             tier: PlanTier::Unknown,
             subscription_status: None,
+            codex_plan: None,
         }),
         ..Default::default()
     });
@@ -472,6 +475,7 @@ fn account_tier_falls_through_an_unclassified_fetched_plan_to_the_token() {
             plan: Some(PlanInfo {
                 tier,
                 subscription_status: None,
+                codex_plan: None,
             }),
             ..Default::default()
         })
@@ -527,6 +531,7 @@ fn account_tier_still_renders_every_known_tier() {
         plan: Some(PlanInfo {
             tier: PlanTier::Max(Some(20)),
             subscription_status: None,
+            codex_plan: None,
         }),
         ..Default::default()
     });
@@ -537,6 +542,7 @@ fn account_tier_still_renders_every_known_tier() {
         plan: Some(PlanInfo {
             tier: PlanTier::Free,
             subscription_status: None,
+            codex_plan: None,
         }),
         ..Default::default()
     });

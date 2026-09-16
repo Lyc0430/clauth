@@ -354,11 +354,63 @@ pub(crate) fn serve_endpoints(
 /// [`serve_endpoints`] that also hands back each request's BODY, for a leg
 /// whose correctness is in what it sent (the paste door's `redirect_uri` and
 /// `state`) rather than in which endpoint it reached. Same listener, same
-/// deadlines; `serve_endpoints` is a projection of this one.
+/// deadlines; `serve_endpoints` is a projection of this one, and this one of
+/// [`serve_endpoints_raw`].
 pub(crate) fn serve_endpoints_recording(
     max: usize,
     reply: impl Fn(&str, usize) -> (u16, String) + Send + 'static,
 ) -> (String, std::thread::JoinHandle<Vec<(String, String)>>) {
+    let (base, inner) = serve_endpoints_raw(max, reply);
+    let handle = std::thread::spawn(move || {
+        inner
+            .join()
+            .expect("raw listener")
+            .into_iter()
+            .map(|raw| (request_path(&raw), request_body(&raw)))
+            .collect()
+    });
+    (base, handle)
+}
+
+/// The request path off a raw request text, as the listener saw it.
+pub(crate) fn request_path(raw: &str) -> String {
+    raw.lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .unwrap_or("")
+        .to_string()
+}
+
+/// The body off a raw request text: everything past the header terminator.
+pub(crate) fn request_body(raw: &str) -> String {
+    raw.split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_string())
+        .unwrap_or_default()
+}
+
+/// One header's value off a raw request text, matched case-insensitively the
+/// way a server reads it; `None` when the request never sent it.
+pub(crate) fn request_header(raw: &str, name: &str) -> Option<String> {
+    raw.split_once("\r\n\r\n")
+        .map_or(raw, |(head, _)| head)
+        .lines()
+        .skip(1)
+        .find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim()
+                .eq_ignore_ascii_case(name)
+                .then(|| value.trim().to_string())
+        })
+}
+
+/// The listener under [`serve_endpoints_recording`]: hands back each request's
+/// RAW text, headers included, for a leg whose correctness is in a header it
+/// sent (a bearer token, an account id, a content type). Same deadlines as the
+/// projections above.
+pub(crate) fn serve_endpoints_raw(
+    max: usize,
+    reply: impl Fn(&str, usize) -> (u16, String) + Send + 'static,
+) -> (String, std::thread::JoinHandle<Vec<String>>) {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::time::{Duration, Instant};
@@ -374,7 +426,7 @@ pub(crate) fn serve_endpoints_recording(
         .set_nonblocking(true)
         .expect("nonblocking listener");
     let handle = std::thread::spawn(move || {
-        let mut seen: Vec<(String, String)> = Vec::new();
+        let mut seen: Vec<String> = Vec::new();
         for i in 0..max {
             let deadline = Instant::now()
                 + if seen.is_empty() {
@@ -424,17 +476,7 @@ pub(crate) fn serve_endpoints_recording(
                 }
             }
             let text = String::from_utf8_lossy(&req).into_owned();
-            let path = text
-                .lines()
-                .next()
-                .and_then(|l| l.split_whitespace().nth(1))
-                .unwrap_or("")
-                .to_string();
-            let request_body = text
-                .split_once("\r\n\r\n")
-                .map(|(_, b)| b.to_string())
-                .unwrap_or_default();
-            let (status, body) = reply(&path, i);
+            let (status, body) = reply(&request_path(&text), i);
             let _ = sock.write_all(
                 format!(
                     "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
@@ -445,7 +487,7 @@ pub(crate) fn serve_endpoints_recording(
             );
             let _ = sock.write_all(body.as_bytes());
             let _ = sock.shutdown(std::net::Shutdown::Write);
-            seen.push((path, request_body));
+            seen.push(text);
         }
         seen
     });
@@ -547,6 +589,28 @@ impl Drop for EndpointSandbox<'_> {
         crate::usage::reset_request_slots();
         crate::usage::reset_identity_memo();
         crate::oauth::reset_stored_probe_suppression();
+    }
+}
+
+/// RAII pin pointing the codex token endpoint — the wire behind
+/// `codex_auth::refresh_codex_chain`, which `standby_tick` hardwires — at
+/// `base`, cleared on drop even if the test panics. Borrows the
+/// [`HomeSandbox`] for the reason [`EndpointSandbox`] does: the override is a
+/// process-global serialized by `HOME_TEST_LOCK`, and a fixture panic between
+/// two plain set/clear calls would leave it pointing the next test at a dead
+/// port.
+pub(crate) struct CodexTokenUrlSandbox<'a>(std::marker::PhantomData<&'a HomeSandbox>);
+
+impl<'a> CodexTokenUrlSandbox<'a> {
+    pub(crate) fn new(_home: &'a HomeSandbox, base: &str) -> Self {
+        crate::codex_auth::set_token_url_override(&format!("{base}/oauth/token"));
+        Self(std::marker::PhantomData)
+    }
+}
+
+impl Drop for CodexTokenUrlSandbox<'_> {
+    fn drop(&mut self) {
+        crate::codex_auth::clear_token_url_override();
     }
 }
 
@@ -818,6 +882,45 @@ impl Drop for FakeClaude<'_> {
     }
 }
 
+/// RAII `CODEX_HOME` override — [`ConfigDirSandbox`]'s codex twin, same lock
+/// discipline, same restore-on-drop.
+pub(crate) struct CodexHomeSandbox<'a> {
+    prev: Option<std::ffi::OsString>,
+    _home: std::marker::PhantomData<&'a HomeSandbox>,
+}
+
+impl<'a> CodexHomeSandbox<'a> {
+    #[expect(
+        unsafe_code,
+        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
+    )]
+    pub(crate) fn new(_home: &'a HomeSandbox, dir: &Path) -> Self {
+        let prev = std::env::var_os("CODEX_HOME");
+        // SAFETY: test-only, serialized by `HOME_TEST_LOCK`, restored on drop.
+        unsafe { std::env::set_var("CODEX_HOME", dir) };
+        Self {
+            prev,
+            _home: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for CodexHomeSandbox<'_> {
+    #[expect(
+        unsafe_code,
+        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
+    )]
+    fn drop(&mut self) {
+        // SAFETY: same as `new` — restore the prior value under the same lock.
+        unsafe {
+            match &self.prev {
+                Some(v) => std::env::set_var("CODEX_HOME", v),
+                None => std::env::remove_var("CODEX_HOME"),
+            }
+        }
+    }
+}
+
 /// Seed a plugin registration the heal gate must act on: a `clauth@clauth`
 /// user-scope row whose `installPath` is gone. The registry lives under the
 /// sandboxed claude dir, so this touches nothing outside it.
@@ -921,6 +1024,59 @@ pub(crate) fn write_usage_history(
         body.push('\n');
     }
     std::fs::write(&path, body).expect("write history");
+}
+
+/// A JWT carrying `payload` (a JSON object) — header.payload.signature in the
+/// base64url alphabet, signed by nobody: every clauth read of a codex token is
+/// unverified, so this is all a schedule or label read needs.
+pub(crate) fn codex_jwt(payload: &str) -> String {
+    let payload = crate::oauth_login::base64url_nopad(payload.as_bytes());
+    format!("h.{payload}.sig")
+}
+
+/// [`codex_jwt`] whose payload carries `exp` (epoch seconds) alone.
+pub(crate) fn jwt_with_exp(exp_secs: i64) -> String {
+    codex_jwt(&format!("{{\"exp\":{exp_secs}}}"))
+}
+
+/// A codex `auth.json` body holding one chain plus a key clauth never writes,
+/// so a rotation's key survival is observable.
+pub(crate) fn codex_auth_body(access: &str, refresh: &str) -> String {
+    format!(
+        "{{ \"tokens\": {{\"id_token\": \"id.x\", \"access_token\": \"{access}\", \
+         \"refresh_token\": \"{refresh}\", \"account_id\": \"acc\"}}, \"keep_me\": 7 }}"
+    )
+}
+
+/// Write `body` as `name`'s profile store (`profiles/<name>/auth.json`) under
+/// the caller's [`HomeSandbox`].
+pub(crate) fn write_codex_store(name: &str, body: &str) {
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
+    crate::profile::mkdir_700(&dir).expect("mkdir");
+    std::fs::write(dir.join("auth.json"), body).expect("write store");
+}
+
+pub(crate) fn read_codex_store(name: &str) -> String {
+    std::fs::read_to_string(
+        crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
+            .expect("dir")
+            .join("auth.json"),
+    )
+    .expect("read store")
+}
+
+/// A locked handle on `name`'s rotation lock from a separate fd, standing in
+/// for another process mid-rotation (`flock(2)` binds to the open file
+/// description, so this genuinely contends with `try_acquire`'s own). Creates
+/// the locks directory the way `RotationGuard::open` does, since a real holder
+/// made it on its way in. Call under a [`HomeSandbox`]; drop it to release.
+pub(crate) fn hold_rotation_lock(name: &str) -> std::fs::File {
+    let path = crate::runtime::rotation_lock_path(&crate::profile::ProfileName::from(name))
+        .expect("rotation lock path");
+    crate::profile::mkdir_700(path.parent().expect("lock parent")).expect("locks dir");
+    let holder = crate::profile::open_state_file(&path).expect("open holder handle");
+    holder.lock().expect("hold the rotation lock");
+    holder
 }
 
 /// Simulate a live `clauth start` session for `name`: a locked pid file in the
@@ -1065,6 +1221,7 @@ pub(crate) fn live_row(session_id: &str, profile: &str) -> crate::live_sessions:
     crate::live_sessions::LiveSession {
         session_id: session_id.to_owned(),
         start_profile: profile.to_owned(),
+        harness: crate::harness::Harness::Claude,
         pid: 4242,
         started_at: 1_700_000_000_000,
         cwd: None,
@@ -1158,6 +1315,12 @@ pub(crate) fn owner_only_violations(root: &Path) -> Vec<String> {
     let want = if is_dir { 0o700 } else { 0o600 };
     if mode != want {
         out.push(format!("{mode:#o} {} (want {want:#o})", root.display()));
+    }
+    // Mirror of `enforce_clauth_perms`: a codex home's contents are codex's
+    // own (exec-bit helper binaries included), so the invariant covers the
+    // home NODE and stops at its threshold.
+    if is_dir && crate::runtime::is_codex_home_path(root) {
+        return out;
     }
     if is_dir && let Ok(entries) = std::fs::read_dir(root) {
         for entry in entries.flatten() {

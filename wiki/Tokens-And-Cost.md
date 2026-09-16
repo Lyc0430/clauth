@@ -14,6 +14,8 @@ Claude Code prunes old transcripts and its rollup freezes at a date, so clauth k
 
 The figures cover **every account sharing this machine's home directory**, since that is what Claude Code's store covers. A `clauth start --isolated` session writes into its own throwaway store, so its usage arrives here only once the run ends and its transcripts are lifted into the global store.
 
+The tab is Claude Code only. A codex session ([Codex](Codex)) writes no transcript into Claude Code's store, so its spend is absent from every figure here rather than folded in silently; a codex account's usage shows as its 5h and 7d percentages on the Overview and in `status.json`, and nowhere on this tab.
+
 ## Period lens
 
 <kbd>t</kbd> cycles the lens: lifetime, today, this week (from Monday), this month (from the 1st). It re-scopes the dashboard cards and the per-model breakdown.
@@ -42,7 +44,7 @@ The Status tab is separate from all of this: it polls `https://status.claude.com
 
 ## Sessions
 
-`clauth sessions` inventories every Claude Code session on this machine, newest first: the global store plus any live isolated runtime's own store. A session's id is its transcript filename, which stays stable across resumes.
+`clauth sessions` inventories every Claude Code session on this machine, newest first: the global store plus any live isolated runtime's own store. A session's id is its transcript filename, which stays stable across resumes. Codex threads are not listed; they live in the profile's own `codex-home/sessions/` ([Codex](Codex#files)).
 
 ```bash
 clauth sessions              # table

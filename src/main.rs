@@ -3,10 +3,14 @@ mod alibaba_login;
 mod claude;
 mod claude_json;
 mod cli;
+mod codex_auth;
+mod codex_login;
+mod codex_profiles;
 mod completions;
 mod daemon;
 mod fallback;
 mod format;
+mod harness;
 mod herdr;
 mod hook_context;
 mod hook_note;
@@ -62,23 +66,64 @@ use crate::out::{errln, out, outln};
 use crate::profile::{AppConfig, ProfileName, ThemeName, load_config};
 use crate::runtime::Isolation;
 
-/// Resolve `name` to its canonical spelling, or bail with a [`UsageError`].
-/// A bare unrecognized word lands here as a profile name (clap's `external`
+/// The not-found refusal for the commands that try the codex roster before
+/// giving up (`switch`, `delete`, `start`), listing both rosters; the
+/// claude-only verbs refuse through [`resolve_or_bail`] instead. A bare
+/// unrecognized word lands here as a profile name (clap's `external`
 /// subcommand), so a typo'd subcommand and a typo'd profile name are
 /// indistinguishable at this position. Either way the caller named something
 /// that isn't there: a usage error (exit 2), not a runtime failure (exit 1).
-/// Shared by every profile-naming command: `start`/`delete`/`disable`/
-/// `enable`/`switch`/`rolling-token`/`static-token`.
-fn resolve_or_bail(config: &AppConfig, name: &str) -> Result<ProfileName> {
-    config
-        .canonical_name(name)
-        .map(ProfileName::from)
-        .ok_or_else(|| {
-            let available = config.names().join(", ");
-            usage_error(format!(
-                "profile '{name}' not found\navailable: {available}"
-            ))
-        })
+fn unknown_profile_error(config: &AppConfig, name: &str) -> anyhow::Error {
+    let mut parts = claude_roster_part(config);
+    // The codex roster too — `switch` and `delete` take those names, and a
+    // list that hides them turns a typo'd codex name into "no such thing".
+    if let Ok(codex) = codex_profiles::CodexState::load()
+        && !codex.profiles().is_empty()
+    {
+        let names: Vec<&str> = codex.profiles().iter().map(|n| n.as_str()).collect();
+        parts.push(format!("codex: {}", names.join(", ")));
+    }
+    profile_not_found_error(name, &parts)
+}
+
+/// The claude roster as one `available:` part, or none when it is empty so the
+/// listing never opens on a dangling separator.
+fn claude_roster_part(config: &AppConfig) -> Vec<String> {
+    let claude = config.names().join(", ");
+    if claude.is_empty() {
+        Vec::new()
+    } else {
+        vec![claude]
+    }
+}
+
+fn profile_not_found_error(name: &str, parts: &[String]) -> anyhow::Error {
+    usage_error(format!(
+        "profile '{name}' not found\navailable: {}",
+        parts.join(" · ")
+    ))
+}
+
+/// Resolve `name` to its canonical spelling against the CLAUDE roster, or bail
+/// with a [`UsageError`]. Shared by every claude-only profile-naming command:
+/// `disable`/`enable`/`rolling-token`/`static-token`, which pass their own
+/// `verb` so a codex name is refused as what it is (a real account on the
+/// harness this verb does not reach) and a name on neither roster lists the
+/// claude roster alone, the only one these verbs take. A roster that fails to
+/// load is a runtime failure (exit 1) like the sibling arms', never a
+/// not-found: the verdict needs the roster. `switch`, `delete`, and `start`
+/// resolve by hand instead — a claude miss falls through to the codex roster
+/// there.
+fn resolve_or_bail(config: &AppConfig, name: &str, verb: &str) -> Result<ProfileName> {
+    if let Some(canonical) = config.canonical_name(name) {
+        return Ok(ProfileName::from(canonical));
+    }
+    if let Some(codex) = codex_profiles::CodexState::load()?.canonical_name(name) {
+        return Err(usage_error(format!(
+            "'{codex}' is a codex profile; {verb} is claude-only"
+        )));
+    }
+    Err(profile_not_found_error(name, &claude_roster_part(config)))
 }
 
 fn main() {
@@ -393,7 +438,31 @@ fn cmd_start(
 
     let (name, rows, pick, demand) = match target {
         cli::StartTarget::Named(raw) => {
-            (resolve_or_bail(&config, raw)?, Vec::new(), None, Vec::new())
+            let Some(canonical) = config.canonical_name(raw) else {
+                // Not a claude name — a codex profile starts an interactive `codex`
+                // in its own clauth-built home. The claude-only flags refuse by name
+                // rather than silently not doing what they promise.
+                if let Some(canonical) = codex_profiles::CodexState::load()?.canonical_name(raw) {
+                    if follows_chain {
+                        anyhow::bail!(
+                            "--with-fallback is not available on a codex profile: codex reads \
+                             auth.json once at start, so a chain lands at the NEXT start, not \
+                             mid-session — start without the flag"
+                        );
+                    }
+                    // Before `--explain` too, for the reason the claude arm runs
+                    // `admit` there: an explained start names what a real one
+                    // would do, never a target it would then refuse.
+                    codex_auth::refuse_if_quarantined(&canonical)?;
+                    if explain_only {
+                        outln!("{}", format::start_pick_line(&canonical, &[]));
+                        return Ok(());
+                    }
+                    return start::run_codex(&config, &canonical, rest, isolation);
+                }
+                return Err(unknown_profile_error(&config, raw));
+            };
+            (ProfileName::from(canonical), Vec::new(), None, Vec::new())
         }
         cli::StartTarget::Auto => {
             anyhow::ensure!(
@@ -902,12 +971,19 @@ fn run_oauth(reauth: bool, target: &str) -> Result<actions::CaptureSnapshot> {
 /// Tokens are never printed — only a sha256 prefix.
 fn cmd_login(args: LoginArgs) -> Result<()> {
     platform::init();
+    if args.codex {
+        return if args.browser {
+            actions::codex_login_browser(&args.profile)
+        } else {
+            actions::codex_login_capture(&args.profile)
+        };
+    }
     let mut config = load_config()?;
     let route = login_route(&config, &args.profile);
     let target = ProfileName::from(match &route {
         LoginRoute::Reauth(existing) => existing.clone(),
         LoginRoute::New(fresh) => {
-            actions::validate_profile_name(fresh, &config.names(), None)?;
+            actions::validate_profile_name(fresh, crate::harness::Harness::Claude, None)?;
             fresh.clone()
         }
     });
@@ -1220,7 +1296,7 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
     platform::init();
 
     let config = load_config()?;
-    let canonical = resolve_or_bail(&config, name)?;
+    let canonical = resolve_or_bail(&config, name, "static-token")?;
     let target = &canonical;
     let profile = config
         .find(target)
@@ -1456,21 +1532,19 @@ fn clear_backup_postscript(target: &str) -> String {
 fn cmd_delete(name: &str, yes: bool, force: bool) -> Result<()> {
     platform::init();
     let mut config = load_config()?;
-    let canonical = resolve_or_bail(&config, name)?;
-    if !yes {
-        use std::io::IsTerminal as _;
-        if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-            anyhow::bail!(
-                "refusing to delete '{canonical}' without confirmation; pass --yes for a non-interactive delete"
-            );
-        }
-        out!("clauth: delete profile '{canonical}' and all its credentials? [y/N] ");
-        let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer)?;
-        if !reauth_confirmed(&answer) {
-            outln!("clauth: aborted. '{canonical}' left in place.");
-            return Ok(());
-        }
+    let Some(canonical) = config.canonical_name(name) else {
+        // Not a claude name — a codex profile deletes through its own state
+        // file, same confirm gate, same flags.
+        return cmd_delete_codex(&config, name, yes, force);
+    };
+    let canonical = ProfileName::from(canonical);
+    // Same collision note as `cmd_switch`, and it matters more here: the verb
+    // is destructive, and silence would read as "the only 'foo' is gone".
+    if codex_profiles::CodexState::load().is_ok_and(|s| s.canonical_name(&canonical).is_some()) {
+        outln!("clauth: note — '{canonical}' also names a codex profile; deleting the CLAUDE one");
+    }
+    if !confirm_profile_delete(&canonical, yes)? {
+        return Ok(());
     }
     let was_active = config.is_active(&canonical);
     let rotation = actions::rotation_guard_for_mutation(&canonical)?;
@@ -1479,6 +1553,54 @@ fn cmd_delete(name: &str, yes: bool, force: bool) -> Result<()> {
         outln!("clauth: deleted profile '{canonical}' (was active; live credentials cleared).");
     } else {
         outln!("clauth: deleted profile '{canonical}'.");
+    }
+    Ok(())
+}
+
+/// The `delete` confirm gate, one spelling for both harnesses: refuse a
+/// promptless non-TTY delete, prompt on a TTY, `--yes` skips. `Ok(false)` is
+/// the clean abort.
+fn confirm_profile_delete(canonical: &str, yes: bool) -> Result<bool> {
+    if yes {
+        return Ok(true);
+    }
+    use std::io::IsTerminal as _;
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        anyhow::bail!(
+            "refusing to delete '{canonical}' without confirmation; pass --yes for a non-interactive delete"
+        );
+    }
+    out!("clauth: delete profile '{canonical}' and all its credentials? [y/N] ");
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    if !reauth_confirmed(&answer) {
+        outln!("clauth: aborted. '{canonical}' left in place.");
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// The codex leg of [`cmd_delete`]: resolve against the codex roster, then the
+/// same confirm gate, the same rotation guard, and the codex delete. The
+/// postscript names what a codex profile installs globally — the operator's
+/// `auth.json` slot the capture linked onto it — when the delete detached it,
+/// since the operator's own codex is logged out from that moment.
+fn cmd_delete_codex(config: &AppConfig, name: &str, yes: bool, force: bool) -> Result<()> {
+    let Some(canonical) = codex_profiles::CodexState::load()?.canonical_name(name) else {
+        return Err(unknown_profile_error(config, name));
+    };
+    if !confirm_profile_delete(&canonical, yes)? {
+        return Ok(());
+    }
+    let rotation = actions::rotation_guard_for_mutation(&ProfileName::from(canonical.as_str()))?;
+    let detached = actions::delete_codex_profile(&canonical, force, &rotation)?;
+    outln!("clauth: removed codex profile '{canonical}'.");
+    if let Some(slot) = detached {
+        outln!(
+            "clauth: {} followed that profile's chain and is detached now, so your own codex \
+             has no login; run `codex login` to mint a fresh one",
+            slot.display()
+        );
     }
     Ok(())
 }
@@ -1506,7 +1628,7 @@ fn refuse_if_disabled(config: &AppConfig, name: &ProfileName) -> Result<()> {
 fn cmd_disable(name: &str, yes: bool) -> Result<()> {
     platform::init();
     let mut config = load_config()?;
-    let canonical = resolve_or_bail(&config, name)?;
+    let canonical = resolve_or_bail(&config, name, "disable")?;
 
     if config.find(&canonical).is_some_and(|p| p.is_disabled()) {
         outln!("clauth: '{canonical}' is already disabled.");
@@ -1543,7 +1665,7 @@ fn cmd_disable(name: &str, yes: bool) -> Result<()> {
 fn cmd_enable(name: &str) -> Result<()> {
     platform::init();
     let mut config = load_config()?;
-    let canonical = resolve_or_bail(&config, name)?;
+    let canonical = resolve_or_bail(&config, name, "enable")?;
     if actions::enable_profile(&mut config, &canonical)? {
         outln!("clauth: enabled '{canonical}'.");
     } else {
@@ -1555,7 +1677,23 @@ fn cmd_enable(name: &str) -> Result<()> {
 fn cmd_switch(name: &str) -> Result<()> {
     platform::init();
     let config = load_config()?;
-    let canonical = resolve_or_bail(&config, name)?;
+    let Some(canonical) = config.canonical_name(name) else {
+        // Not a claude name — a codex profile switches its own harness's
+        // active slot, with no live install to perform (session-boundary).
+        if let Some(canonical) = codex_profiles::CodexState::load()?.canonical_name(name) {
+            actions::switch_codex_profile(&canonical)?;
+            outln!("clauth: switched codex to '{canonical}'");
+            return Ok(());
+        }
+        return Err(unknown_profile_error(&config, name));
+    };
+    let canonical = ProfileName::from(canonical);
+    // One namespace is enforced at creation, not against hand-edited state:
+    // when both files claim the name, claude-first is the pinned precedence —
+    // said out loud rather than resolved silently.
+    if codex_profiles::CodexState::load().is_ok_and(|s| s.canonical_name(&canonical).is_some()) {
+        outln!("clauth: note — '{canonical}' also names a codex profile; switching the CLAUDE one");
+    }
     refuse_if_disabled(&config, &canonical)?;
     actions::switch_profile_cli(config, &canonical)
 }
@@ -1569,7 +1707,7 @@ fn cmd_switch(name: &str) -> Result<()> {
 /// picks the new bearer up on its next request.
 fn cmd_rolling_token(name: &str) -> Result<()> {
     let config = load_config()?;
-    let canonical = resolve_or_bail(&config, name)?;
+    let canonical = resolve_or_bail(&config, name, "rolling-token")?;
     // Same gate `start` and `switch` take. A disabled profile is off every
     // operational surface, the re-stamp timer included, so arming one produces
     // a bearer that dies in hours with nothing behind it.
@@ -1837,7 +1975,7 @@ fn report_armed_sidecar(canonical: &ProfileName, chain_is_broken: bool) -> Resul
 /// mint that needs no re-stamping is always allowed.
 fn cmd_static_token(name: &str) -> Result<()> {
     let config = load_config()?;
-    let canonical = resolve_or_bail(&config, name)?;
+    let canonical = resolve_or_bail(&config, name, "static-token")?;
     // The whole restore (flag flip + mint restore) serializes on the profile's
     // rotation guard: without it, a concurrent rotation that still sees the
     // flag set can re-stamp the sidecar AFTER the restore, leaving the flag

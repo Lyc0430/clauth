@@ -199,6 +199,13 @@ pub(crate) struct ProfileEntry {
     /// third-party/api-key profiles.
     #[schema(required = true)]
     pub(crate) tier: Option<String>,
+    /// Additive (schema stays 1): which harness this profile belongs to,
+    /// `claude` or `codex`. Membership of a state file is the authority
+    /// (decision 1) and names are globally unique (decision 2), so one flat
+    /// `profiles[]` still reads unambiguously — a reader that predates codex
+    /// ignores the field and sees the claude accounts it always saw, because
+    /// codex entries are appended after them.
+    pub(crate) harness: String,
     /// A live `clauth start` session runs for this profile.
     pub(crate) has_live_session: bool,
     /// `ok` / `expired` / `broken` (see [`auth_status_str`]).
@@ -511,6 +518,7 @@ pub(crate) fn build_profile_entries(
                 provider: provider_label(p),
                 base_url: p.base_url.clone(),
                 tier: tier_label(p),
+                harness: "claude".to_string(),
                 has_live_session: crate::runtime::has_live_session(name),
                 auth_status: auth_status_str(config, p, now as i64).to_string(),
                 fetch_status: fetch_status.map(str::to_string),
@@ -534,6 +542,80 @@ pub(crate) fn build_profile_entries(
         .collect()
 }
 
+/// The codex half of `profiles[]`, appended after the claude entries.
+///
+/// Built from the caller's `codex-profiles.toml` read (one load per body, so
+/// these `active` flags and the top-level `active_codex_profile` can never
+/// disagree) plus the per-profile usage cache the codex leg writes, and
+/// nothing else: a codex profile has no `Profile` record (the file split
+/// leaves `profiles.toml` untouched), so every claude-only field is its
+/// no-data form rather than a fabricated one. `tier` carries the ChatGPT plan
+/// — the polled one, else the id_token's claim — never a `Claude <tier>`
+/// label, which is what `tier_label` would produce.
+pub(crate) fn build_codex_entries(
+    codex: &crate::codex_profiles::CodexState,
+    interval_ms: u64,
+) -> Vec<ProfileEntry> {
+    let now = now_ms();
+    let active = codex.active_profile();
+    codex
+        .profiles()
+        .iter()
+        .map(|name| {
+            let mtime_ms = profile_cache_mtime_ms(name, USAGE_CACHE_FILE);
+            let cached: Option<UsageInfo> = load_profile_cache(name, USAGE_CACHE_FILE);
+            ProfileEntry {
+                name: name.clone(),
+                active: active.is_some_and(|a| a == name),
+                // Rolling tokens are a claude-side mechanism (a `session-token`
+                // sidecar); codex holds one chain in one auth.json.
+                rolling_token: false,
+                provider: "openai".to_string(),
+                base_url: None,
+                tier: crate::codex_auth::plan_label(
+                    name.as_str(),
+                    cached
+                        .as_ref()
+                        .and_then(|u| u.plan.as_ref())
+                        .and_then(|p| p.codex_plan.as_deref()),
+                ),
+                harness: "codex".to_string(),
+                has_live_session: crate::runtime::has_live_session(name),
+                // `broken` is the server's terminal verdict on the chain
+                // (`codex_auth::read_quarantine`), the codex twin of the claude
+                // `auth_broken` grade; `expired` has no codex reading, since the
+                // standby leg rotates on the access token's own clock.
+                auth_status: if crate::codex_auth::read_quarantine(name.as_str()).is_some() {
+                    "broken"
+                } else if cached.is_some() {
+                    "ok"
+                } else {
+                    "unknown"
+                }
+                .to_string(),
+                fetch_status: mtime_ms.map(|mt| {
+                    if now.saturating_sub(mt) < interval_ms {
+                        "Fresh"
+                    } else {
+                        "Cached"
+                    }
+                    .to_string()
+                }),
+                stale: false,
+                fetched_at: mtime_ms.map(iso_from_ms),
+                next_refresh_at: mtime_ms.map(|mt| iso_from_ms(mt.saturating_add(interval_ms))),
+                auto_start: false,
+                // The interleaved auto-start queue elects claude members only.
+                auto_start_queue: None,
+                bell_threshold: None,
+                fallback: None,
+                windows: published_windows(name),
+                third_party: None,
+            }
+        })
+        .collect()
+}
+
 /// The full `status.json` body. Field order is the published key order, and
 /// each `Option` field emits a present key holding `null` when absent.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -545,7 +627,24 @@ pub(crate) struct StatusBody {
     #[schema(required = true)]
     pub(crate) pending_switch: Option<String>,
     pub(crate) wrap_off: bool,
+    /// Additive per-harness slots (decision 10): the top-level
+    /// `active_profile` / `wrap_off` above stay the CLAUDE ones, so nothing
+    /// that reads them today changes meaning. `default` so a reader stays
+    /// additive-tolerant of an older writer.
+    #[serde(default)]
+    #[schema(required = true)]
+    pub(crate) active_codex_profile: Option<String>,
+    #[serde(default)]
+    #[schema(value_type = Vec<String>)]
+    pub(crate) codex_fallback_chain: Vec<ProfileName>,
+    #[serde(default)]
+    pub(crate) codex_wrap_off: bool,
     pub(crate) refresh_interval_ms: u64,
+    /// The daemon that wrote this feed. A reader can tell an old daemon —
+    /// one with no codex support at all — from a new one reporting an empty
+    /// codex roster, which are otherwise byte-identical.
+    #[serde(default)]
+    pub(crate) clauth_version: String,
     pub(crate) profiles: Vec<ProfileEntry>,
 }
 
@@ -558,7 +657,14 @@ pub(crate) fn build_status(
     live: Option<&LiveSignals>,
     include_disabled: bool,
 ) -> StatusBody {
-    let profiles = build_profile_entries(config, interval_ms, live, include_disabled);
+    let mut profiles = build_profile_entries(config, interval_ms, live, include_disabled);
+    // One read feeds both the entries and the slots below, so a load error
+    // publishes an empty roster AND empty slots rather than a body whose two
+    // halves describe different files.
+    let codex = crate::codex_profiles::CodexState::load().unwrap_or_default();
+    // Appended, never interleaved: a reader that predates codex takes the
+    // prefix it always took.
+    profiles.extend(build_codex_entries(&codex, interval_ms));
     // Stamped after the entries build (each entry reads its own clock) so
     // `generated_at` never precedes the instant a per-entry verdict was judged at.
     let now = now_ms();
@@ -569,7 +675,11 @@ pub(crate) fn build_status(
         active_profile: config.state.active_profile.as_deref().map(str::to_string),
         pending_switch: live.and_then(|s| s.pending_switch).map(str::to_string),
         wrap_off: config.state.switch_off_when_spent,
+        active_codex_profile: codex.active_profile().map(|n| n.as_str().to_string()),
+        codex_fallback_chain: codex.fallback_chain().to_vec(),
+        codex_wrap_off: codex.switch_off_when_spent(),
         refresh_interval_ms: interval_ms,
+        clauth_version: env!("CARGO_PKG_VERSION").to_string(),
         profiles,
     }
 }

@@ -721,6 +721,222 @@ fn start_heals_the_plugin_registry_only_when_it_is_broken() {
     );
 }
 
+/// The codex spawn's wire facts, pinned without spawning: the CODEX_HOME pin,
+/// the forced file store as the FIRST -c (a caller's later -c wins in codex's
+/// layering, which is their own foot-gun to aim), and the passthrough args
+/// after it. The store value carries its TOML quotes as literal bytes — a
+/// well-formed TOML string to codex's -c parser, not a bare-word fallback.
+#[test]
+fn the_codex_spawn_command_carries_the_wire_facts() {
+    let home = crate::testutil::HomeSandbox::new();
+    let session_home = home.home().join(".clauth/profiles/cx/codex-home-4242-0");
+    let cmd = codex_spawn_command(
+        &session_home,
+        &["exec".to_string(), "--full-auto".to_string()],
+        &[],
+    );
+
+    assert_eq!(
+        cmd.get_program(),
+        crate::runtime::codex_command().get_program()
+    );
+    let env = crate::testutil::env_overrides(&cmd);
+    assert_eq!(
+        env.get("CODEX_HOME").and_then(|v| v.as_deref()),
+        session_home.to_str(),
+        "the home pin is the session's own home"
+    );
+    let args: Vec<String> = cmd
+        .get_args()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        args,
+        [
+            "-c",
+            "cli_auth_credentials_store=\"file\"",
+            "-c",
+            &format!("sqlite_home='{}'", session_home.display()),
+            "exec",
+            "--full-auto"
+        ],
+        "forced store and state-DB home first, passthrough after"
+    );
+}
+
+/// The state-DB pin exists to outrank a `sqlite_home` the COPIED config.toml
+/// carries: scrubbing `CODEX_SQLITE_HOME` cannot reach a config key, and an
+/// operator's absolute path there would pool every profile's goals/memories/
+/// state DBs in one directory while the home's durable links sit unopened.
+#[test]
+fn the_spawn_pins_the_state_db_home_past_a_copied_config_key() {
+    let home = crate::testutil::HomeSandbox::new();
+    let session_home = home.home().join(".clauth/profiles/cx/codex-home-4242-0");
+    std::fs::create_dir_all(&session_home).expect("mkdir home");
+    // The operator's own setting, faithfully copied into the session home by
+    // `build_codex_home` — codex would resolve its DBs there, not here.
+    std::fs::write(
+        session_home.join("config.toml"),
+        b"sqlite_home = \"/tmp/one-shared-dir\"\n",
+    )
+    .expect("write config");
+
+    let cmd = codex_spawn_command(&session_home, &[], &[]);
+    let args: Vec<String> = cmd
+        .get_args()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let pinned = format!("sqlite_home='{}'", session_home.display());
+    assert!(
+        args.windows(2).any(|w| w[0] == "-c" && w[1] == pinned),
+        "the session's own home is pinned past the copied key: {args:?}"
+    );
+    assert!(
+        !args.iter().any(|a| a.contains("/tmp/one-shared-dir")),
+        "the operator's path is never what the spawn names"
+    );
+}
+
+/// codex layers its managed config ABOVE the session's `-c` flags, so a key
+/// set there defeats the forced store and state-DB home the spawn pins, and
+/// nothing clauth passes can outrank it. The two keys that kill the chain
+/// refuse the spawn with a line naming the file, the key, its value and the
+/// fix; the moved state-DB home warns; anything else, absent or unparseable
+/// included, is clear.
+#[test]
+fn the_managed_config_verdict_refuses_the_chain_killers_and_warns_on_the_rest() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("managed_config.toml");
+    let file = path.display();
+
+    assert_eq!(
+        managed_config_verdict(&path),
+        ManagedConfigVerdict::Clear,
+        "absent"
+    );
+
+    fs::write(
+        &path,
+        "model = \"o3\"\ncli_auth_credentials_store = \"keyring\"\n",
+    )
+    .expect("write");
+    assert_eq!(
+        managed_config_verdict(&path),
+        ManagedConfigVerdict::Refuse(format!(
+            "{file} sets cli_auth_credentials_store = \"keyring\", and a managed config outranks \
+             the file store clauth forces at spawn, so codex would ignore this session's \
+             linked auth.json. ask whoever manages this machine to remove the key or set it \
+             to \"file\"; clauth cannot override a managed config"
+        ))
+    );
+
+    fs::write(&path, "cli_auth_credentials_store = \"file\"\n").expect("write");
+    assert_eq!(
+        managed_config_verdict(&path),
+        ManagedConfigVerdict::Clear,
+        "the file store is what the spawn forces anyway"
+    );
+
+    fs::write(&path, "[debug]\nconfig_lockfile = { load_path = \"/x\" }\n").expect("write");
+    assert_eq!(
+        managed_config_verdict(&path),
+        ManagedConfigVerdict::Refuse(format!(
+            "{file} sets debug.config_lockfile.load_path = \"/x\", and a managed config \
+             outranks the flags clauth passes at spawn, so codex would replay that lockfile \
+             as its whole config and drop the file store this session's linked auth.json \
+             depends on. ask whoever manages this machine to remove the key; clauth cannot \
+             override a managed config"
+        ))
+    );
+
+    fs::write(
+        &path,
+        "[debug]\nconfig_lockfile = { export_dir = \"/e\" }\n",
+    )
+    .expect("write");
+    assert_eq!(
+        managed_config_verdict(&path),
+        ManagedConfigVerdict::Clear,
+        "an export dir writes lockfiles and replays none"
+    );
+
+    fs::write(&path, "sqlite_home = \"/y\"\n").expect("write");
+    assert_eq!(
+        managed_config_verdict(&path),
+        ManagedConfigVerdict::Warn(format!(
+            "{file} sets sqlite_home = \"/y\", which outranks the per-session home \
+             clauth pins at spawn, so every profile's state dbs land in that one directory"
+        ))
+    );
+
+    fs::write(
+        &path,
+        "sqlite_home = \"/y\"\ncli_auth_credentials_store = \"auto\"\n",
+    )
+    .expect("write");
+    assert!(
+        matches!(
+            managed_config_verdict(&path),
+            ManagedConfigVerdict::Refuse(_)
+        ),
+        "a chain killer outranks a warning"
+    );
+
+    fs::write(&path, "model = \"o3\"\n[unclosed\n").expect("write");
+    assert_eq!(
+        managed_config_verdict(&path),
+        ManagedConfigVerdict::Clear,
+        "a file codex cannot parse is codex's own refusal"
+    );
+}
+
+/// The spawn site consults the verdict before anything else: a refusing
+/// managed config ends `run_codex` with the verdict's own line. The profile
+/// root is walled off with a file so a spawn-site regression fails on the
+/// wall (`acquire` cannot create the profile dir) instead of launching
+/// whatever `codex` is on PATH.
+#[test]
+fn run_codex_refuses_on_the_managed_config_before_building_a_home() {
+    let sb = HomeSandbox::new();
+    fs::create_dir_all(sb.home().join(".clauth")).expect("mkdir .clauth");
+    fs::write(sb.home().join(".clauth/profiles"), b"").expect("wall off the profile root");
+    let managed = sb.home().join("managed_config.toml");
+    fs::write(&managed, "cli_auth_credentials_store = \"keyring\"\n").expect("write managed");
+    let _managed = ManagedConfigSandbox::new(&sb, &managed);
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+
+    let err = run_codex(&config, "cx", &[], Isolation::Shared)
+        .expect_err("a managed keyring store refuses the spawn");
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "{} sets cli_auth_credentials_store = \"keyring\", and a managed config outranks \
+             the file store clauth forces at spawn, so codex would ignore this session's \
+             linked auth.json. ask whoever manages this machine to remove the key or set it \
+             to \"file\"; clauth cannot override a managed config",
+            managed.display()
+        )
+    );
+}
+
+/// A home whose path carries an apostrophe cannot ride a TOML literal string,
+/// so the override falls back to a basic string rather than emitting a value
+/// codex's `-c` parser would read as truncated.
+#[test]
+fn a_quoted_home_path_falls_back_to_a_basic_toml_string() {
+    assert_eq!(
+        toml_path_value(std::path::Path::new("/Users/o'brien/.clauth")),
+        "\"/Users/o'brien/.clauth\""
+    );
+    assert_eq!(
+        toml_path_value(std::path::Path::new("/Users/plain/.clauth")),
+        "'/Users/plain/.clauth'"
+    );
+}
+
 // ── the runtime settings merge's strip list ──────────────────────────────
 
 /// The runtime settings merge at session start strips the OUTGOING

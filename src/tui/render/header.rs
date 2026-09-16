@@ -198,7 +198,19 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let rows: [Rect; 3] = Layout::vertical([Constraint::Length(1); 3]).areas(cols[1]);
 
-    let n = app.config().profiles.len();
+    // The account rows the Overview lists under the harness filter: claude
+    // while it shows them, codex while it shows those; both by default.
+    let claude_n = if app.harness_filter.shows_claude() {
+        app.config().profiles.len()
+    } else {
+        0
+    };
+    let codex_n = if app.harness_filter.shows_codex() {
+        app.codex_rows.len()
+    } else {
+        0
+    };
+    let n = claude_n + codex_n;
     let info_width = rows[0].width as usize;
 
     let gauge = if app.tab == Tab::Overview || app.compact {
@@ -246,7 +258,15 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // The count + gauge are left-aligned together; the status dot is the
     // only thing right-aligned, with an elastic gap in between.
     let row1_width = rows[1].width as usize;
-    let prefix = format!("{n} account{}", crate::format::plural(n));
+    // The harness chip rides the account count, because it is a statement ABOUT
+    // that count: while it shows, the number beside it is one harness's, and
+    // without it the number is both rosters together. Absent while both show,
+    // so a header with no codex roster is byte-identical to the one that
+    // predates codex.
+    let prefix = match app.harness_filter.chip() {
+        Some(chip) => format!("{n} account{} · {chip}", crate::format::plural(n)),
+        None => format!("{n} account{}", crate::format::plural(n)),
+    };
     let feed = "status.claude.ai";
     let status_head = "● ";
     let status_w = status_head.chars().count() + feed.chars().count();

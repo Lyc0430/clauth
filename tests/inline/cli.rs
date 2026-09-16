@@ -1549,10 +1549,10 @@ mod disabled_target_refusal {
 
 // ── a bad profile name is a usage error, not a runtime failure ──────────────
 // A typo'd subcommand is clap's `external` arm (dispatch routes it to
-// `cmd_switch`); a typo'd profile name on `delete`/`start`/`disable`/`enable`
-// reaches the same `resolve_or_bail`. Both should read as "you named something
-// that isn't there" to a calling script: exit 2, distinguishable from success.
-// Mirrors `main`'s parse -> dispatch -> exit_code mapping end-to-end.
+// `cmd_switch`); a typo'd profile name on `disable`/`enable`/`rolling-token`/
+// `static-token` reaches `resolve_or_bail` while `switch`/`delete`/`start`
+// resolve by hand, so either reads as "you named something that isn't there"
+// to a calling script: exit 2, distinguishable from success.
 mod bad_profile_name_is_a_usage_error {
     use super::*;
     use crate::testutil::HomeSandbox;
@@ -3124,12 +3124,7 @@ fn cli_delete_refuses_while_a_rotation_holds_the_lock() {
         .expect("create profile");
 
     // Another process mid-rotation: a locked handle on a separate fd.
-    let lock_path =
-        crate::runtime::rotation_lock_path(&crate::profile::ProfileName::from("cli-held"))
-            .expect("rotation lock path");
-    crate::profile::mkdir_700(lock_path.parent().expect("lock parent")).expect("locks dir");
-    let holder = crate::profile::open_state_file(&lock_path).expect("open holder handle");
-    holder.lock().expect("hold the rotation lock");
+    let _holder = crate::testutil::hold_rotation_lock("cli-held");
 
     // Spelled in a case `canonical_name` has to fold, so the argument and the
     // resolved name DIFFER: guarding the raw argument locks a path nothing
@@ -3160,6 +3155,160 @@ fn cli_delete_refuses_while_a_rotation_holds_the_lock() {
             .to_string(),
         "'cli-held' has a token rotation in progress, retry in a moment"
     );
+}
+
+/// The not-found listing names BOTH rosters — `switch` and `delete` accept
+/// codex names, so a list hiding them turns a typo'd codex name into "no such
+/// thing" — with the codex half labeled so nothing reads as a claude profile.
+#[test]
+fn the_not_found_listing_names_both_rosters() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let clauth = crate::profile::clauth_dir().expect("clauth dir");
+    crate::profile::mkdir_700(&clauth).expect("mkdir .clauth");
+    std::fs::write(clauth.join("codex-profiles.toml"), "profiles = [\"cx1\"]\n")
+        .expect("write codex state");
+    let config = crate::profile::AppConfig {
+        state: crate::profile::AppState {
+            profiles: vec!["cl1".into()],
+            ..Default::default()
+        },
+        profiles: vec![crate::testutil::blank_profile(
+            &crate::profile::ProfileName::from("cl1"),
+        )],
+    };
+
+    let msg = unknown_profile_error(&config, "ghost").to_string();
+    assert!(msg.contains("profile 'ghost' not found"), "{msg}");
+    assert!(msg.contains("cl1"), "claude roster listed: {msg}");
+    assert!(
+        msg.contains("codex: cx1"),
+        "codex roster listed, labeled: {msg}"
+    );
+
+    // An empty claude roster leaves no dangling separator.
+    let empty = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![],
+    };
+    let msg = unknown_profile_error(&empty, "ghost").to_string();
+    assert!(msg.contains("available: codex: cx1"), "{msg}");
+}
+
+/// `--with-fallback` refuses ON a codex profile by name, before any spawn:
+/// codex reads `auth.json` once at start, so a chain lands at the NEXT start
+/// rather than mid-session, and silently not doing what the flag promises is
+/// the worse answer. (`--rescue`/`--no-rescue` were the other half until
+/// upstream retired them; an isolated session keeps its transcripts now.)
+#[test]
+fn codex_start_refuses_with_fallback_by_name() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let clauth = crate::profile::clauth_dir().expect("clauth dir");
+    crate::profile::mkdir_700(&clauth).expect("mkdir .clauth");
+    std::fs::write(clauth.join("codex-profiles.toml"), "profiles = [\"cx\"]\n")
+        .expect("write codex state");
+
+    let err = cmd_start(
+        &crate::cli::StartTarget::Named("cx".to_owned()),
+        &[],
+        Isolation::Shared,
+        true,
+        false,
+    )
+    .expect_err("--with-fallback refuses on codex");
+    assert!(err.to_string().contains("--with-fallback"), "{err}");
+    assert!(err.to_string().contains("NEXT start"), "{err}");
+}
+
+/// `cmd_delete_codex` takes the rotation guard exactly where `cmd_delete`
+/// does — after the confirm gate, before the delete — so a codex name typed at
+/// the CLI under an in-flight rotation refuses with the same words and touches
+/// nothing. Spelled in a case `canonical_name` folds, like the claude twin.
+#[test]
+fn cli_codex_delete_refuses_while_a_rotation_holds_the_lock() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let clauth = crate::profile::clauth_dir().expect("clauth dir");
+    crate::profile::mkdir_700(&clauth).expect("mkdir .clauth");
+    std::fs::write(
+        clauth.join("codex-profiles.toml"),
+        "active_profile = \"cx-held\"\nprofiles = [\"cx-held\"]\n",
+    )
+    .expect("write codex state");
+    crate::testutil::write_codex_store("cx-held", "{}");
+
+    let _holder = crate::testutil::hold_rotation_lock("cx-held");
+
+    let outcome = dispatch(
+        Cli::try_parse_from(["clauth", "delete", "CX-HELD", "--yes"]).expect("delete must parse"),
+    );
+
+    assert!(
+        crate::profile::profile_dir(&crate::profile::ProfileName::from("cx-held"))
+            .expect("profile dir")
+            .join("auth.json")
+            .exists(),
+        "a refused delete leaves the store on disk"
+    );
+    let state = crate::codex_profiles::CodexState::load().expect("reload codex state");
+    assert!(
+        state.holds("cx-held"),
+        "a refused delete leaves the roster entry"
+    );
+    assert_eq!(state.active_profile().map(|n| n.as_str()), Some("cx-held"));
+    assert_eq!(
+        outcome
+            .expect_err("an in-flight rotation must block the CLI codex delete")
+            .to_string(),
+        "'cx-held' has a token rotation in progress, retry in a moment"
+    );
+}
+
+/// A quarantined codex profile refuses `clauth start` by name — `--explain`
+/// included, the way the claude arm runs `admit` there — naming the fix,
+/// before any spawn. The explain leg runs first: it is the one that can red by
+/// assertion if the refusal moves or goes (it prints the pick and returns
+/// `Ok`), where the real leg would run on into `start::run_codex` and spawn
+/// the operator's `codex`, whose exit takes the whole test binary down.
+#[test]
+fn codex_start_refuses_a_quarantined_chain_by_name() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let clauth = crate::profile::clauth_dir().expect("clauth dir");
+    crate::profile::mkdir_700(&clauth).expect("mkdir .clauth");
+    std::fs::write(clauth.join("codex-profiles.toml"), "profiles = [\"cx\"]\n")
+        .expect("write codex state");
+    crate::testutil::write_codex_store(
+        "cx",
+        &crate::testutil::codex_auth_body(&crate::testutil::jwt_with_exp(1_700_000_060), "rt.a"),
+    );
+    let expired = |_t: &str| -> Result<
+        crate::codex_auth::CodexTokenResponse,
+        crate::codex_auth::CodexRefreshError,
+    > { Err(crate::codex_auth::CodexRefreshError::Dead("expired")) };
+    assert_eq!(
+        crate::codex_auth::standby_pass(
+            "cx",
+            1_700_000_000_000,
+            "2026-08-13T00:00:00Z".into(),
+            &expired
+        ),
+        crate::codex_auth::StandbyOutcome::Failed
+    );
+
+    for explain_only in [true, false] {
+        let err = cmd_start(
+            &crate::cli::StartTarget::Named("CX".to_owned()),
+            &[],
+            Isolation::Shared,
+            false,
+            explain_only,
+        )
+        .expect_err("a dead chain refuses the start");
+        assert_eq!(
+            err.to_string(),
+            "'cx': codex chain is broken (expired since 2026-08-13T00:00:00Z), \
+             run `clauth login cx --codex --browser`",
+            "explain_only = {explain_only}"
+        );
+    }
 }
 
 // ── login paste door: the piped reader and the raw-mode key loop ─────────────
@@ -3423,4 +3572,130 @@ fn cmd_start_explain_auto_runs_the_with_fallback_refusals() {
         err.to_string(),
         "'a': --with-fallback needs a second account in the fallback chain to move to; add one on the fallback tab, or start without it"
     );
+}
+
+// ── the claude-only verbs and a codex name ────────────────────────────────────
+
+/// `disable`/`enable`/`rolling-token`/`static-token` take claude names alone.
+/// A codex name is refused as what it is, a real account on the other harness,
+/// in one fixed shape naming the verb, as a usage error (exit 2); a name on
+/// neither roster lists the claude roster alone, the only one these verbs
+/// take. `switch`/`delete`/`start` keep the two-roster listing.
+#[test]
+fn the_claude_only_verbs_refuse_a_codex_name_and_list_the_claude_roster_alone() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let clauth = crate::profile::clauth_dir().expect("clauth dir");
+    crate::profile::mkdir_700(&clauth).expect("mkdir .clauth");
+    std::fs::write(clauth.join("codex-profiles.toml"), "profiles = [\"cx\"]\n")
+        .expect("write codex state");
+    let config = AppConfig {
+        state: crate::profile::AppState {
+            profiles: vec!["cl1".into()],
+            ..Default::default()
+        },
+        profiles: vec![crate::testutil::blank_profile(&ProfileName::from("cl1"))],
+    };
+
+    let err = resolve_or_bail(&config, "cx", "disable").expect_err("a codex name is refused");
+    assert!(
+        err.downcast_ref::<UsageError>().is_some(),
+        "a usage error, so the process exits 2: {err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "'cx' is a codex profile; disable is claude-only"
+    );
+    // The caller's casing resolves to the roster's spelling, as `switch` does.
+    let err = resolve_or_bail(&config, "CX", "enable").expect_err("a codex name is refused");
+    assert_eq!(
+        err.to_string(),
+        "'cx' is a codex profile; enable is claude-only"
+    );
+
+    let err = resolve_or_bail(&config, "zz", "disable").expect_err("unknown on both rosters");
+    assert!(err.downcast_ref::<UsageError>().is_some(), "{err:?}");
+    assert_eq!(err.to_string(), "profile 'zz' not found\navailable: cl1");
+
+    assert_eq!(
+        unknown_profile_error(&config, "zz").to_string(),
+        "profile 'zz' not found\navailable: cl1 · codex: cx",
+        "control: the two-roster listing `switch`/`delete`/`start` use is unchanged"
+    );
+
+    let claude = resolve_or_bail(&config, "CL1", "disable").expect("a claude name resolves");
+    assert_eq!(claude.as_str(), "cl1");
+}
+
+/// Every handler passes its own verb, so `clauth <verb> cx` names the verb the
+/// user typed; the `--clear` form of `static-token` is the same verb. Through
+/// `dispatch` the refusal maps to exit 2.
+#[test]
+fn each_claude_only_verb_names_itself_in_the_codex_refusal() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let clauth = crate::profile::clauth_dir().expect("clauth dir");
+    crate::profile::mkdir_700(&clauth).expect("mkdir .clauth");
+    std::fs::write(clauth.join("codex-profiles.toml"), "profiles = [\"cx\"]\n")
+        .expect("write codex state");
+
+    let cases = [
+        ("disable", cmd_disable("cx", true)),
+        ("enable", cmd_enable("cx")),
+        ("rolling-token", cmd_rolling_token("cx")),
+        ("static-token", cmd_static_token("cx")),
+        ("static-token", cmd_static_token_clear("cx", true)),
+    ];
+    for (verb, outcome) in cases {
+        let err = outcome.expect_err("a codex name is refused before any state moves");
+        assert!(
+            err.downcast_ref::<UsageError>().is_some(),
+            "{verb}: {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!("'cx' is a codex profile; {verb} is claude-only")
+        );
+    }
+
+    let cli = parse(&["disable", "cx", "--yes"]).expect("argv parses");
+    assert_eq!(crate::exit_code(crate::dispatch(cli)), 2);
+}
+
+/// A roster that fails to load is a runtime failure (exit 1) like `switch`'s,
+/// `delete`'s and `start`'s, never a not-found: without the roster the verdict
+/// on `cx` is unknowable, and `profile 'cx' not found` would send the user to
+/// fix the wrong file. A claude name never loads the roster, so it resolves
+/// over the same corrupt file.
+#[test]
+fn a_corrupt_codex_roster_fails_the_claude_only_verbs_as_a_runtime_error() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let clauth = crate::profile::clauth_dir().expect("clauth dir");
+    crate::profile::mkdir_700(&clauth).expect("mkdir .clauth");
+    let roster = clauth.join("codex-profiles.toml");
+    std::fs::write(&roster, "profiles = [not toml").expect("corrupt codex state");
+    let config = AppConfig {
+        state: crate::profile::AppState {
+            profiles: vec!["cl1".into()],
+            ..Default::default()
+        },
+        profiles: vec![crate::testutil::blank_profile(&ProfileName::from("cl1"))],
+    };
+
+    let err = resolve_or_bail(&config, "cx", "disable").expect_err("the roster does not load");
+    assert_eq!(
+        err.to_string(),
+        format!("failed to parse {}", roster.display())
+    );
+    assert!(
+        err.root_cause().downcast_ref::<toml::de::Error>().is_some(),
+        "the parse error is the cause, never hidden: {err:?}"
+    );
+    assert!(
+        err.downcast_ref::<UsageError>().is_none(),
+        "a runtime failure, not a usage error: {err:?}"
+    );
+    assert_eq!(crate::exit_code(Err(err)), 1);
+
+    let claude =
+        resolve_or_bail(&config, "CL1", "disable").expect("a claude name never loads the roster");
+    assert_eq!(claude.as_str(), "cl1");
 }

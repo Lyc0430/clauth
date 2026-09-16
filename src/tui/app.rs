@@ -27,7 +27,8 @@ use crate::actions::{
     edit_profile_endpoint, edit_profile_env, edit_profile_model, edit_profile_preset,
     find_matching_oauth_profile, overwrite_captured_profile, rename_profile, reorder_profile,
     rotation_guard_for_mutation, set_chain_order, set_member_threshold, set_wrap_off,
-    snapshot_is_empty, switch_off, switch_profile, validate_profile_name,
+    snapshot_is_empty, switch_off, switch_profile, validate_foreign_harness_free,
+    validate_name_chars, validate_profile_name,
 };
 use crate::claude::{
     LinkState, adopt_first_login, classify_credentials_link, claude_settings_env_keys,
@@ -40,6 +41,7 @@ use crate::fallback::{
     parse_threshold, threshold_for,
 };
 use crate::format::{format_pct, format_threshold_tokens};
+use crate::harness::Harness;
 use crate::lock::with_state_lock;
 use crate::lockorder::{RankedGuard, RankedMutex};
 use crate::oauth;
@@ -1506,6 +1508,99 @@ pub(crate) enum MainItemKind {
     Profile(usize),
 }
 
+/// Which harness the Overview shows. A VIEW filter only: selection and every
+/// action stay bound to the claude list, because a codex account has no
+/// `Profile` record for them to act on and clauth switches it through its own
+/// CLI verb. So the codex section renders READ-ONLY, and while the claude rows
+/// are hidden every key bound to the selection is inert
+/// ([`claude_rows_hidden`]) rather than acting on a row the screen does not
+/// show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum HarnessFilter {
+    #[default]
+    All,
+    Claude,
+    Codex,
+}
+
+impl HarnessFilter {
+    /// `c` cycles: both → claude → codex → both.
+    pub(crate) fn next(self) -> Self {
+        match self {
+            HarnessFilter::All => HarnessFilter::Claude,
+            HarnessFilter::Claude => HarnessFilter::Codex,
+            HarnessFilter::Codex => HarnessFilter::All,
+        }
+    }
+    pub(crate) fn shows_claude(self) -> bool {
+        !matches!(self, HarnessFilter::Codex)
+    }
+    pub(crate) fn shows_codex(self) -> bool {
+        !matches!(self, HarnessFilter::Claude)
+    }
+    /// Header chip text; `None` while both harnesses show, so the default view
+    /// carries no badge at all.
+    pub(crate) fn chip(self) -> Option<&'static str> {
+        match self {
+            HarnessFilter::All => None,
+            HarnessFilter::Claude => Some("claude only"),
+            HarnessFilter::Codex => Some("codex only"),
+        }
+    }
+}
+
+/// One codex account as the Overview renders it — name, plan, the two windows
+/// and whether its chain is quarantined. The windows come from the per-profile
+/// usage cache the codex leg writes; the plan from that cache, else from the
+/// store's id_token claim; `broken` from the quarantine record beside the
+/// store. Deliberately NOT a `Profile`: synthesizing one would put a record
+/// with no credentials into every claude path that walks `config.profiles`.
+#[derive(Debug, Clone)]
+pub(crate) struct CodexRow {
+    pub(crate) name: ProfileName,
+    pub(crate) active: bool,
+    pub(crate) broken: bool,
+    pub(crate) plan: Option<String>,
+    pub(crate) five_hour: Option<crate::usage::UsageWindow>,
+    pub(crate) seven_day: Option<crate::usage::UsageWindow>,
+}
+
+/// Read the codex roster into the [`App::codex_rows`] snapshot. Lock-free: the
+/// roster is one small TOML and each reading is the profile's own cache file
+/// plus the small files beside its store (the quarantine record, and the store
+/// itself on a cache miss for the plan), the same set `status --json` reads
+/// with no daemon running.
+pub(crate) fn codex_rows() -> Vec<CodexRow> {
+    let Ok(state) = crate::codex_profiles::CodexState::load() else {
+        return Vec::new();
+    };
+    let active = state.active_profile().cloned();
+    state
+        .profiles()
+        .iter()
+        .map(|name| {
+            let cached: Option<crate::usage::UsageInfo> = crate::profile_cache::load_profile_cache(
+                name,
+                crate::profile_cache::USAGE_CACHE_FILE,
+            );
+            CodexRow {
+                name: name.clone(),
+                active: active.as_ref().is_some_and(|a| a == name),
+                broken: crate::codex_auth::read_quarantine(name.as_str()).is_some(),
+                plan: crate::codex_auth::plan_label(
+                    name.as_str(),
+                    cached
+                        .as_ref()
+                        .and_then(|u| u.plan.as_ref())
+                        .and_then(|p| p.codex_plan.as_deref()),
+                ),
+                five_hour: cached.as_ref().and_then(|u| u.five_hour.clone()),
+                seven_day: cached.as_ref().and_then(|u| u.seven_day.clone()),
+            }
+        })
+        .collect()
+}
+
 // ── Login session ─────────────────────────────────────────────────────────────
 
 /// An in-flight login. The worker blocks up to the login bound in
@@ -1662,6 +1757,9 @@ pub(crate) struct App {
     /// Selected account index, shared across Overview/Usage/Setup tabs.
     /// On Setup may also rest on the trailing `+ new` row (== profile_count).
     pub(crate) profile_cursor: usize,
+    /// Which harness the Overview lists (`c` cycles). A view filter only — see
+    /// [`HarnessFilter`].
+    pub(crate) harness_filter: HarnessFilter,
     /// Which Setup pane has focus.
     pub(crate) config_focus: ConfigFocus,
     /// Cursor into the detail rows on the Setup tab's right pane.
@@ -1884,6 +1982,16 @@ pub(crate) struct App {
     /// — the state a fixture writes to force a re-tally, since backdating an
     /// `Instant` panics on a host booted more recently than the interval.
     last_live_sessions_refresh: Option<Instant>,
+    /// The codex roster as the Overview lists it and the header counts it.
+    /// Cached like `live_sessions`: [`codex_rows`] is a roster read plus a few
+    /// small files per account, the header draws on every tab every frame, and
+    /// the roster moves on a human timescale (a CLI verb in another terminal).
+    /// One snapshot for both surfaces is also what keeps the header's count
+    /// equal to the rows the Overview draws.
+    pub(crate) codex_rows: Vec<CodexRow>,
+    /// Throttle for the per-tick codex re-read; same contract as
+    /// `last_live_sessions_refresh`.
+    last_codex_rows_refresh: Option<Instant>,
 }
 
 /// Read every named profile's long-lived-token status for the Overview cache.
@@ -2141,6 +2249,7 @@ impl App {
             third_party_usage_store,
             third_party_status,
             tab: Tab::Overview,
+            harness_filter: HarnessFilter::default(),
             herdr_mode: false,
             modals: Vec::new(),
             help_scroll: 0,
@@ -2219,6 +2328,8 @@ impl App {
             session_tokens,
             live_sessions,
             last_live_sessions_refresh: Some(Instant::now()),
+            codex_rows: codex_rows(),
+            last_codex_rows_refresh: Some(Instant::now()),
         };
         app.refresh_unsaved_live_login();
         app
@@ -3079,8 +3190,19 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             }
             return;
         }
+        // Overview only: it is the one screen listing accounts, so the filter
+        // has nothing to mean anywhere else. Guarded rather than swallowed so
+        // `c` still reaches the per-tab dispatch (Tokens binds it too).
+        KeyCode::Char('c') if app.tab == Tab::Overview => {
+            app.disarm_quit();
+            app.harness_filter = app.harness_filter.next();
+            return;
+        }
         KeyCode::Char('a') => {
             app.disarm_quit();
+            if app.tab == Tab::Overview && claude_rows_hidden(app) {
+                return;
+            }
             let state = build_action_menu(app);
             if !state.items.is_empty() {
                 app.modals.push(Modal::ActionMenu(state));
@@ -3372,9 +3494,22 @@ fn step_profile_cursor(app: &mut App, delta: i32, len: usize) {
     app.profile_cursor = (app.profile_cursor as i32 + delta).rem_euclid(len as i32) as usize;
 }
 
+/// True, with a toast saying so, while the Overview's `Codex` filter hides the
+/// claude rows the cursor is bound to. Every key that reorders, steps or acts
+/// on the selection asks here first, so nothing acts on a row the screen does
+/// not show.
+fn claude_rows_hidden(app: &mut App) -> bool {
+    if app.harness_filter.shows_claude() {
+        return false;
+    }
+    app.toast(ToastKind::Info, "claude rows are hidden, press c");
+    true
+}
+
 fn handle_overview_key(app: &mut App, key: KeyEvent) {
     let count = app.profile_count();
     match key.code {
+        KeyCode::Up | KeyCode::Down | KeyCode::Enter if claude_rows_hidden(app) => {}
         KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => reorder_main_cursor(app, -1),
         KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => reorder_main_cursor(app, 1),
         KeyCode::Up => step_profile_cursor(app, -1, count),
@@ -7471,10 +7606,7 @@ fn oauth_login_target(app: &mut App, editing: Option<String>) -> Option<(String,
                 .as_ref()
                 .map(|d| d.name.trimmed().to_string())
                 .unwrap_or_default();
-            let validation = {
-                let cfg = app.config();
-                validate_profile_name(&typed, &cfg.names(), None)
-            };
+            let validation = validate_profile_name(&typed, Harness::Claude, None);
             match validation {
                 Ok(()) => Some((typed, true)),
                 Err(e) => {
@@ -8244,10 +8376,7 @@ fn commit_rename(app: &mut App) {
         }
         return;
     }
-    let validation = {
-        let cfg = app.config();
-        validate_profile_name(&new, &cfg.names(), Some(old.as_str()))
-    };
+    let validation = validate_profile_name(&new, Harness::Claude, Some(old.as_str()));
     if let Err(e) = validation {
         app.toast(ToastKind::Danger, format!("{e}"));
         return;
@@ -8346,10 +8475,7 @@ fn commit_new_account(app: &mut App) {
         base_url.is_some() && matches!(d.captured_login, Some(DraftLogin::Mint(_)));
     let endpoint_overridden =
         base_url.is_some() && matches!(d.captured_login, Some(DraftLogin::LiveLogin(_)));
-    let validation = {
-        let cfg = app.config();
-        validate_profile_name(&name, &cfg.names(), None)
-    };
+    let validation = validate_profile_name(&name, Harness::Claude, None);
     if let Err(e) = validation {
         app.toast(ToastKind::Danger, format!("{e}"));
         return;
@@ -8554,10 +8680,7 @@ fn handle_name_prompt_key(app: &mut App, key: KeyEvent) {
             let action = form.action.clone();
             match action {
                 NamePromptAction::DuplicateProfile(source) => {
-                    let validation = {
-                        let cfg = app.config();
-                        validate_profile_name(&name, &cfg.names(), None)
-                    };
+                    let validation = validate_profile_name(&name, Harness::Claude, None);
                     if let Err(e) = validation {
                         app.toast(ToastKind::Danger, format!("{e}"));
                         return;
@@ -8570,9 +8693,9 @@ fn handle_name_prompt_key(app: &mut App, key: KeyEvent) {
                     );
                 }
                 NamePromptAction::SavePreset(source) => {
-                    // The preset store is its own namespace, so the roster is
-                    // empty here; only the charset + built-in rules apply.
-                    if let Err(e) = validate_profile_name(&name, &[], None) {
+                    // The preset store is its own namespace — neither harness's
+                    // roster has a say; only the charset + built-in rules apply.
+                    if let Err(e) = validate_name_chars(&name) {
                         app.toast(ToastKind::Danger, format!("{e}"));
                         return;
                     }
@@ -9458,11 +9581,17 @@ fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Enter => {
             let name = form.input.trimmed().to_string();
-            // Chars/empty-only check here — the duplicate-name branch of
-            // `validate_profile_name` is skipped (empty `existing`) so a
+            // Chars + cross-harness only — the own-roster duplicate branch of
+            // `validate_profile_name` is deliberately skipped so a claude
             // collision falls through to the canonical_name lookup below
-            // instead of dead-ending with an "already exists" error.
-            if let Err(e) = validate_profile_name(&name, &[], None) {
+            // (capture-into-existing) instead of dead-ending with an "already
+            // exists" error. A codex-held name has no such flow — a claude
+            // login can't be captured into a codex profile — so that half
+            // still refuses here.
+            let validation = validate_name_chars(&name)
+                .map(|_| ())
+                .and_then(|()| validate_foreign_harness_free(&name, Harness::Claude));
+            if let Err(e) = validation {
                 app.toast(ToastKind::Danger, format!("{e}"));
                 return;
             }
@@ -9981,11 +10110,30 @@ pub(crate) fn on_tick(app: &mut App) {
     // Before the plugin refresh, which folds the tally into its runtime row and
     // would otherwise render this tick against the previous one's fleet.
     poll_live_sessions(app);
+    poll_codex_rows(app);
     poll_plugin_refresh(app);
     poll_daemon_health(app);
 
     update_banner(app);
     app.prune_toasts();
+}
+
+/// Re-read the codex roster for the Overview's codex section and the header's
+/// account count, at most once a second: a roster TOML plus a few small files
+/// per account is cheap but not per-frame cheap, and both a `clauth login --codex`
+/// in another terminal and a codex usage fetch land on a human timescale.
+/// Ungated by tab and by filter, so a `c` onto the codex view shows the current
+/// roster rather than the one from whenever the view last showed it.
+fn poll_codex_rows(app: &mut App) {
+    const CODEX_ROWS_INTERVAL: Duration = Duration::from_secs(1);
+    if app
+        .last_codex_rows_refresh
+        .is_some_and(|t| t.elapsed() < CODEX_ROWS_INTERVAL)
+    {
+        return;
+    }
+    app.last_codex_rows_refresh = Some(Instant::now());
+    app.codex_rows = codex_rows();
 }
 
 /// Re-probe the daemon presence + `status.json` health for the `● daemon`

@@ -339,3 +339,58 @@ fn daemon_dot_maps_health_to_color_and_hides_when_absent() {
         "stale → amber"
     );
 }
+
+// ── Row 1 account count under the harness filter ──────────────────────────────
+
+/// Row 1's count, cut at the elastic gap before the status dot: the account
+/// count plus the harness chip when one shows, and nothing else.
+fn count_prefix(app: &App) -> String {
+    row_content(app, 100, 1)
+        .split("  ")
+        .next()
+        .expect("row 1 opens on the account count")
+        .to_string()
+}
+
+/// The count is a statement about the rows the Overview lists under the
+/// filter: both rosters by default, one roster under its chip. A codex-only
+/// view over three codex rows reads `3 accounts · codex only` and means it.
+#[test]
+fn the_account_count_follows_the_harness_filter() {
+    use crate::tui::app::HarnessFilter;
+    let _home = crate::testutil::HomeSandbox::new();
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    crate::profile::mkdir_700(&dir).expect("mkdir .clauth");
+    std::fs::write(
+        dir.join("codex-profiles.toml"),
+        "profiles = [\"cx1\", \"cx2\", \"cx3\"]\n",
+    )
+    .expect("write codex state");
+    let mut app = app_with(
+        vec![oauth_profile("uwuclxdy", 42.0), provider_profile("z.ai")],
+        None,
+    );
+
+    assert_eq!(count_prefix(&app), "5 accounts");
+
+    app.harness_filter = HarnessFilter::Claude;
+    assert_eq!(count_prefix(&app), "2 accounts · claude only");
+
+    app.harness_filter = HarnessFilter::Codex;
+    assert_eq!(count_prefix(&app), "3 accounts · codex only");
+}
+
+/// No codex roster: the default header is byte-identical to the one that
+/// predates codex, and the codex-only chip counts nothing.
+#[test]
+fn the_account_count_without_a_codex_roster_is_the_claude_count() {
+    use crate::tui::app::HarnessFilter;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(
+        vec![oauth_profile("uwuclxdy", 42.0), provider_profile("z.ai")],
+        None,
+    );
+    assert_eq!(count_prefix(&app), "2 accounts");
+    app.harness_filter = HarnessFilter::Codex;
+    assert_eq!(count_prefix(&app), "0 accounts · codex only");
+}

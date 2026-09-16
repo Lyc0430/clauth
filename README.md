@@ -39,6 +39,7 @@ Most account tools do one half. clauth pairs instant **switching between multipl
 - 🧩 **Run in parallel**: several accounts at once in isolated config dirs, or a clean headless session with none of your global memory, plugins, or hooks
 - 🔌 **From inside Claude**: an MCP plugin lets a live session list, switch, or delegate a whole prompt (even headless) to another account, and tells a session when the account behind it changed
 - 🖥️ **Headless**: `clauth daemon` runs the refresh and auto-switch loop with no TUI and publishes `status.json` for a menu-bar app to read, or serves that feed and the account switch to another machine over HTTPS with `--listen`
+- 🔀 **Codex too**: adopt or mint a ChatGPT login as a codex profile, run `codex` under it in its own `CODEX_HOME`, and let a separate codex chain rotate accounts between sessions ([Codex](https://github.com/uwuclxdy/clauth/wiki/Codex))
 - 🛠️ **Quality-of-life**: browse and resume past sessions under any account, per-profile model routing, `start --auto` to pick the account by the models a session will run, shell completions, signed self-updates, multi-instance safe
 
 Full reference: **[the wiki](https://github.com/uwuclxdy/clauth/wiki)**.
@@ -163,7 +164,7 @@ clauth is the only one of these that pairs account switching with a live usage m
 
 **Does it work with Claude Pro, Max, Team, and Enterprise?** Yes. OAuth profiles cover all paid tiers (plan auto-detected, including Max 5x / 20x). API-endpoint profiles cover the Anthropic API or any compatible proxy.
 
-**Where does clauth store my Claude Code credentials?** Locally under `~/.clauth/`, with `0600` permissions on Unix. Tokens only ever go to Anthropic. See [SECURITY.md](SECURITY.md).
+**Where does clauth store my Claude Code credentials?** Locally under `~/.clauth/`, with `0600` permissions on Unix. Claude tokens only ever go to Anthropic, codex tokens only to OpenAI. See [SECURITY.md](SECURITY.md).
 
 More, including what to check when something misbehaves: [FAQ](https://github.com/uwuclxdy/clauth/wiki/FAQ).
 
@@ -180,6 +181,7 @@ More, including what to check when something misbehaves: [FAQ](https://github.co
 | [Claude Code plugin](https://github.com/uwuclxdy/clauth/wiki/Claude-Code-Plugin) | the MCP server and `delegate` in full |
 | [herdr plugin](https://github.com/uwuclxdy/clauth/wiki/Herdr-Plugin) | the clauth popup in herdr, the key, the per-pane account tag |
 | [Tokens and cost](https://github.com/uwuclxdy/clauth/wiki/Tokens-And-Cost) | where the dashboard reads from, what the cost figure means |
+| [Codex](https://github.com/uwuclxdy/clauth/wiki/Codex) | ChatGPT logins as codex profiles: capture, sessions, the codex chain |
 | [Security](https://github.com/uwuclxdy/clauth/wiki/Security) | where credentials live and how they move |
 
 ## Development

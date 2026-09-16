@@ -276,6 +276,7 @@ fn seed_flag_states() {
             plan: Some(PlanInfo {
                 tier: PlanTier::Free,
                 subscription_status: Some("canceled".to_string()),
+                codex_plan: None,
             }),
             ..Default::default()
         },
@@ -361,6 +362,7 @@ fn seed_canceled_account() {
         plan: Some(PlanInfo {
             tier: PlanTier::Free,
             subscription_status: Some("canceled".to_string()),
+            codex_plan: None,
         }),
         ..Default::default()
     };
@@ -839,5 +841,56 @@ fn session_scope_refuses_names_by_name() {
         empty.is_error,
         Some(true),
         "an empty `names` list is omitted"
+    );
+}
+
+/// A `names` filter naming a codex account is refused as what it is: a real
+/// account on the harness these tools do not manage, never "not found". A
+/// mixed list keeps the unknown name's own fix and adds the codex clause for
+/// the codex one, so neither subset loses its lesson; the caller's casing
+/// resolves the way the claude side did, and the clause names the roster's
+/// spelling.
+#[test]
+fn a_codex_name_in_the_filter_is_refused_as_a_codex_account() {
+    let home = HomeSandbox::new();
+    seed_two_profiles();
+    std::fs::write(
+        home.home().join(".clauth").join("codex-profiles.toml"),
+        "profiles = [\"cx\"]\n",
+    )
+    .expect("write codex state");
+
+    let result = call_profiles(Some(vec!["cx", "zz"]), None);
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(
+        first_text(&result),
+        "error: profile not found: zz; omit `names` for every account; cx names a CODEX \
+         account, which these tools do not manage — they are Claude Code only. Switch it \
+         with `clauth <name>`"
+    );
+
+    let result = call_profiles(Some(vec!["cx"]), None);
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(
+        first_text(&result),
+        "error: profile not found: cx; cx names a CODEX account, which these tools do not \
+         manage — they are Claude Code only. Switch it with `clauth <name>`"
+    );
+
+    let result = call_profiles(Some(vec!["CX", "zz"]), None);
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(
+        first_text(&result),
+        "error: profile not found: zz; omit `names` for every account; cx names a CODEX \
+         account, which these tools do not manage — they are Claude Code only. Switch it \
+         with `clauth <name>`"
+    );
+
+    let result = call_profiles(Some(vec!["CX"]), None);
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(
+        first_text(&result),
+        "error: profile not found: CX; cx names a CODEX account, which these tools do not \
+         manage — they are Claude Code only. Switch it with `clauth <name>`"
     );
 }

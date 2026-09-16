@@ -70,7 +70,7 @@ const SCOPES: &str = "org:create_api_key user:profile user:inference user:sessio
 const LOGIN_TIMEOUT_SECS: u64 = 600;
 
 /// Base64url without padding (RFC 4648 §5) — the encoding OAuth PKCE mandates.
-fn base64url_nopad(input: &[u8]) -> String {
+pub(crate) fn base64url_nopad(input: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
@@ -306,7 +306,7 @@ impl AuthorizeRejection {
     /// Parse the callback's `error` param. The input is discarded here: every
     /// value any arm carries onward is one of this function's own literals, so
     /// nothing downstream can be holding browser-supplied bytes.
-    fn parse(code: &str) -> Self {
+    pub(crate) fn parse(code: &str) -> Self {
         match code {
             "access_denied" => Self::Declined,
             "server_error" => Self::Upstream("server_error"),
@@ -319,7 +319,7 @@ impl AuthorizeRejection {
         }
     }
 
-    fn user_message(&self) -> &'static str {
+    pub(crate) fn user_message(&self) -> &'static str {
         match self {
             Self::Declined => "you declined the authorization request",
             Self::Upstream(_) => "anthropic is having trouble",
@@ -329,7 +329,7 @@ impl AuthorizeRejection {
 
     /// Operator-log rendering: the spec code the user copy withholds, as our own
     /// literal rather than the browser's bytes.
-    fn log_detail(&self) -> &'static str {
+    pub(crate) fn log_detail(&self) -> &'static str {
         match self {
             Self::Declined => "access_denied",
             Self::Upstream(code) | Self::Refused(code) => code,

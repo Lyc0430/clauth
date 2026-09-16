@@ -31,6 +31,8 @@ The TUI's Plugin tab writes exactly that entry for you with <kbd>f</kbd>. The ma
 
 Every reply reads as prose; there is no format parameter.
 
+The four tools are Claude Code only: they see the Claude Code roster, and a codex profile ([Codex](Codex)) never appears in `profiles`. A codex profile named to `profiles`, `switch_profile` or `delegate` (one name or a fan-out list) is refused as a codex account the plugin does not manage, never as an unknown name; the match is case-insensitive and the refusal names the roster's spelling: ``profile not found: cx; cx names a CODEX account, which these tools do not manage — they are Claude Code only. Switch it with `clauth <name>` ``. A list mixing unknown and codex names keeps the tool's own fix for the unknown ones and adds the codex clause for the rest.
+
 ## Hearing about changes: `since_your_last_call` and `monitor`
 
 clauth's state can move under a live session: the active profile switches, the background scheduler refreshes usage figures, a rotation rewrites the credentials file. Replies that carry live usage (`profiles({scope:"session"})`, `switch_profile`, `delegate`, `monitor`) carry a `since_your_last_call` note too, naming what moved since the last reply that reported one, and only when something did.

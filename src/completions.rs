@@ -262,6 +262,11 @@ const ZSH_LOGIN_DESCS: &[(&str, &str)] = &[
         "--setup-token",
         "capture a claude setup-token mint as a long-lived login",
     ),
+    ("--codex", "create or re-authenticate a codex profile"),
+    (
+        "--browser",
+        "with --codex: mint a fresh codex chain via the browser",
+    ),
     ("--yes", "replace an existing long-lived token unprompted"),
     ("-y", "replace an existing long-lived token unprompted"),
     ("--model", "set the default model before signing in"),
@@ -273,6 +278,11 @@ const FISH_LOGIN_DESCS: &[(&str, &str)] = &[
     (
         "--setup-token",
         "Capture a claude setup-token mint as a long-lived login",
+    ),
+    ("--codex", "Create or re-authenticate a codex profile"),
+    (
+        "--browser",
+        "With --codex: mint a fresh codex chain via the browser",
     ),
     ("--yes", "Replace an existing long-lived token unprompted"),
     ("-y", "Replace an existing long-lived token unprompted"),
