@@ -544,18 +544,20 @@ pub(crate) fn build_profile_entries(
 
 /// The codex half of `profiles[]`, appended after the claude entries.
 ///
-/// Built from `codex-profiles.toml` plus the per-profile usage cache the codex
-/// leg writes, and nothing else: a codex profile has no `Profile` record (the
-/// file split leaves `profiles.toml` untouched), so every claude-only field is
-/// its no-data form rather than a fabricated one. `tier` carries the ChatGPT
-/// plan verbatim — never a `Claude <tier>` label, which is what `tier_label`
-/// would produce.
-pub(crate) fn build_codex_entries(interval_ms: u64) -> Vec<ProfileEntry> {
-    let Ok(codex) = crate::codex_profiles::CodexState::load() else {
-        return Vec::new();
-    };
+/// Built from the caller's `codex-profiles.toml` read (one load per body, so
+/// these `active` flags and the top-level `active_codex_profile` can never
+/// disagree) plus the per-profile usage cache the codex leg writes, and
+/// nothing else: a codex profile has no `Profile` record (the file split
+/// leaves `profiles.toml` untouched), so every claude-only field is its
+/// no-data form rather than a fabricated one. `tier` carries the ChatGPT plan
+/// — the polled one, else the id_token's claim — never a `Claude <tier>`
+/// label, which is what `tier_label` would produce.
+pub(crate) fn build_codex_entries(
+    codex: &crate::codex_profiles::CodexState,
+    interval_ms: u64,
+) -> Vec<ProfileEntry> {
     let now = now_ms();
-    let active = codex.active_profile().cloned();
+    let active = codex.active_profile();
     codex
         .profiles()
         .iter()
@@ -564,23 +566,33 @@ pub(crate) fn build_codex_entries(interval_ms: u64) -> Vec<ProfileEntry> {
             let cached: Option<UsageInfo> = load_profile_cache(name, USAGE_CACHE_FILE);
             ProfileEntry {
                 name: name.clone(),
-                active: active.as_ref().is_some_and(|a| a == name),
+                active: active.is_some_and(|a| a == name),
                 // Rolling tokens are a claude-side mechanism (a `session-token`
                 // sidecar); codex holds one chain in one auth.json.
                 rolling_token: false,
                 provider: "openai".to_string(),
                 base_url: None,
-                tier: cached
-                    .as_ref()
-                    .and_then(|u| u.plan.as_ref())
-                    .and_then(|p| p.codex_plan.clone()),
+                tier: crate::codex_auth::plan_label(
+                    name.as_str(),
+                    cached
+                        .as_ref()
+                        .and_then(|u| u.plan.as_ref())
+                        .and_then(|p| p.codex_plan.as_deref()),
+                ),
                 harness: "codex".to_string(),
                 has_live_session: crate::runtime::has_live_session(name),
-                // The claude auth grades read `.credentials.json` and the
-                // keychain, neither of which a codex profile has. A chain that
-                // cannot be read at all is the only codex-side "broken", and
-                // the usage leg reports that as a missing reading.
-                auth_status: if cached.is_some() { "ok" } else { "unknown" }.to_string(),
+                // `broken` is the server's terminal verdict on the chain
+                // (`codex_auth::read_quarantine`), the codex twin of the claude
+                // `auth_broken` grade; `expired` has no codex reading, since the
+                // standby leg rotates on the access token's own clock.
+                auth_status: if crate::codex_auth::read_quarantine(name.as_str()).is_some() {
+                    "broken"
+                } else if cached.is_some() {
+                    "ok"
+                } else {
+                    "unknown"
+                }
+                .to_string(),
                 fetch_status: mtime_ms.map(|mt| {
                     if now.saturating_sub(mt) < interval_ms {
                         "Fresh"
@@ -646,10 +658,13 @@ pub(crate) fn build_status(
     include_disabled: bool,
 ) -> StatusBody {
     let mut profiles = build_profile_entries(config, interval_ms, live, include_disabled);
+    // One read feeds both the entries and the slots below, so a load error
+    // publishes an empty roster AND empty slots rather than a body whose two
+    // halves describe different files.
+    let codex = crate::codex_profiles::CodexState::load().unwrap_or_default();
     // Appended, never interleaved: a reader that predates codex takes the
     // prefix it always took.
-    profiles.extend(build_codex_entries(interval_ms));
-    let codex = crate::codex_profiles::CodexState::load().unwrap_or_default();
+    profiles.extend(build_codex_entries(&codex, interval_ms));
     // Stamped after the entries build (each entry reads its own clock) so
     // `generated_at` never precedes the instant a per-entry verdict was judged at.
     let now = now_ms();

@@ -1450,6 +1450,14 @@ fn the_codex_surface_is_additive_and_appended() {
         cx1["active"], true,
         "the codex active marker is the codex slot's"
     );
+    // One load feeds both halves: the entries' flags name exactly the profile
+    // the top-level slot names, in one body.
+    let flagged: Vec<&str> = profiles
+        .iter()
+        .filter(|p| p["harness"] == "codex" && p["active"] == true)
+        .filter_map(|p| p["name"].as_str())
+        .collect();
+    assert_eq!(flagged, [v["active_codex_profile"].as_str().unwrap()]);
     assert_eq!(cx1["provider"], "openai");
     assert_eq!(
         cx1["rolling_token"], false,
@@ -1459,6 +1467,82 @@ fn the_codex_surface_is_additive_and_appended() {
         cx1["tier"].is_null(),
         "no reading yet means no plan — never a fabricated Claude tier"
     );
+}
+
+/// The codex `tier`: the plan a poll cached is authoritative, the id_token's
+/// `chatgpt_plan_type` claim stands in while no poll has answered (settled
+/// question 5), and no claim plus no cache stays `null`. `auth_status` reads
+/// `broken` off the quarantine record ahead of the cache-derived grades.
+#[test]
+fn codex_entries_fall_back_to_the_id_token_plan_and_publish_broken() {
+    let home = crate::testutil::HomeSandbox::new();
+    let dir = home.home().join(".clauth");
+    crate::profile::mkdir_700(&dir).expect("mkdir .clauth");
+    std::fs::write(
+        dir.join("codex-profiles.toml"),
+        "profiles = [\"claimed\", \"polled\", \"bare\", \"dead\"]\n",
+    )
+    .expect("write codex state");
+    let with_plan = |plan: &str| {
+        let id_token = crate::testutil::codex_jwt(&format!(
+            r#"{{"https://api.openai.com/auth":{{"chatgpt_account_id":"acc","chatgpt_plan_type":"{plan}"}}}}"#
+        ));
+        format!(
+            r#"{{"tokens":{{"id_token":"{id_token}","access_token":"at","refresh_token":"rt"}}}}"#
+        )
+    };
+    // Captured, never polled: the claim (normalized like the live plan).
+    crate::testutil::write_codex_store("claimed", &with_plan(" Plus "));
+    // Polled: the cache wins over a claim that disagrees.
+    crate::testutil::write_codex_store("polled", &with_plan("plus"));
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("polled"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::map_codex_usage(
+            r#"{"plan_type":"pro","rate_limit":{"primary_window":{"used_percent":3,"limit_window_seconds":18000,"reset_after_seconds":3600}}}"#,
+            crate::usage::now_epoch_secs(),
+        )
+        .expect("maps"),
+    );
+    // No claim, no cache.
+    crate::testutil::write_codex_store(
+        "bare",
+        r#"{"tokens":{"access_token":"at","refresh_token":"rt"}}"#,
+    );
+    // A chain the server declared dead.
+    crate::testutil::write_codex_store(
+        "dead",
+        &crate::testutil::codex_auth_body(&crate::testutil::jwt_with_exp(1_700_000_060), "rt.a"),
+    );
+    let invalidated = |_t: &str| -> Result<
+        crate::codex_auth::CodexTokenResponse,
+        crate::codex_auth::CodexRefreshError,
+    > { Err(crate::codex_auth::CodexRefreshError::Dead("invalidated")) };
+    assert_eq!(
+        crate::codex_auth::standby_pass(
+            "dead",
+            1_700_000_000_000,
+            "2026-08-13T00:00:00Z".into(),
+            &invalidated
+        ),
+        crate::codex_auth::StandbyOutcome::Failed
+    );
+
+    let codex = crate::codex_profiles::CodexState::load().expect("load");
+    let entries = build_codex_entries(&codex, 300_000);
+    let by_name = |name: &str| {
+        entries
+            .iter()
+            .find(|e| e.name.as_str() == name)
+            .unwrap_or_else(|| panic!("{name} is an entry"))
+    };
+    assert_eq!(by_name("claimed").tier.as_deref(), Some("plus"));
+    assert_eq!(by_name("claimed").auth_status, "unknown");
+    assert_eq!(by_name("polled").tier.as_deref(), Some("pro"));
+    assert_eq!(by_name("polled").auth_status, "ok");
+    assert_eq!(by_name("bare").tier, None);
+    assert_eq!(by_name("dead").auth_status, "broken");
+    assert_eq!(by_name("dead").tier, None);
 }
 
 /// The feed must publish the queue the ELECTION is running, not a wider one.

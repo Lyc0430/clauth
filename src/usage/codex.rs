@@ -170,7 +170,10 @@ pub(crate) fn map_usage(body: &str, now_secs: i64) -> Result<UsageInfo, FetchErr
 
     Ok(UsageInfo {
         plan: Some(PlanInfo {
-            codex_plan: raw.plan_type.map(|p| p.trim().to_ascii_lowercase()),
+            codex_plan: raw
+                .plan_type
+                .as_deref()
+                .and_then(crate::codex_auth::plan_word),
             ..PlanInfo::default()
         }),
         five_hour,

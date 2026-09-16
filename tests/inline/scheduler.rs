@@ -10870,3 +10870,125 @@ fn auto_start_queue_election_is_a_no_op_when_the_toggle_is_off() {
         "with the toggle off the queue never narrows anything"
     );
 }
+
+// ── the codex walk through its scheduler entry point ────────────────────────
+
+/// A codex roster on disk plus the readings the walk judges, written the way
+/// the codex leg leaves them: the store entries keyed by name, every member
+/// `Fresh`. `weekly` is the codex file's own line, absent for the default.
+fn seed_codex_walk(
+    state: &super::SchedulerState,
+    toml: &str,
+    readings: &[(&str, &str)],
+) -> crate::codex_profiles::CodexState {
+    let clauth = crate::profile::clauth_dir().expect("clauth dir");
+    crate::profile::mkdir_700(&clauth).expect("mkdir .clauth");
+    std::fs::write(clauth.join("codex-profiles.toml"), toml).expect("write codex state");
+    for (name, body) in readings {
+        let info = crate::usage::map_codex_usage(body, now_epoch_secs()).expect("maps");
+        state
+            .store
+            .lock()
+            .unwrap()
+            .insert((*name).to_string(), info);
+        state
+            .status
+            .lock()
+            .unwrap()
+            .insert((*name).to_string(), crate::usage::FetchStatus::Fresh);
+    }
+    crate::codex_profiles::CodexState::load().expect("load codex state")
+}
+
+const CODEX_SPENT: &str = r#"{"rate_limit":{"limit_reached":true,"primary_window":{"used_percent":99,"limit_window_seconds":18000,"reset_after_seconds":3600}}}"#;
+const CODEX_IDLE: &str = r#"{"rate_limit":{"primary_window":{"used_percent":3,"limit_window_seconds":18000,"reset_after_seconds":3600}}}"#;
+/// 5h idle, 7d at 60%: exhausted only for a weekly line at or under 60.
+const CODEX_WEEK_60: &str = r#"{"rate_limit":{"primary_window":{"used_percent":3,"limit_window_seconds":18000,"reset_after_seconds":3600},"secondary_window":{"used_percent":60,"limit_window_seconds":604800,"reset_after_seconds":86400}}}"#;
+
+fn codex_active() -> Option<String> {
+    crate::codex_profiles::CodexState::load()
+        .expect("load")
+        .active_profile()
+        .map(|n| n.as_str().to_string())
+}
+
+/// `apply_codex_switch` through its own entry point: a spent active with a
+/// fresh sibling moves the codex active marker ON DISK to that sibling; with
+/// wrap-off and every member spent it clears the marker. Deletable green
+/// before this existed.
+#[test]
+fn apply_codex_switch_moves_the_on_disk_marker() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = third_party_state(crate::providers::fetch_third_party_usage);
+    let codex = seed_codex_walk(
+        &state,
+        "active_profile = \"cx1\"\nprofiles = [\"cx1\", \"cx2\"]\nfallback_chain = [\"cx1\", \"cx2\"]\n",
+        &[("cx1", CODEX_SPENT), ("cx2", CODEX_IDLE)],
+    );
+    super::apply_codex_switch(&state, &codex, REFRESH_INTERVAL_MS);
+    assert_eq!(codex_active().as_deref(), Some("cx2"));
+
+    // Wrap-off, every member spent: the slot clears.
+    let codex = seed_codex_walk(
+        &state,
+        "active_profile = \"cx1\"\nprofiles = [\"cx1\", \"cx2\"]\nfallback_chain = [\"cx1\", \"cx2\"]\nwrap_off = true\n",
+        &[("cx1", CODEX_SPENT), ("cx2", CODEX_SPENT)],
+    );
+    super::apply_codex_switch(&state, &codex, REFRESH_INTERVAL_MS);
+    assert_eq!(
+        codex_active(),
+        None,
+        "every codex account spent: switched off"
+    );
+}
+
+/// The codex chain walks at the codex file's OWN weekly line, never the claude
+/// setting: `weekly_switch_threshold = 50.0` in `codex-profiles.toml` makes a
+/// member at 60% weekly exhausted while the claude state sits at its 98
+/// default, and without the key the codex default (98) leaves it alone.
+#[test]
+fn apply_codex_switch_walks_at_the_codex_weekly_line() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = third_party_state(crate::providers::fetch_third_party_usage);
+    assert_eq!(
+        state
+            .config
+            .lock()
+            .unwrap()
+            .state
+            .weekly_switch_threshold_pct(),
+        crate::profile::DEFAULT_WEEKLY_SWITCH_PCT,
+        "the claude line is at its default throughout"
+    );
+
+    // Without the key: 60% weekly is under the codex default, no switch.
+    let codex = seed_codex_walk(
+        &state,
+        "active_profile = \"cx1\"\nprofiles = [\"cx1\", \"cx2\"]\nfallback_chain = [\"cx1\", \"cx2\"]\n",
+        &[("cx1", CODEX_WEEK_60), ("cx2", CODEX_IDLE)],
+    );
+    assert_eq!(
+        codex.weekly_switch_threshold_pct(),
+        crate::profile::DEFAULT_WEEKLY_SWITCH_PCT
+    );
+    super::apply_codex_switch(&state, &codex, REFRESH_INTERVAL_MS);
+    assert_eq!(
+        codex_active().as_deref(),
+        Some("cx1"),
+        "under the line: stays"
+    );
+
+    // The codex line at 50: the same reading is exhausted for codex.
+    let codex = seed_codex_walk(
+        &state,
+        "active_profile = \"cx1\"\nprofiles = [\"cx1\", \"cx2\"]\nfallback_chain = [\"cx1\", \"cx2\"]\nweekly_switch_threshold = 50.0\n",
+        &[("cx1", CODEX_WEEK_60), ("cx2", CODEX_IDLE)],
+    );
+    assert_eq!(codex.weekly_switch_threshold_pct(), 50.0);
+    super::apply_codex_switch(&state, &codex, REFRESH_INTERVAL_MS);
+    assert_eq!(
+        codex_active().as_deref(),
+        Some("cx2"),
+        "over the codex line: hops, whatever the claude line says"
+    );
+}

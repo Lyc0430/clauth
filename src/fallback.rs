@@ -977,9 +977,13 @@ pub(crate) fn snapshot_chain(config: &AppConfig) -> Option<ChainSnapshot> {
 /// per-model weekly windows are a claude concept (`"7d fable"` and friends come
 /// from the anthropic `limits[]` array), and `wham/usage` has no equivalent. An
 /// armed gate would judge codex members against windows that can never appear.
+///
+/// `broken` and `kick_rejected` are filled HERE, where the claude builder
+/// leaves the second to the scheduler's scan: the codex verdicts live beside
+/// each store (`codex_auth::read_quarantine`) and in the kick map, not in any
+/// scheduler store, so this is the one place that can read them.
 pub(crate) fn snapshot_codex_chain(
     state: &crate::codex_profiles::CodexState,
-    weekly_pct: f64,
     interval_ms: u64,
 ) -> Option<ChainSnapshot> {
     let active = state.active_profile()?.clone();
@@ -987,6 +991,17 @@ pub(crate) fn snapshot_codex_chain(
     if !chain.iter().any(|n| n == &active) {
         return None;
     }
+    let weekly_pct = state.weekly_switch_threshold_pct();
+    let broken = chain
+        .iter()
+        .filter(|name| crate::codex_auth::read_quarantine(name.as_str()).is_some())
+        .cloned()
+        .collect();
+    let kick_rejected = chain
+        .iter()
+        .filter(|name| crate::codex_auth::kick_breaker_tripped(name.as_str()))
+        .cloned()
+        .collect();
     Some(ChainSnapshot {
         active,
         chain: chain
@@ -1003,14 +1018,14 @@ pub(crate) fn snapshot_codex_chain(
             })
             .collect(),
         switch_off_when_spent: state.switch_off_when_spent(),
-        broken: Vec::new(),
+        broken,
         burn_aware: false,
         interval_ms,
         burn_floor_pct: 0.0,
         burn_horizon_cap_ms: 0,
         spend_budget: false,
         switch_off_when_budget_spent: false,
-        kick_rejected: Vec::new(),
+        kick_rejected,
         fresh: Vec::new(),
     })
 }

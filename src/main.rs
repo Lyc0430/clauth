@@ -428,6 +428,10 @@ fn cmd_start(
                              mid-session — start without the flag"
                         );
                     }
+                    // Before `--explain` too, for the reason the claude arm runs
+                    // `admit` there: an explained start names what a real one
+                    // would do, never a target it would then refuse.
+                    codex_auth::refuse_if_quarantined(&canonical)?;
                     if explain_only {
                         outln!("{}", format::start_pick_line(&canonical, &[]));
                         return Ok(());
@@ -1555,9 +1559,10 @@ fn confirm_profile_delete(canonical: &str, yes: bool) -> Result<bool> {
 }
 
 /// The codex leg of [`cmd_delete`]: resolve against the codex roster, then the
-/// same confirm gate and the codex delete. No was-active postscript — nothing
-/// global is installed for a codex profile, so an active one's delete clears
-/// only its own state slot.
+/// same confirm gate, the same rotation guard, and the codex delete. The
+/// postscript names what a codex profile installs globally — the operator's
+/// `auth.json` slot the capture linked onto it — when the delete detached it,
+/// since the operator's own codex is logged out from that moment.
 fn cmd_delete_codex(config: &AppConfig, name: &str, yes: bool, force: bool) -> Result<()> {
     let Some(canonical) = codex_profiles::CodexState::load()?.canonical_name(name) else {
         return Err(unknown_profile_error(config, name));
@@ -1565,8 +1570,16 @@ fn cmd_delete_codex(config: &AppConfig, name: &str, yes: bool, force: bool) -> R
     if !confirm_profile_delete(&canonical, yes)? {
         return Ok(());
     }
-    actions::delete_codex_profile(&canonical, force)?;
-    outln!("clauth: deleted codex profile '{canonical}'.");
+    let rotation = actions::rotation_guard_for_mutation(&ProfileName::from(canonical.as_str()))?;
+    let detached = actions::delete_codex_profile(&canonical, force, &rotation)?;
+    outln!("clauth: removed codex profile '{canonical}'.");
+    if let Some(slot) = detached {
+        outln!(
+            "clauth: {} followed that profile's chain and is detached now, so your own codex \
+             has no login; run `codex login` to mint a fresh one",
+            slot.display()
+        );
+    }
     Ok(())
 }
 

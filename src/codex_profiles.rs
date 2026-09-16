@@ -40,12 +40,16 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::lock::StateLock;
-use crate::profile::{ProfileName, atomic_write_600, clauth_dir, mkdir_700, read_toml_file};
+use crate::profile::{
+    DEFAULT_WEEKLY_SWITCH_PCT, MAX_WEEKLY_SWITCH_PCT, MIN_WEEKLY_SWITCH_PCT, ProfileName,
+    atomic_write_600, clauth_dir, mkdir_700, read_toml_file,
+};
 
 /// The codex roster and its per-harness slots: the same four fields
 /// `profiles.toml` holds for claude — active marker, ordering, fallback chain,
-/// wrap-off — scoped to codex sessions alone. A codex switch writes this file
-/// and never `profiles.toml`; chains are strictly per-harness.
+/// wrap-off — plus the chain's own weekly line, scoped to codex sessions
+/// alone. A codex switch writes this file and never `profiles.toml`; chains
+/// are strictly per-harness.
 ///
 /// Slots are PRIVATE, deliberately breaking with [`crate::profile::AppState`]'s
 /// all-`pub(crate)` shape: every mutation goes through a writer on this type,
@@ -66,6 +70,13 @@ pub(crate) struct CodexState {
     /// files stay hand-editable by one rule.
     #[serde(rename = "wrap_off", default)]
     switch_off_when_spent: bool,
+    /// The codex chain's own weekly (7d) exhaustion line, percent — the codex
+    /// twin of [`crate::profile::AppState::weekly_switch_threshold`] under the
+    /// same on-disk key, hand-editable only (the Fallback tab is claude-only).
+    /// `None` = [`DEFAULT_WEEKLY_SWITCH_PCT`], and absent stays absent across a
+    /// save: the key is never invented into a file that did not carry it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    weekly_switch_threshold: Option<f64>,
 }
 
 impl CodexState {
@@ -78,7 +89,16 @@ impl CodexState {
         if !path.exists() {
             return Ok(Self::default());
         }
-        read_toml_file(&path)
+        let mut state: Self = read_toml_file(&path)?;
+        // Normalized at load the way `load_app_state` normalizes the claude
+        // line: left raw, an out-of-band hand-edit would survive every save.
+        // Through the accessor, so the band and its reset-to-default stay
+        // defined in one place; `None` stays `None`, so `skip_serializing_if`
+        // keeps omitting a key the file never carried.
+        if state.weekly_switch_threshold.is_some() {
+            state.weekly_switch_threshold = Some(state.weekly_switch_threshold_pct());
+        }
+        Ok(state)
     }
 
     /// Every codex profile, in roster order.
@@ -102,6 +122,17 @@ impl CodexState {
     /// member is spent — the codex twin of `AppState.switch_off_when_spent`.
     pub(crate) fn switch_off_when_spent(&self) -> bool {
         self.switch_off_when_spent
+    }
+
+    /// The effective codex weekly line: the configured value inside
+    /// [`MIN_WEEKLY_SWITCH_PCT`]`..=`[`MAX_WEEKLY_SWITCH_PCT`], else the
+    /// default — the same reset-not-clamp
+    /// [`crate::profile::AppState::weekly_switch_threshold_pct`] applies, since
+    /// a hand-edited `0.98` or `nan` must not silently disable the gate.
+    pub(crate) fn weekly_switch_threshold_pct(&self) -> f64 {
+        self.weekly_switch_threshold
+            .filter(|v| (MIN_WEEKLY_SWITCH_PCT..=MAX_WEEKLY_SWITCH_PCT).contains(v))
+            .unwrap_or(DEFAULT_WEEKLY_SWITCH_PCT)
     }
 
     /// Exact-match membership, same semantics as `AppConfig::find` answering

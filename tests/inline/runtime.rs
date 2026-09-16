@@ -3,7 +3,7 @@ use super::*;
 use std::fs;
 use std::time::{Duration, SystemTime};
 
-use crate::testutil::{HomeSandbox, set_mtime};
+use crate::testutil::{HomeSandbox, hold_rotation_lock, set_mtime};
 
 // V1 expires_at < V2 so tie-break tests can assert which side wins unambiguously.
 const CREDS_V1: &[u8] = br#"{"claudeAiOauth":{"accessToken":"tok1","expiresAt":1000}}"#;
@@ -3712,20 +3712,6 @@ fn teardown_retries_a_persistent_wedge_then_gives_up() {
         set_teardown_timeout_hook(None);
         crate::lock::set_state_lock_timeout_override(None);
     });
-}
-
-/// A locked handle on `name`'s rotation lock from a separate fd, standing in for
-/// another process mid-rotation — `flock(2)` binds to the open file description,
-/// so this genuinely contends with the acquire's own. Creates the locks directory
-/// the way `RotationGuard::open` does, since a real holder made it on its way in.
-/// Call INSIDE [`with_fake_home`].
-fn hold_rotation_lock(name: &str) -> std::fs::File {
-    let path =
-        crate::runtime::rotation_lock_path(&crate::profile::ProfileName::from(name)).expect("path");
-    crate::profile::mkdir_700(path.parent().expect("lock parent")).expect("locks dir");
-    let holder = crate::profile::open_state_file(&path).expect("open holder handle");
-    holder.lock().expect("hold the rotation lock");
-    holder
 }
 
 /// A wedge on the rotation lock ends the start with a NAMED failure instead of an

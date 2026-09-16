@@ -3600,12 +3600,9 @@ fn apply_codex_switch(
     codex: &crate::codex_profiles::CodexState,
     interval_ms: u64,
 ) {
-    let weekly_pct = match state.config.lock() {
-        Ok(cfg) => cfg.state.weekly_switch_threshold_pct(),
-        Err(_) => return,
-    };
-    let Some(mut snapshot) = crate::fallback::snapshot_codex_chain(codex, weekly_pct, interval_ms)
-    else {
+    // Nothing off the claude config reaches this walk: the weekly line, like
+    // every other slot, is the codex file's own (decision 4).
+    let Some(mut snapshot) = crate::fallback::snapshot_codex_chain(codex, interval_ms) else {
         return;
     };
     // Folded fix 1, answered where it actually bites rather than by changing a

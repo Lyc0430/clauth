@@ -5290,14 +5290,24 @@ fn weekly_override_on_a_sink_active_still_stays_put_over_paying() {
 
 // ── the codex chain ─────────────────────────────────────────────────────────
 
-fn codex_state(active: &str, chain: &[&str], wrap_off: bool) -> crate::codex_profiles::CodexState {
+/// The snapshot reads each member's quarantine record off disk, so every test
+/// through it holds a sandbox — an empty one reads as "no verdict anywhere".
+fn codex_state(
+    active: &str,
+    chain: &[&str],
+    wrap_off: bool,
+    weekly: Option<f64>,
+) -> crate::codex_profiles::CodexState {
     let toml = format!(
-        "active_profile = \"{active}\"\nprofiles = [{list}]\nfallback_chain = [{list}]\nwrap_off = {wrap_off}\n",
+        "active_profile = \"{active}\"\nprofiles = [{list}]\nfallback_chain = [{list}]\nwrap_off = {wrap_off}\n{weekly}",
         list = chain
             .iter()
             .map(|n| format!("\"{n}\""))
             .collect::<Vec<_>>()
-            .join(", ")
+            .join(", "),
+        weekly = weekly.map_or(String::new(), |w| format!(
+            "weekly_switch_threshold = {w:?}\n"
+        ))
     );
     toml::from_str(&toml).expect("codex state fixture")
 }
@@ -5307,8 +5317,9 @@ fn codex_state(active: &str, chain: &[&str], wrap_off: bool) -> crate::codex_pro
 /// reaches it, which is what keeps the two harnesses' rotations independent.
 #[test]
 fn the_codex_chain_reads_only_the_codex_state() {
-    let state = codex_state("cx1", &["cx1", "cx2"], true);
-    let snap = crate::fallback::snapshot_codex_chain(&state, 95.0, 60_000)
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = codex_state("cx1", &["cx1", "cx2"], true, Some(95.0));
+    let snap = crate::fallback::snapshot_codex_chain(&state, 60_000)
         .expect("an active member of its own chain");
     assert_eq!(snap.active.as_str(), "cx1");
     assert_eq!(
@@ -5322,7 +5333,11 @@ fn the_codex_chain_reads_only_the_codex_state() {
         snap.switch_off_when_spent,
         "the codex wrap-off, not claude's"
     );
-    assert_eq!(snap.chain[0].weekly_line, 95.0);
+    assert_eq!(
+        snap.chain[0].weekly_line, 95.0,
+        "the codex file's own weekly line, not the claude default"
+    );
+    assert!(snap.broken.is_empty() && snap.kick_rejected.is_empty());
 }
 
 /// `check_scoped` is DISARMED on every codex member: per-model weekly windows
@@ -5330,8 +5345,9 @@ fn the_codex_chain_reads_only_the_codex_state() {
 /// an armed gate would judge codex against windows that can never appear.
 #[test]
 fn codex_members_never_arm_the_scoped_gate() {
-    let state = codex_state("cx1", &["cx1", "cx2"], false);
-    let snap = crate::fallback::snapshot_codex_chain(&state, 95.0, 60_000).expect("snapshot");
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = codex_state("cx1", &["cx1", "cx2"], false, None);
+    let snap = crate::fallback::snapshot_codex_chain(&state, 60_000).expect("snapshot");
     assert!(
         snap.chain.iter().all(|m| !m.check_scoped),
         "no codex member arms a gate its harness cannot answer"
@@ -5343,10 +5359,11 @@ fn codex_members_never_arm_the_scoped_gate() {
 /// instead of walking a chain the active is not on.
 #[test]
 fn a_codex_active_outside_its_chain_yields_no_snapshot() {
-    let state = codex_state("cx9", &["cx1", "cx2"], false);
-    assert!(crate::fallback::snapshot_codex_chain(&state, 95.0, 60_000).is_none());
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = codex_state("cx9", &["cx1", "cx2"], false, None);
+    assert!(crate::fallback::snapshot_codex_chain(&state, 60_000).is_none());
     let empty = crate::codex_profiles::CodexState::default();
-    assert!(crate::fallback::snapshot_codex_chain(&empty, 95.0, 60_000).is_none());
+    assert!(crate::fallback::snapshot_codex_chain(&empty, 60_000).is_none());
 }
 
 /// The codex chain walks on the SAME predicates the claude one does, over the
@@ -5355,8 +5372,9 @@ fn a_codex_active_outside_its_chain_yields_no_snapshot() {
 /// the `wham/usage` mapping.
 #[test]
 fn a_spent_codex_active_moves_to_the_next_member() {
-    let state = codex_state("cx1", &["cx1", "cx2"], false);
-    let snap = crate::fallback::snapshot_codex_chain(&state, 95.0, 60_000).expect("snapshot");
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = codex_state("cx1", &["cx1", "cx2"], false, None);
+    let snap = crate::fallback::snapshot_codex_chain(&state, 60_000).expect("snapshot");
     let spent = crate::usage::map_codex_usage(
         r#"{"rate_limit":{"limit_reached":true,"primary_window":{"used_percent":99,"limit_window_seconds":18000,"reset_after_seconds":3600}}}"#,
         crate::usage::now_epoch_secs(),
@@ -5374,6 +5392,188 @@ fn a_spent_codex_active_moves_to_the_next_member() {
     assert_eq!(
         crate::fallback::next_auto_switch_target_for_test(&snap, &store),
         Some(crate::fallback::SwitchAction::To("cx2".to_string()))
+    );
+}
+
+const CODEX_SPENT_BODY: &str = r#"{"rate_limit":{"limit_reached":true,"primary_window":{"used_percent":99,"limit_window_seconds":18000,"reset_after_seconds":3600}}}"#;
+const CODEX_IDLE_BODY: &str = r#"{"rate_limit":{"primary_window":{"used_percent":3,"limit_window_seconds":18000,"reset_after_seconds":3600}}}"#;
+
+/// The readings the walk judges, keyed by member and mapped the way the codex
+/// leg maps a `wham/usage` body.
+fn codex_readings(
+    rows: &[(&str, &str)],
+) -> std::collections::HashMap<String, crate::usage::UsageInfo> {
+    rows.iter()
+        .map(|(name, body)| {
+            (
+                (*name).to_string(),
+                crate::usage::map_codex_usage(body, crate::usage::now_epoch_secs()).expect("maps"),
+            )
+        })
+        .collect()
+}
+
+/// A chain the server declared dead is excluded from the codex walk: the
+/// verdict lands as the quarantine record the standby pass writes (its real
+/// writer, driven here with a `Reused` refresher), the next snapshot lists the
+/// member in `broken`, and the walk never picks it — the spent active stays
+/// put with no viable sibling rather than hopping onto a chain that cannot
+/// authenticate. A tripped kick breaker lists a member in `kick_rejected` the
+/// same way, and only a TRIPPED one: a kick the breaker still honors is a
+/// forced attempt still owed, not a rejection.
+#[test]
+fn a_quarantined_codex_member_is_walked_around() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let now_ms: i64 = 1_700_000_000_000;
+    let state = codex_state("cx1", &["cx1", "cx2", "cx3"], false, None);
+    let store = codex_readings(&[
+        ("cx1", CODEX_SPENT_BODY),
+        ("cx2", CODEX_IDLE_BODY),
+        ("cx3", CODEX_IDLE_BODY),
+    ]);
+
+    // Control: every sibling idle, the walk hops to the next member.
+    let snap = crate::fallback::snapshot_codex_chain(&state, 60_000).expect("snapshot");
+    assert!(snap.broken.is_empty());
+    assert_eq!(
+        crate::fallback::next_auto_switch_target_for_test(&snap, &store),
+        Some(crate::fallback::SwitchAction::To("cx2".to_string()))
+    );
+
+    // cx2's chain dies on the wire: the pass records the verdict.
+    crate::testutil::write_codex_store(
+        "cx2",
+        &crate::testutil::codex_auth_body(
+            &crate::testutil::jwt_with_exp((now_ms / 1000) + 60),
+            "rt.cx2",
+        ),
+    );
+    let reused = |_t: &str| -> Result<
+        crate::codex_auth::CodexTokenResponse,
+        crate::codex_auth::CodexRefreshError,
+    > { Err(crate::codex_auth::CodexRefreshError::Reused) };
+    assert_eq!(
+        crate::codex_auth::standby_pass("cx2", now_ms, "2026-08-13T00:00:00Z".into(), &reused),
+        crate::codex_auth::StandbyOutcome::Failed
+    );
+
+    let snap = crate::fallback::snapshot_codex_chain(&state, 60_000).expect("snapshot");
+    assert_eq!(snap.broken, [crate::profile::ProfileName::from("cx2")]);
+    assert_eq!(
+        crate::fallback::next_auto_switch_target_for_test(&snap, &store),
+        Some(crate::fallback::SwitchAction::To("cx3".to_string())),
+        "the walk steps over the dead chain to the next live member"
+    );
+
+    // Two 401 kicks on cx3, none healed: the second is still inside the
+    // breaker (strikes = KICK_BREAKER), so a forced attempt is still owed and
+    // the member is NOT kick-rejected.
+    for _ in 0..2 {
+        crate::codex_auth::kick_codex("cx3");
+    }
+    let snap = crate::fallback::snapshot_codex_chain(&state, 60_000).expect("snapshot");
+    assert!(
+        snap.kick_rejected.is_empty(),
+        "a kick the breaker still honors is not a rejection"
+    );
+    assert_eq!(
+        crate::fallback::next_auto_switch_target_for_test(&snap, &store),
+        Some(crate::fallback::SwitchAction::To("cx3".to_string()))
+    );
+
+    // The third trips it: kick-rejected, and with both siblings excluded the
+    // spent active has nowhere to go.
+    crate::codex_auth::kick_codex("cx3");
+    let snap = crate::fallback::snapshot_codex_chain(&state, 60_000).expect("snapshot");
+    assert_eq!(
+        snap.kick_rejected,
+        [crate::profile::ProfileName::from("cx3")]
+    );
+    assert_eq!(
+        crate::fallback::next_auto_switch_target_for_test(&snap, &store),
+        None,
+        "no viable member: the walk answers nothing rather than a dead chain"
+    );
+    crate::codex_auth::kick_reset("cx3");
+    crate::codex_auth::clear_quarantine("cx2");
+}
+
+/// A rotation the wire accepted but the store could not keep is a terminal
+/// verdict the pass already holds: the old token is spent server-side and the
+/// new pair exists nowhere. The record is written against the old token —
+/// what the store still holds — so the walk steps over the member; a fresh
+/// chain landing by any path, a clear call or not, lifts it.
+#[test]
+fn a_rotation_the_store_could_not_keep_is_walked_around() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let now_ms: i64 = 1_700_000_000_000;
+    let state = codex_state("cxl1", &["cxl1", "cxl2", "cxl3"], false, None);
+    let store = codex_readings(&[
+        ("cxl1", CODEX_SPENT_BODY),
+        ("cxl2", CODEX_IDLE_BODY),
+        ("cxl3", CODEX_IDLE_BODY),
+    ]);
+    let auth = crate::profile::profile_dir(&crate::profile::ProfileName::from("cxl2"))
+        .expect("dir")
+        .join("auth.json");
+    let old = crate::testutil::codex_auth_body(
+        &crate::testutil::jwt_with_exp((now_ms / 1000) + 60),
+        "rt.old",
+    );
+    crate::testutil::write_codex_store("cxl2", &old);
+
+    // The wire accepts, then the store cannot take the pair: a directory sits
+    // where the file was, so the atomic rename fails on every platform.
+    let minted = |_t: &str| -> Result<
+        crate::codex_auth::CodexTokenResponse,
+        crate::codex_auth::CodexRefreshError,
+    > {
+        std::fs::remove_file(&auth).expect("drop the store");
+        std::fs::create_dir(&auth).expect("occupy the store path");
+        Ok(crate::codex_auth::CodexTokenResponse {
+            id_token: None,
+            access_token: crate::testutil::jwt_with_exp((now_ms / 1000) + 3600),
+            refresh_token: "rt.new".into(),
+        })
+    };
+    assert_eq!(
+        crate::codex_auth::standby_pass("cxl2", now_ms, "2026-08-13T00:00:00Z".into(), &minted),
+        crate::codex_auth::StandbyOutcome::Failed
+    );
+    // What the store still holds: the token the wire just spent.
+    std::fs::remove_dir(&auth).expect("free the store path");
+    crate::testutil::write_codex_store("cxl2", &old);
+    assert_eq!(
+        crate::codex_auth::read_quarantine("cxl2"),
+        Some(crate::codex_auth::CodexQuarantine {
+            kind: "lost".into(),
+            at: "2026-08-13T00:00:00Z".into(),
+            token_fingerprint: crate::codex_auth::token_fingerprint("rt.old"),
+        })
+    );
+
+    let snap = crate::fallback::snapshot_codex_chain(&state, 60_000).expect("snapshot");
+    assert_eq!(snap.broken, [crate::profile::ProfileName::from("cxl2")]);
+    assert_eq!(
+        crate::fallback::next_auto_switch_target_for_test(&snap, &store),
+        Some(crate::fallback::SwitchAction::To("cxl3".to_string())),
+        "the walk steps over the chain whose token the wire already spent"
+    );
+
+    // A fresh chain lands with no clear call: the verdict has no claim on it.
+    crate::testutil::write_codex_store(
+        "cxl2",
+        &crate::testutil::codex_auth_body(
+            &crate::testutil::jwt_with_exp((now_ms / 1000) + 3600),
+            "rt.fresh",
+        ),
+    );
+    let snap = crate::fallback::snapshot_codex_chain(&state, 60_000).expect("snapshot");
+    assert!(snap.broken.is_empty());
+    assert_eq!(
+        crate::fallback::next_auto_switch_target_for_test(&snap, &store),
+        Some(crate::fallback::SwitchAction::To("cxl2".to_string())),
+        "a fresh chain is back in the walk"
     );
 }
 

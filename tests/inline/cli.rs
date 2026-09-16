@@ -3124,12 +3124,7 @@ fn cli_delete_refuses_while_a_rotation_holds_the_lock() {
         .expect("create profile");
 
     // Another process mid-rotation: a locked handle on a separate fd.
-    let lock_path =
-        crate::runtime::rotation_lock_path(&crate::profile::ProfileName::from("cli-held"))
-            .expect("rotation lock path");
-    crate::profile::mkdir_700(lock_path.parent().expect("lock parent")).expect("locks dir");
-    let holder = crate::profile::open_state_file(&lock_path).expect("open holder handle");
-    holder.lock().expect("hold the rotation lock");
+    let _holder = crate::testutil::hold_rotation_lock("cli-held");
 
     // Spelled in a case `canonical_name` has to fold, so the argument and the
     // resolved name DIFFER: guarding the raw argument locks a path nothing
@@ -3222,6 +3217,98 @@ fn codex_start_refuses_with_fallback_by_name() {
     .expect_err("--with-fallback refuses on codex");
     assert!(err.to_string().contains("--with-fallback"), "{err}");
     assert!(err.to_string().contains("NEXT start"), "{err}");
+}
+
+/// `cmd_delete_codex` takes the rotation guard exactly where `cmd_delete`
+/// does — after the confirm gate, before the delete — so a codex name typed at
+/// the CLI under an in-flight rotation refuses with the same words and touches
+/// nothing. Spelled in a case `canonical_name` folds, like the claude twin.
+#[test]
+fn cli_codex_delete_refuses_while_a_rotation_holds_the_lock() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let clauth = crate::profile::clauth_dir().expect("clauth dir");
+    crate::profile::mkdir_700(&clauth).expect("mkdir .clauth");
+    std::fs::write(
+        clauth.join("codex-profiles.toml"),
+        "active_profile = \"cx-held\"\nprofiles = [\"cx-held\"]\n",
+    )
+    .expect("write codex state");
+    crate::testutil::write_codex_store("cx-held", "{}");
+
+    let _holder = crate::testutil::hold_rotation_lock("cx-held");
+
+    let outcome = dispatch(
+        Cli::try_parse_from(["clauth", "delete", "CX-HELD", "--yes"]).expect("delete must parse"),
+    );
+
+    assert!(
+        crate::profile::profile_dir(&crate::profile::ProfileName::from("cx-held"))
+            .expect("profile dir")
+            .join("auth.json")
+            .exists(),
+        "a refused delete leaves the store on disk"
+    );
+    let state = crate::codex_profiles::CodexState::load().expect("reload codex state");
+    assert!(
+        state.holds("cx-held"),
+        "a refused delete leaves the roster entry"
+    );
+    assert_eq!(state.active_profile().map(|n| n.as_str()), Some("cx-held"));
+    assert_eq!(
+        outcome
+            .expect_err("an in-flight rotation must block the CLI codex delete")
+            .to_string(),
+        "'cx-held' has a token rotation in progress, retry in a moment"
+    );
+}
+
+/// A quarantined codex profile refuses `clauth start` by name — `--explain`
+/// included, the way the claude arm runs `admit` there — naming the fix,
+/// before any spawn. The explain leg runs first: it is the one that can red by
+/// assertion if the refusal moves or goes (it prints the pick and returns
+/// `Ok`), where the real leg would run on into `start::run_codex` and spawn
+/// the operator's `codex`, whose exit takes the whole test binary down.
+#[test]
+fn codex_start_refuses_a_quarantined_chain_by_name() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let clauth = crate::profile::clauth_dir().expect("clauth dir");
+    crate::profile::mkdir_700(&clauth).expect("mkdir .clauth");
+    std::fs::write(clauth.join("codex-profiles.toml"), "profiles = [\"cx\"]\n")
+        .expect("write codex state");
+    crate::testutil::write_codex_store(
+        "cx",
+        &crate::testutil::codex_auth_body(&crate::testutil::jwt_with_exp(1_700_000_060), "rt.a"),
+    );
+    let expired = |_t: &str| -> Result<
+        crate::codex_auth::CodexTokenResponse,
+        crate::codex_auth::CodexRefreshError,
+    > { Err(crate::codex_auth::CodexRefreshError::Dead("expired")) };
+    assert_eq!(
+        crate::codex_auth::standby_pass(
+            "cx",
+            1_700_000_000_000,
+            "2026-08-13T00:00:00Z".into(),
+            &expired
+        ),
+        crate::codex_auth::StandbyOutcome::Failed
+    );
+
+    for explain_only in [true, false] {
+        let err = cmd_start(
+            &crate::cli::StartTarget::Named("CX".to_owned()),
+            &[],
+            Isolation::Shared,
+            false,
+            explain_only,
+        )
+        .expect_err("a dead chain refuses the start");
+        assert_eq!(
+            err.to_string(),
+            "'cx': codex chain is broken (expired since 2026-08-13T00:00:00Z), \
+             run `clauth login cx --codex --browser`",
+            "explain_only = {explain_only}"
+        );
+    }
 }
 
 // ── login paste door: the piped reader and the raw-mode key loop ─────────────

@@ -15,7 +15,11 @@
 //!   a daemon restart, which forgets every in-memory map, does not re-send a
 //!   token the server may have already consumed. Only the health kick
 //!   (401-triggered) may retry past the memo, one forced attempt per kick and
-//!   two consecutive kicks at most.
+//!   two consecutive kicks at most. A verdict the server calls terminal
+//!   leaves a quarantine record beside the memo, bound to the token it
+//!   judged, and every surface that would hand the chain to a session — the
+//!   walk, the feed, start, switch — reads it for as long as that token is
+//!   the one in the store: browser re-login is the only exit.
 //! - **Stand down where a live carrier holds the chain.** Under real symlinks
 //!   a live session reads the very file a rotation writes, so the only race is
 //!   codex's own five-minute pre-expiry window; under the fake transport the
@@ -104,6 +108,21 @@ impl CodexAuth {
         self.token_str("account_id").filter(|t| !t.is_empty())
     }
 
+    /// The id_token's `chatgpt_plan_type` claim, nested where
+    /// `codex_login::chatgpt_account_id` reads the account id, through
+    /// [`plan_word`]. The FALLBACK plan label for an account no poll has
+    /// answered for yet (settled question 5): stale the moment a plan changes,
+    /// unverified like every payload read here, and never an authorization
+    /// input.
+    pub(crate) fn id_token_plan(&self) -> Option<String> {
+        plan_word(
+            jwt_payload(self.token_str("id_token")?)?
+                .get("https://api.openai.com/auth")?
+                .get("chatgpt_plan_type")?
+                .as_str()?,
+        )
+    }
+
     /// `last_refresh` as epoch ms — codex writes it as an RFC-3339 stamp. The
     /// fallback schedule signal when the access token's JWT `exp` is
     /// unreadable, exactly as codex's own manager falls back to it.
@@ -124,7 +143,7 @@ impl CodexAuth {
 
     /// The rotated pair folded in: the three token slots and `last_refresh`,
     /// everything else byte-preserved. Mirrors codex's own `persist_tokens`.
-    pub(crate) fn with_rotated(mut self, tok: &CodexTokenResponse, now_rfc3339: String) -> Self {
+    pub(crate) fn with_rotated(mut self, tok: &CodexTokenResponse, now_rfc3339: &str) -> Self {
         if let Some(obj) = self.raw.as_object_mut() {
             let tokens = obj.entry("tokens").or_insert_with(|| serde_json::json!({}));
             if let Some(t) = tokens.as_object_mut() {
@@ -134,6 +153,15 @@ impl CodexAuth {
                 t.insert("access_token".into(), serde_json::json!(tok.access_token));
                 t.insert("refresh_token".into(), serde_json::json!(tok.refresh_token));
             }
+        }
+        self.with_last_refresh(now_rfc3339)
+    }
+
+    /// `last_refresh` re-stamped to `now_rfc3339`, everything else
+    /// byte-preserved: the stamp codex's `persist_tokens` writes on every chain
+    /// event, which a capture is too.
+    pub(crate) fn with_last_refresh(mut self, now_rfc3339: &str) -> Self {
+        if let Some(obj) = self.raw.as_object_mut() {
             obj.insert("last_refresh".into(), serde_json::json!(now_rfc3339));
         }
         self
@@ -158,6 +186,15 @@ pub(crate) fn jwt_payload(jwt: &str) -> Option<serde_json::Value> {
 /// `exp` (epoch ms) out of an unverified JWT payload.
 pub(crate) fn jwt_exp_ms(jwt: &str) -> Option<i64> {
     jwt_payload(jwt)?.get("exp")?.as_i64()?.checked_mul(1000)
+}
+
+/// The one normalizer for a ChatGPT plan word, wherever it was read (the
+/// `wham/usage` `plan_type`, the id_token's `chatgpt_plan_type` claim):
+/// trimmed and lowercased, and an empty word is no word, so every reader
+/// falls back the same way on `""` as on an absent key.
+pub(crate) fn plan_word(raw: &str) -> Option<String> {
+    let plan = raw.trim().to_ascii_lowercase();
+    (!plan.is_empty()).then_some(plan)
 }
 
 /// Base64url (no padding) decode — the JWT alphabet. Hand-rolled because the
@@ -197,16 +234,40 @@ fn base64url_decode_nopad(s: &str) -> Option<Vec<u8>> {
 /// classifies the server's `error` field (spec, verified against
 /// rust-v0.145.0): `refresh_token_reused` is PERMANENT — the replay answer —
 /// `refresh_token_expired`/`refresh_token_invalidated` need a browser
-/// re-login, and everything else is a retry-later.
+/// re-login, and everything else is a retry-later. Which verdicts quarantine
+/// the chain is [`CodexRefreshError::quarantine_kind`]'s answer, not the
+/// variant's.
 #[derive(Debug)]
 pub(crate) enum CodexRefreshError {
     /// The single-use token was already spent — a second carrier exists or a
     /// reply was lost. Browser re-login only.
     Reused,
-    /// The chain aged out or was revoked server-side. Browser re-login.
+    /// The chain aged out or was revoked server-side (`expired`,
+    /// `invalidated`), or the token endpoint answered an unrecognized 4xx
+    /// (`rejected`). Browser re-login for the first two.
     Dead(&'static str),
     /// Network/5xx/429 — nothing is known to have been consumed.
     Transient(String),
+}
+
+impl CodexRefreshError {
+    /// The quarantine kind this verdict earns, or `None` for one that must
+    /// not lock the chain out of start, switch and the walk: `Transient` by
+    /// definition, and `Dead("rejected")` because an unrecognized 4xx is a
+    /// statement about the front door (a WAF 403, a moved endpoint's 404, a
+    /// contract-drift 400), never about the chain — it hits every profile at
+    /// once, and a re-login line cannot help. `rejected` keeps what it had
+    /// before the record existed: the memo blocks the routine leg, a kick may
+    /// force one attempt, the breaker bounds the kicks. The three verdicts the
+    /// server spells about the chain itself quarantine: `reused`, `expired`,
+    /// `invalidated`.
+    fn quarantine_kind(&self) -> Option<&'static str> {
+        match self {
+            CodexRefreshError::Reused => Some("reused"),
+            CodexRefreshError::Dead(kind @ ("expired" | "invalidated")) => Some(kind),
+            CodexRefreshError::Dead(_) | CodexRefreshError::Transient(_) => None,
+        }
+    }
 }
 
 impl std::fmt::Display for CodexRefreshError {
@@ -265,10 +326,38 @@ pub(crate) fn refresh_codex_chain_at(
     }
 }
 
+/// Test-only [`CODEX_TOKEN_URL`] override: [`standby_tick`] hardwires the
+/// production refresher, so its wire is unreachable offline without one.
+/// Serialized by `profile::HOME_TEST_LOCK`. Never compiled into the binary.
+#[cfg(test)]
+static TOKEN_URL_OVERRIDE: Mutex<Option<String>> = Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_token_url_override(url: &str) {
+    if let Ok(mut guard) = TOKEN_URL_OVERRIDE.lock() {
+        *guard = Some(url.to_string());
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn clear_token_url_override() {
+    if let Ok(mut guard) = TOKEN_URL_OVERRIDE.lock() {
+        *guard = None;
+    }
+}
+
+fn token_url() -> std::borrow::Cow<'static, str> {
+    #[cfg(test)]
+    if let Some(url) = TOKEN_URL_OVERRIDE.lock().ok().and_then(|g| g.clone()) {
+        return std::borrow::Cow::Owned(url);
+    }
+    std::borrow::Cow::Borrowed(CODEX_TOKEN_URL)
+}
+
 pub(crate) fn refresh_codex_chain(
     refresh_token: &str,
 ) -> std::result::Result<CodexTokenResponse, CodexRefreshError> {
-    refresh_codex_chain_at(CODEX_TOKEN_URL, refresh_token)
+    refresh_codex_chain_at(&token_url(), refresh_token)
 }
 
 /// Classify a non-2xx refresh reply. The `error` field is matched over the
@@ -295,7 +384,9 @@ fn classify_refresh_failure(status: u16, body: &str) -> CodexRefreshError {
 
 // ── the attempt memo (no-replay) ─────────────────────────────────────────────
 
-fn token_fingerprint(token: &str) -> String {
+/// The first 8 bytes of a token's SHA-256, hex: what the memo and the
+/// quarantine record hold in place of the token itself.
+pub(crate) fn token_fingerprint(token: &str) -> String {
     use sha2::Digest as _;
     let mut h = sha2::Sha256::new();
     h.update(token.as_bytes());
@@ -326,12 +417,13 @@ fn attempted_matches(name: &str, token: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn mark_attempted(name: &str, token: &str) {
-    if let Ok(path) = attempt_memo_path(name)
-        && let Err(e) = crate::profile::atomic_write_600(&path, token_fingerprint(token))
-    {
-        logline!("clauth: codex attempt memo write for '{name}' failed: {e}");
-    }
+/// Land the memo, or say which path refused. Fail-CLOSED at the call site: a
+/// memo that did not reach disk protects nothing across a restart, so the
+/// token it would have covered must not go on the wire.
+fn mark_attempted(name: &str, token: &str) -> Result<()> {
+    let path = attempt_memo_path(name)?;
+    crate::profile::atomic_write_600(&path, token_fingerprint(token))
+        .with_context(|| format!("failed to write the no-replay memo {}", path.display()))
 }
 
 fn clear_attempted(name: &str) {
@@ -344,6 +436,98 @@ fn clear_attempted(name: &str) {
 /// (capture/login) that installs a fresh chain the old memo has no claim on.
 pub(crate) fn forget_attempt(name: &str) {
     clear_attempted(name);
+}
+
+// ── the quarantine record ───────────────────────────────────────────────────
+
+/// A terminal verdict on a chain, bound to the refresh token it judged: `kind`
+/// is `reused` (the replay answer), `expired` or `invalidated` — the three the
+/// server spells about the chain itself ([`CodexRefreshError::quarantine_kind`]
+/// says why `rejected` is not one) — or `lost`, clauth's own: the wire
+/// accepted a rotation whose pair never reached the store, so the token the
+/// store still holds is spent server-side. `at` is the RFC-3339 stamp of the
+/// pass that heard it, `token_fingerprint` the judged token's, so the record
+/// speaks only while that token is the one in the store. The codex twin of
+/// `AppState::auth_broken`, kept as a file beside the store like the memo and
+/// the belt rather than a slot in `codex-profiles.toml`: the verdict lands
+/// under the rotation guard, on the standby thread, where the state flock is
+/// not held.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct CodexQuarantine {
+    pub(crate) kind: String,
+    pub(crate) at: String,
+    pub(crate) token_fingerprint: String,
+}
+
+fn quarantine_path(name: &str) -> Result<std::path::PathBuf> {
+    profile_subpath(&ProfileName::from(name), "auth.quarantine.json")
+}
+
+/// The one reader every consumer goes through — the chain walk's `broken`
+/// exclusion, the published `auth_status`, and the start/switch refusals.
+/// `None` is "no verdict": never written, cleared by a rotation or a fresh
+/// chain, a record that does not parse, or a record about a token the store
+/// no longer holds — codex's own `codex login` through a still-linked slot
+/// lands a fresh chain by a path that calls no clear, and the old chain's
+/// verdict has no claim on it. A store that cannot be read keeps the record
+/// standing: the verdict is about a chain that may still be there.
+pub(crate) fn read_quarantine(name: &str) -> Option<CodexQuarantine> {
+    let bytes = std::fs::read(quarantine_path(name).ok()?).ok()?;
+    let record: CodexQuarantine = serde_json::from_slice(&bytes).ok()?;
+    let current =
+        read_store_auth(name).and_then(|auth| auth.refresh_token().map(token_fingerprint));
+    match current {
+        Some(fingerprint) if fingerprint != record.token_fingerprint => None,
+        _ => Some(record),
+    }
+}
+
+/// Written under the rotation guard the pass already holds, for the token
+/// the pass judged. Best-effort like the belt: a failed write leaves the
+/// chain viable to the walk, which the memo then keeps off the routine leg
+/// and the breaker bounds. A standing record of the same kind on the same
+/// token is kept, so `since` names the first verdict rather than the latest
+/// kick's re-confirmation of it.
+fn mark_quarantined(name: &str, kind: &str, at: &str, token: &str) {
+    if read_quarantine(name).is_some_and(|q| q.kind == kind) {
+        return;
+    }
+    let record = CodexQuarantine {
+        kind: kind.to_string(),
+        at: at.to_string(),
+        token_fingerprint: token_fingerprint(token),
+    };
+    if let Ok(path) = quarantine_path(name)
+        && let Err(e) =
+            crate::profile::atomic_write_600(&path, serde_json::to_vec(&record).unwrap_or_default())
+    {
+        logline!("clauth: codex quarantine record write for '{name}' failed: {e}");
+    }
+}
+
+/// Retire `name`'s quarantine record — a rotation that landed, or a
+/// capture/login that installed a fresh chain the verdict has no claim on.
+pub(crate) fn clear_quarantine(name: &str) {
+    if let Ok(path) = quarantine_path(name) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Refuse `name` as a start or switch target while its quarantine record
+/// stands, naming the one exit that is valid for every profile: the browser
+/// mint. The bare capture is a no-op for an adopted slot (it finds the link
+/// already naming this profile and captures nothing), and no refresh can
+/// revive a chain the server declared dead.
+pub(crate) fn refuse_if_quarantined(name: &str) -> Result<()> {
+    if let Some(q) = read_quarantine(name) {
+        anyhow::bail!(
+            "'{name}': codex chain is broken ({} since {}), run `clauth login {name} --codex \
+             --browser`",
+            q.kind,
+            q.at
+        );
+    }
+    Ok(())
 }
 
 // ── the last-known-good belt ────────────────────────────────────────────────
@@ -451,6 +635,16 @@ pub(crate) fn read_store_auth(name: &str) -> Option<CodexAuth> {
     CodexAuth::parse(&std::fs::read(&store).ok()?).ok()
 }
 
+/// The plan label a surface publishes for `name`: `cached_plan` — the
+/// `wham/usage` `plan_type` the last poll cached — is authoritative, and the
+/// store's id_token claim stands in only while no poll has answered (settled
+/// question 5). One rule for every surface that shows a codex tier.
+pub(crate) fn plan_label(name: &str, cached_plan: Option<&str>) -> Option<String> {
+    cached_plan
+        .map(str::to_string)
+        .or_else(|| read_store_auth(name)?.id_token_plan())
+}
+
 /// A wham/usage 401 for `name`: queue ONE forced refresh. The codex usage leg's
 /// 401 arm is the production caller.
 pub(crate) fn kick_codex(name: &str) {
@@ -487,6 +681,33 @@ fn kick_available(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether `name`'s breaker has tripped: a kick still pending that
+/// [`take_kick`] will never honor. The chain walk's `kick_rejected` reads this
+/// — an account whose polls keep 401ing past two forced refreshes cannot serve
+/// a session, whatever its cached window says — and only a successful poll
+/// ([`kick_reset`]) clears it. A peek, consuming nothing.
+pub(crate) fn kick_breaker_tripped(name: &str) -> bool {
+    KICKED
+        .lock()
+        .ok()
+        .and_then(|g| {
+            g.as_ref()
+                .and_then(|m| m.get(name).map(|s| s.pending && s.strikes > KICK_BREAKER))
+        })
+        .unwrap_or(false)
+}
+
+/// Hand back a kick [`take_kick`] consumed for an attempt that never reached
+/// the wire (the memo did not land): the forced attempt is still owed, and the
+/// strike was already counted when the kick arrived.
+fn restore_kick(name: &str) {
+    if let Ok(mut g) = KICKED.lock()
+        && let Some(s) = g.as_mut().and_then(|m| m.get_mut(name))
+    {
+        s.pending = true;
+    }
+}
+
 /// Consume `name`'s pending kick, if the breaker allows it: each kick buys
 /// exactly one forced attempt, and past [`KICK_BREAKER`] consecutive kicks
 /// nothing fires — a chain two forced refreshes did not heal needs a
@@ -506,26 +727,28 @@ fn take_kick(name: &str) -> bool {
     false
 }
 
-/// Latch so a chain that is unreadable AND unrestorable logs its plight once,
-/// not every tick (the daemon log would otherwise truncate). Cleared by any
-/// good read.
-static CORRUPT_WARNED: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+/// Latch so a chain clauth cannot service logs its plight once, not every
+/// tick (the daemon log would otherwise truncate). Keyed by profile and
+/// plight — a store unreadable AND unrestorable, a memo path that refuses the
+/// write — and cleared when that plight heals: a good read, a memo that lands.
+static PLIGHT_WARNED: Mutex<Option<std::collections::HashSet<(String, &'static str)>>> =
+    Mutex::new(None);
 
-fn corrupt_warn_once(name: &str) -> bool {
-    CORRUPT_WARNED
+fn plight_warn_once(name: &str, plight: &'static str) -> bool {
+    PLIGHT_WARNED
         .lock()
         .map(|mut g| {
             g.get_or_insert_with(Default::default)
-                .insert(name.to_string())
+                .insert((name.to_string(), plight))
         })
         .unwrap_or(false)
 }
 
-fn clear_corrupt_warn(name: &str) {
-    if let Ok(mut g) = CORRUPT_WARNED.lock()
+fn clear_plight_warn(name: &str, plight: &'static str) {
+    if let Ok(mut g) = PLIGHT_WARNED.lock()
         && let Some(s) = g.as_mut()
     {
-        s.remove(name);
+        s.remove(&(name.to_string(), plight));
     }
 }
 
@@ -541,10 +764,15 @@ pub(crate) enum StandbyOutcome {
     StoodDown,
     /// A rotation ran and persisted.
     Rotated,
-    /// A rotation ran and failed; the memo now blocks the token.
+    /// A rotation ran and failed; the memo now blocks the token, and a
+    /// server-spelled terminal verdict left a quarantine record (an
+    /// unrecognized 4xx leaves none: `quarantine_kind`).
     Failed,
     /// The store read bad twice under the guard and the belt restored it.
     Restored,
+    /// The no-replay memo could not be written, so nothing was sent; a kick
+    /// this pass took is handed back.
+    MemoFailed,
 }
 
 /// One profile's standby pass. `refresher` is injected so every path is
@@ -565,7 +793,7 @@ pub(crate) fn standby_pass(
     let auth = match CodexAuth::parse(&bytes) {
         Ok(a) => {
             clear_bad_reads(name);
-            clear_corrupt_warn(name);
+            clear_plight_warn(name, "corrupt");
             record_lkg(name, &bytes);
             a
         }
@@ -594,7 +822,7 @@ pub(crate) fn standby_pass(
                         return match restore_from_lkg(name) {
                             Ok(()) => {
                                 clear_bad_reads(name);
-                                clear_corrupt_warn(name);
+                                clear_plight_warn(name, "corrupt");
                                 logline!(
                                     "clauth: '{name}' codex auth.json read bad for \
                                      {}s — restored the last-known-good copy",
@@ -605,7 +833,7 @@ pub(crate) fn standby_pass(
                             Err(e) => {
                                 // Latched: this line would otherwise repeat every
                                 // tick until a re-login and truncate the log.
-                                if corrupt_warn_once(name) {
+                                if plight_warn_once(name, "corrupt") {
                                     logline!(
                                         "clauth: '{name}' codex auth.json is unreadable and the \
                                          belt could not restore it: {e:#}"
@@ -705,14 +933,30 @@ pub(crate) fn standby_pass(
         return StandbyOutcome::Idle;
     }
 
-    mark_attempted(name, &fresh_token);
+    // No token reaches the wire without its memo on disk: a memo that failed
+    // to land is exactly the restart hole the memo exists to close, so the
+    // pass ends here rather than sending unprotected. The kick it took is
+    // handed back — the forced attempt is still owed.
+    if let Err(e) = mark_attempted(name, &fresh_token) {
+        if forced {
+            restore_kick(name);
+        }
+        // Latched: a path that stays unwritable would otherwise say so every
+        // tick, since the chain stays due until the memo lands.
+        if plight_warn_once(name, "memo") {
+            logline!("clauth: codex refresh for '{name}' not sent: {e:#}");
+        }
+        return StandbyOutcome::MemoFailed;
+    }
+    clear_plight_warn(name, "memo");
     match refresher(&fresh_token) {
         Ok(tok) => {
-            let rotated = auth.with_rotated(&tok, now_rfc3339);
+            let rotated = auth.with_rotated(&tok, &now_rfc3339);
             match crate::profile::atomic_write_600(&store, rotated.to_bytes()) {
                 Ok(()) => {
                     record_lkg(name, &rotated.to_bytes());
                     clear_attempted(name);
+                    clear_quarantine(name);
                     // The kick's breaker is NOT reset here. A successful
                     // rotation only proves the TOKEN rotated — if the 401 that
                     // kicked us has a non-token cause (a suspended account),
@@ -726,18 +970,28 @@ pub(crate) fn standby_pass(
                 }
                 Err(e) => {
                     // The rotated pair could not land: the OLD token is spent
-                    // server-side and the new one exists only in memory. Say
-                    // exactly that — this is the one failure worth shouting.
+                    // server-side and the new one exists only in memory. A
+                    // terminal verdict this pass already knows, recorded
+                    // against the token the store still holds so the walk,
+                    // the feed and start/switch stop handing the chain out
+                    // before a kick-forced retry earns the server's `reused`.
+                    mark_quarantined(name, "lost", &now_rfc3339, &fresh_token);
                     logline!(
-                        "clauth: '{name}' codex rotation SUCCEEDED on the wire but the \
-                         store write failed ({e}); the chain will read as reused until \
-                         a re-login — run `codex login` + `clauth login {name} --codex`"
+                        "clauth: '{name}' codex rotation succeeded on the wire but the \
+                         store write failed ({e}); the chain is spent, run \
+                         `clauth login {name} --codex --browser`"
                     );
                     StandbyOutcome::Failed
                 }
             }
         }
         Err(e) => {
+            // A terminal verdict is recorded, never merely logged: the walk,
+            // the feed and the start/switch refusals all read the record, and
+            // without it a dead chain stays viable to every one of them.
+            if let Some(kind) = e.quarantine_kind() {
+                mark_quarantined(name, kind, &now_rfc3339, &fresh_token);
+            }
             logline!("clauth: codex refresh for '{name}' failed: {e}");
             StandbyOutcome::Failed
         }

@@ -592,6 +592,28 @@ impl Drop for EndpointSandbox<'_> {
     }
 }
 
+/// RAII pin pointing the codex token endpoint — the wire behind
+/// `codex_auth::refresh_codex_chain`, which `standby_tick` hardwires — at
+/// `base`, cleared on drop even if the test panics. Borrows the
+/// [`HomeSandbox`] for the reason [`EndpointSandbox`] does: the override is a
+/// process-global serialized by `HOME_TEST_LOCK`, and a fixture panic between
+/// two plain set/clear calls would leave it pointing the next test at a dead
+/// port.
+pub(crate) struct CodexTokenUrlSandbox<'a>(std::marker::PhantomData<&'a HomeSandbox>);
+
+impl<'a> CodexTokenUrlSandbox<'a> {
+    pub(crate) fn new(_home: &'a HomeSandbox, base: &str) -> Self {
+        crate::codex_auth::set_token_url_override(&format!("{base}/oauth/token"));
+        Self(std::marker::PhantomData)
+    }
+}
+
+impl Drop for CodexTokenUrlSandbox<'_> {
+    fn drop(&mut self) {
+        crate::codex_auth::clear_token_url_override();
+    }
+}
+
 /// RAII `CLAUDE_CONFIG_DIR` pin: forces the var for its lifetime and restores the
 /// previous value on drop (even on panic). Required by any test exercising a path
 /// that reads the session's config dir — `which::session_auth`,
@@ -1002,6 +1024,59 @@ pub(crate) fn write_usage_history(
         body.push('\n');
     }
     std::fs::write(&path, body).expect("write history");
+}
+
+/// A JWT carrying `payload` (a JSON object) — header.payload.signature in the
+/// base64url alphabet, signed by nobody: every clauth read of a codex token is
+/// unverified, so this is all a schedule or label read needs.
+pub(crate) fn codex_jwt(payload: &str) -> String {
+    let payload = crate::oauth_login::base64url_nopad(payload.as_bytes());
+    format!("h.{payload}.sig")
+}
+
+/// [`codex_jwt`] whose payload carries `exp` (epoch seconds) alone.
+pub(crate) fn jwt_with_exp(exp_secs: i64) -> String {
+    codex_jwt(&format!("{{\"exp\":{exp_secs}}}"))
+}
+
+/// A codex `auth.json` body holding one chain plus a key clauth never writes,
+/// so a rotation's key survival is observable.
+pub(crate) fn codex_auth_body(access: &str, refresh: &str) -> String {
+    format!(
+        "{{ \"tokens\": {{\"id_token\": \"id.x\", \"access_token\": \"{access}\", \
+         \"refresh_token\": \"{refresh}\", \"account_id\": \"acc\"}}, \"keep_me\": 7 }}"
+    )
+}
+
+/// Write `body` as `name`'s profile store (`profiles/<name>/auth.json`) under
+/// the caller's [`HomeSandbox`].
+pub(crate) fn write_codex_store(name: &str, body: &str) {
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
+    crate::profile::mkdir_700(&dir).expect("mkdir");
+    std::fs::write(dir.join("auth.json"), body).expect("write store");
+}
+
+pub(crate) fn read_codex_store(name: &str) -> String {
+    std::fs::read_to_string(
+        crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
+            .expect("dir")
+            .join("auth.json"),
+    )
+    .expect("read store")
+}
+
+/// A locked handle on `name`'s rotation lock from a separate fd, standing in
+/// for another process mid-rotation (`flock(2)` binds to the open file
+/// description, so this genuinely contends with `try_acquire`'s own). Creates
+/// the locks directory the way `RotationGuard::open` does, since a real holder
+/// made it on its way in. Call under a [`HomeSandbox`]; drop it to release.
+pub(crate) fn hold_rotation_lock(name: &str) -> std::fs::File {
+    let path = crate::runtime::rotation_lock_path(&crate::profile::ProfileName::from(name))
+        .expect("rotation lock path");
+    crate::profile::mkdir_700(path.parent().expect("lock parent")).expect("locks dir");
+    let holder = crate::profile::open_state_file(&path).expect("open holder handle");
+    holder.lock().expect("hold the rotation lock");
+    holder
 }
 
 /// Simulate a live `clauth start` session for `name`: a locked pid file in the

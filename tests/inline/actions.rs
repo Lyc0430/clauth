@@ -5,6 +5,7 @@
 use super::*;
 use crate::profile::AppState;
 use crate::testutil::HomeSandbox;
+use crate::testutil::hold_rotation_lock;
 use crate::testutil::through_handle;
 
 const SWITCH_PUBLISH_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -65,19 +66,6 @@ fn feed_active(home: &HomeSandbox) -> String {
 fn rotation_guard(name: &str) -> crate::runtime::RotationGuard {
     rotation_guard_for_mutation(&crate::profile::ProfileName::from(name))
         .expect("uncontended rotation lock")
-}
-
-/// A locked handle on `name`'s rotation lock from a separate fd, standing in for
-/// another process mid-rotation (`flock(2)` binds to the open file description,
-/// so this genuinely contends). Creates the locks directory the way
-/// `try_acquire` does, since a real holder made it on its way in.
-fn hold_rotation_lock(name: &str) -> std::fs::File {
-    let path = crate::runtime::rotation_lock_path(&crate::profile::ProfileName::from(name))
-        .expect("rotation lock path");
-    crate::profile::mkdir_700(path.parent().expect("lock parent")).expect("locks dir");
-    let holder = crate::profile::open_state_file(&path).expect("open holder handle");
-    holder.lock().expect("hold the rotation lock");
-    holder
 }
 
 fn acct_config() -> AppConfig {
@@ -1435,7 +1423,11 @@ fn delete_codex_removes_the_dir_and_every_slot() {
     crate::profile::mkdir_700(&dir).expect("mkdir profile");
     std::fs::write(dir.join("auth.json"), b"{}").expect("write auth");
 
-    delete_codex_profile("cx2", false).expect("delete");
+    assert_eq!(
+        delete_codex_profile("cx2", false, &rotation_guard("cx2")).expect("delete"),
+        None,
+        "no operator slot points at this store, so nothing is detached"
+    );
 
     assert!(!dir.exists(), "the profile dir is removed");
     let state = crate::codex_profiles::CodexState::load().expect("load");
@@ -1482,18 +1474,19 @@ fn a_failed_codex_dir_removal_keeps_the_record() {
     let dir = profile_dir(&crate::profile::ProfileName::from("cx")).expect("profile dir");
     crate::profile::mkdir_700(&dir).expect("mkdir profile");
     let profiles_root = dir.parent().expect("profiles root").to_path_buf();
+    let rotation = rotation_guard("cx");
     // Read-only profiles/ makes the final rmdir of the profile dir fail.
     std::fs::set_permissions(&profiles_root, std::fs::Permissions::from_mode(0o500))
         .expect("chmod profiles");
 
-    let err = delete_codex_profile("cx", false).expect_err("the dir removal must fail");
+    let err = delete_codex_profile("cx", false, &rotation).expect_err("the dir removal must fail");
     std::fs::set_permissions(&profiles_root, std::fs::Permissions::from_mode(0o700))
         .expect("restore profiles");
 
-    assert!(
-        err.to_string()
-            .contains("failed to delete profile directory"),
-        "the failure names the step: {err}"
+    assert_eq!(
+        err.to_string(),
+        "failed to remove profile directory for 'cx'",
+        "the failure names the step"
     );
     assert!(
         crate::codex_profiles::CodexState::load()
@@ -1516,7 +1509,8 @@ fn delete_codex_refuses_a_dir_the_roster_no_longer_owns() {
     crate::profile::mkdir_700(&dir).expect("mkdir profile");
     std::fs::write(dir.join("credentials.json"), b"{}").expect("write foreign login");
 
-    let err = delete_codex_profile("cx", false).expect_err("no record, no removal");
+    let err = delete_codex_profile("cx", false, &rotation_guard("cx"))
+        .expect_err("no record, no removal");
     assert_eq!(err.to_string(), "codex profile 'cx' not found");
     assert!(
         dir.join("credentials.json").exists(),
@@ -1555,7 +1549,8 @@ fn a_noop_codex_switch_leaves_the_file_untouched() {
     );
 }
 
-/// Same live gate as the claude delete, same words — one predicate, one noun.
+/// Same live gate as the claude delete, one predicate; the codex-side copy says
+/// remove, the claude side keeps delete (decision 7 on #69).
 #[test]
 fn delete_codex_refuses_a_live_session_unforced() {
     let home = HomeSandbox::new();
@@ -1570,19 +1565,139 @@ fn delete_codex_refuses_a_live_session_unforced() {
     let pid = crate::runtime::open_pid_file(&sessions.join("99999")).expect("open pid");
     pid.lock().expect("lock pid");
 
-    let err = delete_codex_profile("busy", false).expect_err("live session blocks");
+    let err = delete_codex_profile("busy", false, &rotation_guard("busy"))
+        .expect_err("live session blocks");
     assert_eq!(
         err.to_string(),
-        "'busy' has a live session, pass --force to delete it anyway"
+        "'busy' has a live session, pass --force to remove it anyway"
     );
     let state = crate::codex_profiles::CodexState::load().expect("load");
     assert!(state.holds("busy"), "the refused delete leaves the record");
 
-    delete_codex_profile("busy", true).expect("--force overrides the gate");
+    delete_codex_profile("busy", true, &rotation_guard("busy"))
+        .expect("--force overrides the gate");
     assert!(
         !crate::codex_profiles::CodexState::load()
             .expect("load")
             .holds("busy")
+    );
+}
+
+/// The codex delete takes the guard the claude delete takes, for the race its
+/// doc names: a standby rotation racing `remove_dir_all` either resurrects an
+/// orphan `auth.json` holding the pair it minted, or loses that pair after the
+/// old single-use token was spent — `refresh_token_reused`, re-login only.
+/// Composed the way `cmd_delete_codex` composes it: guard first, the delete
+/// only if granted; released, the same delete completes.
+#[test]
+fn delete_codex_refuses_while_a_rotation_holds_the_lock() {
+    let _home = HomeSandbox::new();
+    write_codex_state(
+        "active_profile = \"cx1\"\nprofiles = [\"cx1\", \"cx2\"]\nfallback_chain = [\"cx1\", \"cx2\"]\n",
+    );
+    crate::testutil::write_codex_store("cx1", "{}");
+    let dir = profile_dir(&crate::profile::ProfileName::from("cx1")).expect("profile dir");
+
+    let holder = hold_rotation_lock("cx1");
+    let outcome = rotation_guard_for_mutation(&crate::profile::ProfileName::from("cx1"))
+        .and_then(|rotation| delete_codex_profile("cx1", false, &rotation));
+
+    // Untouched-state first, error second, for the reason the claude twin
+    // states: a guard handed out under contention runs the whole delete.
+    assert!(
+        dir.join("auth.json").exists(),
+        "the refused delete must leave the store and its directory in place"
+    );
+    let state = crate::codex_profiles::CodexState::load().expect("load");
+    assert_eq!(state.profiles(), ["cx1", "cx2"], "the roster is untouched");
+    assert_eq!(
+        state.active_profile().map(|n| n.as_str()),
+        Some("cx1"),
+        "the active marker is untouched"
+    );
+    assert_eq!(
+        state.fallback_chain(),
+        ["cx1", "cx2"],
+        "the chain is untouched"
+    );
+    assert_eq!(
+        outcome
+            .expect_err("an in-flight rotation must block the codex delete")
+            .to_string(),
+        "'cx1' has a token rotation in progress, retry in a moment"
+    );
+
+    drop(holder);
+    delete_codex_profile("cx1", false, &rotation_guard("cx1"))
+        .expect("the delete goes through once the rotation releases");
+    assert!(
+        !dir.exists(),
+        "a released lock must let the same delete complete"
+    );
+    let state = crate::codex_profiles::CodexState::load().expect("load");
+    assert_eq!(state.profiles(), ["cx2"]);
+    assert_eq!(state.active_profile(), None);
+}
+
+/// A quarantined chain refuses the switch by name, naming the fix, and moves
+/// nothing; a fresh chain landing through the store writer retires the verdict
+/// and the same switch goes through.
+#[test]
+fn switch_codex_refuses_a_quarantined_chain_until_a_fresh_one_lands() {
+    let home = HomeSandbox::new();
+    write_codex_state("active_profile = \"cx1\"\nprofiles = [\"cx1\", \"cx2\"]\n");
+    crate::testutil::write_codex_store(
+        "cx2",
+        &crate::testutil::codex_auth_body(&crate::testutil::jwt_with_exp(1_700_000_060), "rt.a"),
+    );
+    let reused = |_t: &str| -> Result<
+        crate::codex_auth::CodexTokenResponse,
+        crate::codex_auth::CodexRefreshError,
+    > { Err(crate::codex_auth::CodexRefreshError::Reused) };
+    assert_eq!(
+        crate::codex_auth::standby_pass(
+            "cx2",
+            1_700_000_000_000,
+            "2026-08-13T00:00:00Z".into(),
+            &reused
+        ),
+        crate::codex_auth::StandbyOutcome::Failed
+    );
+
+    let err = switch_codex_profile("cx2").expect_err("a dead chain is no switch target");
+    assert_eq!(
+        err.to_string(),
+        "'cx2': codex chain is broken (reused since 2026-08-13T00:00:00Z), run `clauth login cx2 --codex --browser`"
+    );
+    assert_eq!(
+        crate::codex_profiles::CodexState::load()
+            .expect("load")
+            .active_profile()
+            .map(|n| n.as_str()),
+        Some("cx1"),
+        "the refused switch moves nothing"
+    );
+
+    // A fresh chain through the shared store writer (here the capture of a
+    // fresh operator login; the browser mint the refusal names takes the same
+    // writer) retires the verdict.
+    write_operator_codex(&home, Some(OPERATOR_AUTH), None);
+    codex_login_capture("cx2").expect("re-capture");
+    assert_eq!(crate::codex_auth::read_quarantine("cx2"), None);
+    assert!(
+        !profile_dir(&crate::profile::ProfileName::from("cx2"))
+            .expect("dir")
+            .join("auth.quarantine.json")
+            .exists(),
+        "the store writer retires the record itself, not only its claim on the new token"
+    );
+    switch_codex_profile("cx2").expect("a fresh chain switches");
+    assert_eq!(
+        crate::codex_profiles::CodexState::load()
+            .expect("load")
+            .active_profile()
+            .map(|n| n.as_str()),
+        Some("cx2")
     );
 }
 
@@ -5622,22 +5737,37 @@ fn write_operator_codex(home: &HomeSandbox, auth: Option<&str>, config: Option<&
     }
 }
 
-// Deliberately NON-canonical JSON (spacing, key order, a unicode escape): a
-// verbatim copy keeps these bytes, while any parse-and-reserialize normalizes
-// them away — which is exactly what the verbatim pin must catch.
+// Deliberately NON-canonical JSON (spacing, key order, a unicode escape, keys
+// clauth never wrote): the capture re-stamps `last_refresh` and must carry
+// every other key and value across, which the parsed-map pin catches.
 const OPERATOR_AUTH: &str = r#"{ "tokens": {"id_token": "id.x", "access_token": "at.x", "refresh_token": "rt.x", "account_id": "acc"},
   "auth_mode": "chatgpt",  "last_refresh": "2026-08-13T00:00:00Z", "note": "\u0063odex", "from_the_future": 1 }"#;
 
-/// The capture ADOPTS: verbatim bytes into the store (every byte, unknown
-/// keys included, 0600), and the operator slot becomes a symlink to it — one
-/// physical file, decision 8's own mechanism, never a second carrier.
+/// `body` as the capture at `now` lands it: every key and value codex wrote,
+/// `last_refresh` re-stamped to the capture time.
+fn captured_at(body: &str, now: &str) -> serde_json::Value {
+    let mut v: serde_json::Value = serde_json::from_str(body).expect("operator auth parses");
+    v["last_refresh"] = serde_json::json!(now);
+    v
+}
+
+fn parsed(path: &std::path::Path) -> serde_json::Value {
+    serde_json::from_slice(&std::fs::read(path).expect("read")).expect("parses")
+}
+
+/// The capture ADOPTS: the chain into the store (every key codex wrote,
+/// unknown ones included, 0600) with `last_refresh` re-stamped to the capture
+/// time — a capture is a chain event, and the stamp is what the store
+/// convergence reads first — the belt seeded from those same bytes, and the
+/// operator slot becomes a symlink to the store: one physical file, decision
+/// 8's own mechanism, never a second carrier.
 #[test]
 fn codex_capture_adopts_the_operator_slot() {
     let home = HomeSandbox::new();
     write_operator_codex(&home, Some(OPERATOR_AUTH), None);
     let operator_auth = home.home().join(".codex").join("auth.json");
 
-    codex_login_capture("cx").expect("capture");
+    codex_login_capture_at("cx", "2026-09-16T12:00:00+00:00").expect("capture");
 
     let state = crate::codex_profiles::CodexState::load().expect("load");
     assert!(state.holds("cx"));
@@ -5645,9 +5775,14 @@ fn codex_capture_adopts_the_operator_slot() {
         .expect("dir")
         .join("auth.json");
     assert_eq!(
-        std::fs::read(&stored).expect("read stored"),
-        OPERATOR_AUTH.as_bytes(),
-        "the chain moves verbatim, unknown keys included"
+        parsed(&stored),
+        captured_at(OPERATOR_AUTH, "2026-09-16T12:00:00+00:00"),
+        "every key moves, unknown ones included; last_refresh is the capture time"
+    );
+    assert_eq!(
+        std::fs::read(stored.with_file_name("auth.lkg.json")).expect("belt"),
+        std::fs::read(&stored).expect("store"),
+        "the belt is seeded from the re-stamped bytes, never the operator's"
     );
     #[cfg(unix)]
     {
@@ -5721,15 +5856,14 @@ fn codex_recapture_replaces_the_chain_unless_a_session_holds_it() {
     drop(pid);
     std::fs::remove_dir_all(&sessions).expect("clear sessions");
 
-    codex_login_capture("cx").expect("re-capture");
+    codex_login_capture_at("cx", "2026-09-16T13:00:00+00:00").expect("re-capture");
     assert_eq!(
-        std::fs::read(
-            profile_dir(&crate::profile::ProfileName::from("cx"))
+        parsed(
+            &profile_dir(&crate::profile::ProfileName::from("cx"))
                 .expect("dir")
                 .join("auth.json")
-        )
-        .expect("read"),
-        fresh.as_bytes(),
+        ),
+        captured_at(&fresh, "2026-09-16T13:00:00+00:00"),
         "the profile chain is replaced — that is what re-auth means"
     );
 }
@@ -5856,6 +5990,188 @@ fn codex_recapture_refuses_a_different_account() {
     )
     .expect("corrupt store");
     codex_login_capture("cx").expect("a corrupt store re-captures");
+}
+
+/// Deleting an adopted profile detaches the operator slot the capture linked
+/// onto its store — the link alone, before the dir goes — and reports it, so
+/// the operator's bare codex is never left pointing at nothing in silence. A
+/// slot linked to ANOTHER profile's store, or a regular file, survives
+/// byte-identical; a refused delete touches nothing; and a `CODEX_HOME` inside
+/// a clauth session home (a delete typed from a shell inside `clauth start`)
+/// still finds the operator's real slot under the default `~/.codex`.
+#[test]
+fn delete_codex_detaches_only_the_slot_adopted_onto_it() {
+    let home = HomeSandbox::new();
+    let operator = home.home().join("operator-codex");
+    std::fs::create_dir_all(&operator).expect("mkdir operator home");
+    let cx_home = crate::testutil::CodexHomeSandbox::new(&home, &operator);
+    let slot = operator.join("auth.json");
+    std::fs::write(&slot, OPERATOR_AUTH).expect("operator login");
+    codex_login_capture("cx1").expect("capture");
+    let store = profile_dir(&crate::profile::ProfileName::from("cx1"))
+        .expect("dir")
+        .join("auth.json");
+    assert_eq!(std::fs::read_link(&slot).expect("adopted"), store);
+
+    // A live session refuses BEFORE any of it: the slot survives the refusal.
+    let pid = crate::testutil::arm_live_session(home.home(), "cx1");
+    let err = delete_codex_profile("cx1", false, &rotation_guard("cx1"))
+        .expect_err("a live session refuses");
+    assert_eq!(
+        err.to_string(),
+        "'cx1' has a live session, pass --force to remove it anyway"
+    );
+    assert_eq!(
+        std::fs::read_link(&slot).expect("still adopted"),
+        store,
+        "a refused delete leaves the operator slot linked"
+    );
+    drop(pid);
+
+    // The delete detaches the link and says which slot it was.
+    assert_eq!(
+        delete_codex_profile("cx1", false, &rotation_guard("cx1")).expect("delete"),
+        Some(slot.clone())
+    );
+    assert!(
+        slot.symlink_metadata().is_err(),
+        "the dangling link is gone, not left for `codex login` to revoke through"
+    );
+    assert!(!store.exists());
+
+    // A slot linked to ANOTHER profile's store survives byte-identical.
+    std::fs::write(&slot, OPERATOR_AUTH).expect("fresh operator login");
+    codex_login_capture_at("cx2", "2026-09-16T12:00:00+00:00").expect("capture into cx2");
+    let other_store = profile_dir(&crate::profile::ProfileName::from("cx2"))
+        .expect("dir")
+        .join("auth.json");
+    let other_bytes = std::fs::read(&other_store).expect("cx2's store");
+    assert_eq!(
+        parsed(&other_store),
+        captured_at(OPERATOR_AUTH, "2026-09-16T12:00:00+00:00")
+    );
+    crate::codex_profiles::CodexState::update(|state| {
+        state.add_profile("cx3");
+        Ok(())
+    })
+    .expect("roster cx3");
+    crate::testutil::write_codex_store("cx3", "{}");
+    assert_eq!(
+        delete_codex_profile("cx3", false, &rotation_guard("cx3")).expect("delete cx3"),
+        None
+    );
+    assert_eq!(
+        std::fs::read_link(&slot).expect("cx2's link survives"),
+        other_store
+    );
+    assert_eq!(
+        std::fs::read(&slot).expect("through the link"),
+        other_bytes,
+        "the target is untouched too"
+    );
+
+    // A regular-file slot (the operator re-logged in on their own) survives.
+    std::fs::remove_file(&slot).expect("drop link");
+    std::fs::write(&slot, OPERATOR_AUTH).expect("regular file slot");
+    assert_eq!(
+        delete_codex_profile("cx2", false, &rotation_guard("cx2")).expect("delete cx2"),
+        None
+    );
+    assert!(
+        !slot
+            .symlink_metadata()
+            .expect("slot")
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        std::fs::read(&slot).expect("slot bytes"),
+        OPERATOR_AUTH.as_bytes()
+    );
+
+    // `CODEX_HOME` inside a clauth session home: the shell is inside a codex
+    // session, but the operator's real `~/.codex/auth.json` is still the link
+    // the capture installed, and the delete detaches that one.
+    drop(cx_home);
+    write_operator_codex(&home, Some(OPERATOR_AUTH), None);
+    codex_login_capture("cx4").expect("capture into cx4");
+    let default_slot = home.home().join(".codex").join("auth.json");
+    let cx4_store = profile_dir(&crate::profile::ProfileName::from("cx4"))
+        .expect("dir")
+        .join("auth.json");
+    assert_eq!(
+        std::fs::read_link(&default_slot).expect("adopted"),
+        cx4_store
+    );
+    let session_home = home.home().join(".clauth/profiles/cx4/codex-home-sessionx");
+    std::fs::create_dir_all(&session_home).expect("mkdir session home");
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&cx4_store, session_home.join("auth.json"))
+            .expect("session link");
+    }
+    let _cx_session = crate::testutil::CodexHomeSandbox::new(&home, &session_home);
+    assert_eq!(
+        delete_codex_profile("cx4", false, &rotation_guard("cx4")).expect("delete cx4"),
+        Some(default_slot.clone()),
+        "a session home is not the operator's slot; the default home's link is"
+    );
+    assert!(
+        default_slot.symlink_metadata().is_err(),
+        "the operator's own slot is detached, not left dangling behind a session-home CODEX_HOME"
+    );
+    assert!(
+        !crate::codex_profiles::CodexState::load()
+            .expect("load")
+            .holds("cx4")
+    );
+}
+
+/// Dir before state, observed from the failure side with an adopted slot: the
+/// detach precedes the removal and cannot be undone, so a removal that fails
+/// after it says so — the retry finds no link and would never tell the
+/// operator their codex has no login.
+#[cfg(unix)]
+#[test]
+fn a_failed_codex_dir_removal_names_the_slot_it_detached() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = HomeSandbox::new();
+    write_operator_codex(&home, Some(OPERATOR_AUTH), None);
+    codex_login_capture("cx").expect("capture");
+    let slot = home.home().join(".codex").join("auth.json");
+    let dir = profile_dir(&crate::profile::ProfileName::from("cx")).expect("profile dir");
+    assert_eq!(
+        std::fs::read_link(&slot).expect("adopted"),
+        dir.join("auth.json")
+    );
+    let profiles_root = dir.parent().expect("profiles root").to_path_buf();
+    let rotation = rotation_guard("cx");
+    std::fs::set_permissions(&profiles_root, std::fs::Permissions::from_mode(0o500))
+        .expect("chmod profiles");
+
+    let err = delete_codex_profile("cx", false, &rotation).expect_err("the dir removal must fail");
+    std::fs::set_permissions(&profiles_root, std::fs::Permissions::from_mode(0o700))
+        .expect("restore profiles");
+
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "failed to remove profile directory for 'cx' after {} was detached from it, so your \
+             own codex has no login now; run `codex login` to mint a fresh one",
+            slot.display()
+        )
+    );
+    assert!(
+        slot.symlink_metadata().is_err(),
+        "the detach happened and the message says so"
+    );
+    assert!(
+        crate::codex_profiles::CodexState::load()
+            .expect("load")
+            .holds("cx"),
+        "a failed removal must leave the record for a retry"
+    );
 }
 
 /// The browser login's pre-flight refuses a cross-harness clash before ever

@@ -182,6 +182,23 @@ fn a_codex_reading_never_claims_a_claude_tier() {
     assert_eq!(plan.codex_plan.as_deref(), Some("pro"));
 }
 
+/// The body's plan word goes through the one normalizer the id_token claim
+/// uses (`codex_auth::plan_word`): trimmed, lowercased, and an empty string
+/// reads as no plan, so the claim fallback still applies to it.
+#[test]
+fn the_body_plan_word_is_normalized_like_the_claim() {
+    let padded = map_usage(r#"{"plan_type": " Pro "}"#, 1_600_000_000).expect("parses");
+    assert_eq!(
+        padded.plan.as_ref().and_then(|p| p.codex_plan.as_deref()),
+        Some("pro")
+    );
+    let empty = map_usage(r#"{"plan_type": ""}"#, 1_600_000_000).expect("parses");
+    assert_eq!(
+        empty.plan.as_ref().and_then(|p| p.codex_plan.as_deref()),
+        None
+    );
+}
+
 /// The slot cutoff sits at exactly one day: a window of 86400 s is still the
 /// 5h slot and one of 86401 s is the weekly one, so a cutoff moved by an hour
 /// in either direction reds here where the nominal 5h/7d bodies stay green.

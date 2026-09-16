@@ -1137,12 +1137,15 @@ pub(crate) fn delete_profile(
 /// sessions (later in the series) bind `auth.json` at start through their own
 /// home, which is what makes this the parity map's "session-boundary" switch.
 /// Membership is re-made against the state [`CodexState::update`] loaded
-/// under the lock, so a concurrent delete can't be switched onto.
+/// under the lock, so a concurrent delete can't be switched onto. A
+/// quarantined chain refuses the way a disabled claude account does: the
+/// slot would name an account no session can authenticate as.
 pub(crate) fn switch_codex_profile(name: &str) -> Result<()> {
     crate::codex_profiles::CodexState::update(|state| {
         if !state.holds(name) {
             bail!("codex profile '{name}' not found");
         }
+        crate::codex_auth::refuse_if_quarantined(name)?;
         // Same early return the claude switch takes on `is_active` — nothing
         // to move, and `update`'s dirty check then leaves the file untouched.
         if state.active_profile().map(ProfileName::as_str) == Some(name) {
@@ -1154,12 +1157,25 @@ pub(crate) fn switch_codex_profile(name: &str) -> Result<()> {
 }
 
 /// `clauth delete <name>` for a codex profile. Same shape as the claude
-/// [`delete_profile`] minus the steps that have no codex counterpart: nothing
-/// global is installed for codex (no live credentials link, no settings.json
-/// endpoint, no usage-TTL memo), so the unwire half is simply absent. The live
-/// gate and the dir-before-state order are kept exactly — a refused or failed
-/// delete leaves the record intact and retryable.
-pub(crate) fn delete_codex_profile(name: &str, force: bool) -> Result<()> {
+/// [`delete_profile`]: the live gate, an unwire of what the profile installed
+/// globally BEFORE the irreversible removal, then dir before state — a refused
+/// or failed delete leaves the record intact and retryable. What codex
+/// installs globally is the operator's `auth.json` slot the capture linked
+/// onto this store ([`adopt_operator_auth_slot`]); the claude-only halves (the
+/// credentials link, the settings.json endpoint, the usage-TTL memo) have no
+/// counterpart here. Returns the slot it detached, so the caller can say the
+/// operator's own codex is logged out now.
+///
+/// `_rotation` is [`rotation_guard_for_mutation`]'s guard for `name`, and
+/// `force` does not waive it: a standby rotation racing this removal would
+/// either resurrect an orphan `auth.json` holding the pair it minted, or lose
+/// that pair after the old single-use token was spent — a dead chain no
+/// re-capture can revive. `force` waives the live-session gate alone.
+pub(crate) fn delete_codex_profile(
+    name: &str,
+    force: bool,
+    _rotation: &RotationGuard,
+) -> Result<Option<std::path::PathBuf>> {
     crate::codex_profiles::CodexState::update(|state| {
         // Membership re-made against the state loaded UNDER the lock, before
         // anything irreversible: the caller resolved this name from a
@@ -1172,22 +1188,62 @@ pub(crate) fn delete_codex_profile(name: &str, force: bool) -> Result<()> {
         }
         let owned = ProfileName::from(name);
         if !force && crate::runtime::has_live_session(&owned) {
-            bail!("'{name}' has a live session, pass --force to delete it anyway");
+            bail!("'{name}' has a live session, pass --force to remove it anyway");
         }
+        // Before the dir goes: a slot still linked into it would dangle, and
+        // the operator's next `codex login` would revoke through that link
+        // first (see `codex_login_capture`'s refusal) — into a store that no
+        // longer exists, leaving their own codex with no login and no word why.
+        let detached = detach_operator_auth_slot(name)?;
         let dir = profile_dir(&owned)?;
         if dir.exists() {
-            std::fs::remove_dir_all(&dir)
-                .with_context(|| format!("failed to delete profile directory for '{name}'"))?;
+            // The detach is irreversible and precedes this step, so a removal
+            // that fails after it must still say the operator's codex has no
+            // login now: the retry finds no link and can never say it.
+            std::fs::remove_dir_all(&dir).with_context(|| match &detached {
+                Some(slot) => format!(
+                    "failed to remove profile directory for '{name}' after {} was detached from \
+                     it, so your own codex has no login now; run `codex login` to mint a fresh \
+                     one",
+                    slot.display()
+                ),
+                None => format!("failed to remove profile directory for '{name}'"),
+            })?;
         }
         state.remove_profile(name);
-        Ok(())
+        Ok(detached)
     })
 }
 
+/// Remove the operator's `auth.json` when it is the link
+/// [`adopt_operator_auth_slot`] installed onto THIS profile's store — the link
+/// alone, never its target — returning the slot's path. A link naming another
+/// profile, a regular file (the operator re-logged in on their own), or an
+/// absent slot is left exactly as found. The operator home resolves as the
+/// capture resolves it; where that refuses (`CODEX_HOME` inside a clauth
+/// session home: a delete typed from a shell codex spawned by `clauth start`)
+/// the operator's real slot is still the default home's, which the capture
+/// linked exactly as it would have from any other shell, so that is the one
+/// checked — the ownership predicate is what makes the fallback safe.
+fn detach_operator_auth_slot(name: &str) -> Result<Option<std::path::PathBuf>> {
+    let operator = codex_operator_home().or_else(|_| default_codex_operator_home())?;
+    let slot = operator.join("auth.json");
+    let Ok(target) = std::fs::read_link(&slot) else {
+        return Ok(None);
+    };
+    if !clauth_auth_store_owner(&target).is_some_and(|holder| holder.eq_ignore_ascii_case(name)) {
+        return Ok(None);
+    }
+    std::fs::remove_file(&slot)
+        .with_context(|| format!("failed to detach {} from '{name}'", slot.display()))?;
+    Ok(Some(slot))
+}
+
 /// `clauth login <name> --codex` — create (or re-authenticate) a codex
-/// profile by ADOPTING the operator's own `codex login`: the chain moves
-/// VERBATIM into `profiles/<name>/auth.json` (atomic, 0600 — this writer owns
-/// that mode), and the operator's `auth.json` becomes a symlink to it. One
+/// profile by ADOPTING the operator's own `codex login`: the chain moves into
+/// `profiles/<name>/auth.json` (atomic, 0600 — this writer owns that mode)
+/// with every key codex wrote and `last_refresh` re-stamped to the capture
+/// time, and the operator's `auth.json` becomes a symlink to it. One
 /// physical file is the design's own safety mechanism (decision 8): the
 /// operator's bare `codex`, every clauth session, and clauth's rotation all
 /// hold the same chain. A snapshot-copy here would be the forbidden
@@ -1214,6 +1270,12 @@ pub(crate) fn delete_codex_profile(name: &str, force: bool) -> Result<()> {
 /// - a live session on the target profile: re-capture replaces the chain the
 ///   running session holds.
 pub(crate) fn codex_login_capture(name: &str) -> Result<()> {
+    codex_login_capture_at(name, &chrono::Utc::now().to_rfc3339())
+}
+
+/// [`codex_login_capture`] with the capture time injected, so the re-stamp is
+/// pinnable.
+pub(crate) fn codex_login_capture_at(name: &str, now_rfc3339: &str) -> Result<()> {
     let trimmed = validate_name_chars(name)?.to_string();
     let operator = codex_operator_home()?;
     match codex_operator_store_mode(&operator).as_deref() {
@@ -1280,6 +1342,14 @@ pub(crate) fn codex_login_capture(name: &str) -> Result<()> {
             auth_path.display()
         );
     }
+    // A capture is a chain event, so it carries the stamp every chain event
+    // carries (codex's `persist_tokens` writes it; the browser login stamps it
+    // too). Left at the operator's login time, the captured chain would read
+    // OLDER than a session copy rotated since, and the store convergence,
+    // which reads `last_refresh` first, would hand that copy the win and drop
+    // the chain the operator just captured.
+    let parsed = parsed.with_last_refresh(now_rfc3339);
+    let raw = parsed.to_bytes();
 
     // RotationGuard outermost, state flock inside — the module-wide order. The
     // guard is what a live rotation (a running codex refreshing through the
@@ -1402,12 +1472,14 @@ fn write_codex_profile_store(
     }
     state.add_profile(name);
     // Seed the last-known-good belt from this fresh, well-formed chain and
-    // retire any stale no-replay memo: a capture/login is an out-of-band store
-    // write, and without this the belt could later restore a chain SUPERSEDED
-    // by the one just written, and a memo from a pre-capture attempt could
-    // block the new token.
+    // retire any stale no-replay memo and quarantine verdict: a capture/login
+    // is an out-of-band store write, and without this the belt could later
+    // restore a chain SUPERSEDED by the one just written, a memo from a
+    // pre-capture attempt could block the new token, and the old chain's
+    // death sentence would keep the fresh one out of every walk.
     crate::codex_auth::record_lkg(name, raw);
     crate::codex_auth::forget_attempt(name);
+    crate::codex_auth::clear_quarantine(name);
     Ok(store)
 }
 
@@ -1488,6 +1560,11 @@ fn codex_operator_home() -> Result<std::path::PathBuf> {
         }
         return Ok(dir);
     }
+    default_codex_operator_home()
+}
+
+/// The home codex reads with no `CODEX_HOME` set: `~/.codex`.
+fn default_codex_operator_home() -> Result<std::path::PathBuf> {
     Ok(crate::profile::home_dir()?.join(".codex"))
 }
 
