@@ -60,25 +60,26 @@ clauth list           # account table with cached usage, no network
 | Command | Flags | Does |
 |---------|-------|------|
 | `clauth` | | open the TUI (with stdout not a terminal: command help on stderr, exit 2) |
-| `clauth <profile>` | | switch to that profile and exit |
-| `clauth start <profile> [claude args…]` | `--isolated`, `--with-fallback`, `--explain` | run `claude` under that profile's own config dir |
+| `clauth <profile>` | | switch to that profile and exit; a codex name moves the codex active marker instead ([Codex](Codex#switch)) |
+| `clauth start <profile> [claude args…]` | `--isolated`, `--with-fallback`, `--explain` | run `claude` under that profile's own config dir; a codex profile runs `codex` under its own `CODEX_HOME` instead, and `--with-fallback` is refused there ([Codex](Codex#run)) |
 | `clauth start --auto [claude args…]` | `--isolated`, `--with-fallback`, `--explain` | start on the first fallback-chain member with headroom for the models the session will run |
 | `clauth login <profile>` | `--base-url`, `--api-key`, `--setup-token`, `--yes`, `--model` | add an account, or re-authenticate one in place |
+| `clauth login <profile> --codex` | `--browser` | adopt the `codex login` in your `~/.codex` as a codex profile; `--browser` mints a fresh ChatGPT login in the browser instead and leaves `~/.codex` alone ([Codex](Codex#add-an-account)) |
 | `clauth capture <profile>` | | save the login Claude Code is using now as a new profile; the first one becomes the active account |
 | `clauth rolling-token <profile>` | | serve the profile's sessions a rolling token re-stamped from its usage chain |
 | `clauth static-token <profile>` | `--clear`, `--yes` | bare: restore the preserved mint a rolling token superseded; `--clear` removes the long-lived token entirely |
-| `clauth delete <profile>` | `--yes`, `--force` | remove a profile and every credential it holds |
+| `clauth delete <profile>` | `--yes`, `--force` | remove a profile and every credential it holds, a codex profile included ([Codex](Codex#remove)) |
 | `clauth disable <profile>` | `--yes` | hide it from auto-switch, polling, and the status feed; files stay |
 | `clauth enable <profile>` | | put a disabled profile back |
-| `clauth which` | `--json` | print the profile owning the loaded credentials |
-| `clauth list` | `--all` (`--disabled`) | account table from the on-disk caches, never fetches |
+| `clauth which` | `--json` | print the profile owning the loaded credentials; inside a `clauth start` codex session, that codex profile |
+| `clauth list` | `--all` (`--disabled`) | account table from the on-disk caches, never fetches; Claude Code accounts only |
 | `clauth jobs` | `--json` | what the delegates are doing: account, elapsed, last output, live runs first; `--json` also carries each run's `session_id`, the handle `delegate({session_id})` takes after a crash, and whether the run was isolated, which is what decides whether that id is a handle at all |
 | `clauth sessions` | `--json`, `--tokens` | list Claude Code sessions, newest first |
 | `clauth resume <id\|latest>` | `--profile <name>` | resume a session under a chosen account |
 | `clauth info <id\|latest>` | | print a session's resume command, workspace, and storage path |
 | `clauth daemon` | `--status`, `--standby`, `--replace`, `--no-standby`, `--listen [ADDR:PORT]`, `--cert <path>`, `--key <path>`, `--dump-openapi` | run the refresh + auto-switch loop with no TUI |
 | `clauth devices` | `--json`; `pair <name> [--control]`, `add <name> [--control]`, `revoke <name>` | list, pair, add, and revoke the devices that may call the REST API |
-| `clauth status --json` | `--all`, `--disabled` | print the daemon's status shape once, from disk |
+| `clauth status --json` | `--all`, `--disabled` | print the daemon's status shape once, from disk, codex accounts included |
 | `clauth mcp` | | stdio MCP server; Claude Code launches this, not you |
 | `clauth completions <bash\|zsh\|fish\|install> [shell]` | | print or install a completion script |
 | `clauth herdr install` | `--key <spec>`, `--no-config`, `--yes` | install the [herdr](https://herdr.dev) plugin and bind a key to it |
@@ -96,6 +97,7 @@ clauth list           # account table with cached usage, no network
 - **`start --explain`** prints the account a start would launch on and the walk behind it, then exits without launching. It runs the refusals a real launch runs and dates every usage reading it judged, so a stale cache shows as one.
 - **`start --isolated` keeps the session.** Its transcripts and session state are lifted into your global store before the throwaway runtime is discarded, so the run stays resumable and its tokens are counted. A hard kill (SIGKILL) skips that teardown; the next stale-runtime sweep lifts the tree into the global store before deleting it, so a killed session is rescued too. The `--rescue`/`--no-rescue` flags and the `auto_rescue` setting that used to decide this are gone; there is nothing to opt into and no way to opt out.
 - **`delete` and `disable` want a TTY.** Both prompt `[y/N]`; on a non-TTY stdin they refuse unless you pass `--yes`. `--force` is the only way past `delete`'s live-session guard, and `--yes` alone does not override it.
+- **Bare names span both rosters.** `clauth <name>`, `delete` and `start` resolve a name against the Claude Code profiles first, then the codex ones, so a codex profile needs no flag after `login --codex` created it; a name on both rosters gets the Claude Code one, and the command says so. An unknown name lists both rosters: `available: <claude names> · codex: <codex names>`. `disable`, `enable`, `rolling-token` and `static-token` take Claude Code profiles alone: a codex name is refused with `'<name>' is a codex profile; <verb> is claude-only` (exit 2), and an unknown name lists the Claude Code profiles only. Everything codex: [Codex](Codex).
 - **`login <existing>`** re-authenticates in place. The chain slot, env block, and model settings survive; a browser re-login replaces the subscription login after a confirm. On an account that has an endpoint and a key it can still authenticate with, whether or not clauth recognises the provider, a browser re-login replaces the subscription login alone and leaves the endpoint and key where they are: it is the stored OAuth chain you came to renew, and the key is what that account's inference actually runs on. An endpoint with nothing left behind it is cleared as before, so a re-login never leaves a bare endpoint standing in front of a fresh subscription login. An api-key re-login replaces the endpoint set, and so does any capture that brings one of the fields; a headless one (non-interactive stdin) with no `--base-url` reuses the stored endpoint instead of prompting. The stored OAuth chain survives an api-key re-login: it is what usage polling and `rolling-token` roll from.
 - **`login <alibaba account>`** opens the Alibaba Model Studio console instead, because that plan's usage figures run on a console session its api key cannot stand in for. It replaces that session and nothing else: endpoint, api key and model settings all stay put. There is no confirm either, since re-running it is the routine repair. The window it captures is measured from your aliyun console sign-in ([Configuration](Configuration#the-alibaba-console-session)). Passing `--base-url` or `--api-key` still takes the ordinary api-key path. Starting one from nothing is two steps for that reason: give the account a Model Studio endpoint first (a Qwen preset on the Setup tab, or `--base-url` here), then run a bare `clauth login <name>`. The console a session comes from is read off the endpoint, so a name that has none yet has no console to open.
 - **`login` on a box with no browser** (or over ssh): the same login prints the link under `Browser didn't open? Use the url below to sign in` and prompts `Paste code here if prompted:`; open the link on any device, sign in, and paste the code the page shows back into the prompt (read echo-off). The browser callback still wins if it lands first. It is Claude Code's own "Browser didn't open?" path, so it mints exactly what a browser login mints: usage polling, plan tier, and `rolling-token` all work. The Setup tab's login modal has the same: <kbd>c</kbd> copies the link for another device to your local clipboard through the terminal (OSC 52), <kbd>p</kbd> turns its row into a code field: type or paste the code, <kbd>⏎</kbd> submits, <kbd>esc</kbd> brings the row back.
@@ -117,6 +119,7 @@ clauth list           # account table with cached usage, no network
 | `CLAUTH_NO_COMPLETIONS=1` | skips the first-run completions prompt |
 | `CLAUTH_NO_API=1` | disables the daemon's REST listener whatever `--listen` says |
 | `CLAUDE_CONFIG_DIR` | scopes `which` and `start` to that config dir's credentials |
+| `CODEX_HOME` | set by `clauth start` on a codex profile to the session's own home, which is how `which` answers inside one; read by `login --codex` as the codex home to capture from, when it is not a clauth session home |
 | `SHELL` | how `completions install` detects your shell when you do not name one |
 | `COLORTERM` | what the TUI auto-detects its color depth from: `truecolor` or `24bit` picks `full`, anything else `compatible`. `--theme` and the `theme` key in `profiles.toml` both beat it |
 | `HERDR_CONFIG_PATH` | which config file `herdr install` writes into, matching how herdr itself reads the override |

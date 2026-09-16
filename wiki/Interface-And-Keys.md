@@ -6,7 +6,7 @@
 
 | Tab | Holds | You can |
 |-----|-------|---------|
-| **Overview** | account table, live 5h / 7d bars, chain position | switch accounts, reorder them |
+| **Overview** | account table, live 5h / 7d bars, chain position, a read-only section of codex accounts | switch accounts, reorder them, pick which harness shows |
 | **Usage** | per-account window breakdown: 5h, 7d, per-model weeks, extra-usage spend, peak-rate state | refresh one account, toggle estimates and the pace marker |
 | **Tokens** | global Claude Code token stats and API-equivalent cost | drill into models, change the period lens, count cache tokens |
 | **Setup** | per-account endpoint, key, env, model routing, auto-start | edit any of it, log in, log out, disable, delete |
@@ -16,6 +16,8 @@
 | **Plugin** | Claude Code wiring health, per-profile runtime state, running delegates | apply one-key fixes |
 
 The active account is orange. A `▲` on an account's row means the provider behind it is on peak-rate hours right now — some providers charge more at set times of day (DeepSeek roughly doubles its API rate; Z.ai's GLM peak hours consume the coding plan's quota faster). The active account's `●` outranks `▲` on its own row, so an active account on peak hours keeps its dot and `▲` shows on the other accounts. The Usage tab's `pricing` row names the state, the countdown to the next switch, and nothing renders for flat-rate accounts. The marker follows the provider's own published rate schedule, never which models the profile pins; an account on an endpoint clauth doesn't recognize shows none. Usage numbers are cached on disk, so they stay on screen when the API is rate-limited or unreachable. Once those figures age past the refresh cadence's stale threshold, the Usage tab's status block adds a `[ stale ]` pill; it reads the age of the reading — an OAuth account's own fetch stamp, one it cannot date reading stale at once, or a third-party account's cache write time — not the last fetch outcome, so a `[ cached ]` pill and it can appear together.
+
+Codex accounts ([Codex](Codex)) sit under the Claude Code rows in a section headed ``codex — switch with `clauth <name>` ``, in the same columns: name (bold, in the blue accent, when it is the active codex profile), plan, 5h and 7d, with `—` where nothing is cached. The section is read-only: no cursor reaches it, <kbd>⏎</kbd> and <kbd>a</kbd> never act on a codex row, and there is no live or timer cell. A codex row shows the same `×` marker when its chain is quarantined, and its plan cell falls back to the plan the account's login claims while no poll has cached one. The header's account count is the rows the Overview lists: both harnesses by default, one under its `claude only` / `codex only` chip (`3 accounts · codex only`).
 
 ## Keys
 
@@ -39,18 +41,20 @@ The active account is orange. A `▲` on an account's row means the provider beh
 
 | Key | Behavior |
 |-----|----------|
-| <kbd>r</kbd> | Usage: refresh the selected account only. Tokens / Status / Plugin: reload that tab's data. Everywhere else: refresh every account |
-| <kbd>t</kbd> | Tokens: cycle the period lens. Everywhere else: force-rotate every account's token, after a confirm |
+| <kbd>r</kbd> | Usage: refresh the selected account only. Tokens / Status / Plugin: reload that tab's data. Everywhere else: refresh every Claude Code account |
+| <kbd>t</kbd> | Tokens: cycle the period lens. Everywhere else: force-rotate every Claude Code account's token, after a confirm |
 | <kbd>⏎</kbd> | Overview: switch to the selected account. Tokens: open the model breakdown. Setup / Fallback: open a detail row, or commit an edit. Status / Plugin: open the detail |
 | <kbd>⇧↑</kbd> <kbd>⇧↓</kbd> | Overview: reorder accounts. Fallback (chain focus): reorder chain members |
 | <kbd>space</kbd> | Config: cycle a value. Setup `model` row and Fallback toggle rows: flip |
 | <kbd>+</kbd> <kbd>-</kbd> | Fallback detail: step `rotate at` or `weekly at` by 5 |
 | <kbd>e</kbd> | Usage: toggle burn estimates |
 | <kbd>p</kbd> | Usage: toggle the ideal-pace marker |
-| <kbd>c</kbd> | Tokens: count cache reads and writes in the token totals |
+| <kbd>c</kbd> | Overview: cycle the harness filter, both → claude only → codex only. Tokens: count cache reads and writes in the token totals |
 | <kbd>f</kbd> | Plugin: apply the selected row's fix |
 
 On macOS, <kbd>t</kbd> skips any account holding a live `clauth start` session: that session's login lives in a Keychain item clauth cannot write, so rotating it would sign the session out.
+
+The footer labels <kbd>c</kbd> `harness` on the Overview; the <kbd>?</kbd> help for that tab does not list it. With the Overview showing codex rows alone, the keys bound to the Claude Code selection (<kbd>↑</kbd> <kbd>↓</kbd>, <kbd>⇧↑</kbd> <kbd>⇧↓</kbd>, <kbd>⏎</kbd>, <kbd>a</kbd>) do nothing and a toast says `claude rows are hidden, press c`. <kbd>n</kbd>, <kbd>r</kbd> and <kbd>t</kbd> keep working on the Claude Code accounts; neither refresh nor rotation reaches a codex row (codex usage polls on the refresh interval alone, and a codex chain rotates only in the background). On every other tab <kbd>c</kbd> keeps its own meaning or none.
 
 ## Action menus
 

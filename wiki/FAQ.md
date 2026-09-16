@@ -12,7 +12,9 @@
 
 **Does it work with Pro, Max, Team, and Enterprise?** Yes, plan tier detected automatically, Max 5x and 20x included. Endpoint profiles cover the Anthropic API and any compatible proxy.
 
-**Where does clauth store my credentials?** Under `~/.clauth/`, owner-only on Unix. Tokens go to Anthropic and nowhere else. [Security](Security).
+**Where does clauth store my credentials?** Under `~/.clauth/`, owner-only on Unix. Claude tokens go to Anthropic and codex tokens to OpenAI, nowhere else. [Security](Security).
+
+**Can clauth run codex accounts?** Yes. `clauth login <name> --codex` adopts the ChatGPT login your own `codex` holds (or `--codex --browser` mints a fresh one), `clauth start <name>` then runs `codex` under that profile's own `CODEX_HOME`, and a separate codex chain rotates accounts between sessions. [Codex](Codex).
 
 **Can I add an account without logging out of the one I am using?** `clauth login <name>` opens a browser, runs Claude Code's OAuth flow, and writes the tokens into a new profile. The session you are in is untouched.
 
@@ -28,7 +30,7 @@
 
 **Usage numbers are stuck.** Only one clauth instance fetches at a time. If a daemon holds the lease, an open TUI reads its results instead of polling itself, and picks the lease back up within a tick of the daemon exiting. `clauth daemon --status` says whether one is up.
 
-**An account has a `×` next to it.** Its login was rejected for good, so it is quarantined and excluded from the chain. Run `clauth login <name>` to re-authenticate it. On an account that authenticates by api key, what died is the stored subscription login its usage figures came from, so `clauth login <name> --api-key <key>` is the one that clears the quarantine against the credential that account actually runs on. A bare browser login clears it too and leaves the endpoint and key standing.
+**An account has a `×` next to it.** Its login was rejected for good, so it is quarantined and excluded from the chain. Run `clauth login <name>` to re-authenticate it. On an account that authenticates by api key, what died is the stored subscription login its usage figures came from, so `clauth login <name> --api-key <key>` is the one that clears the quarantine against the credential that account actually runs on. A bare browser login clears it too and leaves the endpoint and key standing. On a codex row the `×` means the chain is quarantined; only a new login clears it: `clauth login <name> --codex --browser` ([Codex](Codex#when-a-chain-dies)).
 
 **The chain will not switch to an account that looks fine.** Check the reason on its row. Weekly windows, per-model weekly windows, a spend ceiling, a canceled subscription, or a `disabled` flag all take a member out of rotation independently of its 5h number. The [exclusion table](Auto-Switch#excluded-members) lists all of them. If what excludes it is a per-model week and the sessions you run do not use that model, `start --auto` judges that week against the models a session will run instead of excluding the account outright ([Auto-switch](Auto-Switch#choosing-where-a-session-starts)).
 

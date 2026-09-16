@@ -12,7 +12,7 @@ Only the latest release. Binary installs stay current through the verified auto-
 
 ## Data at rest
 
-Per-profile state lives under `~/.clauth/`. On Unix that whole tree is owner-only: every clauth-owned file is `0600`, every directory `0700`. No exceptions list to drift out of date. The only credential copy outside it is the macOS Keychain item below. clauth's one other tree of its own is `~/.local/share/clauth/`, which holds the bundled plugin and no credentials; what a switch writes into Claude Code's own `~/.claude/` is listed at the end of this section.
+Per-profile state lives under `~/.clauth/`. On Unix that whole tree is owner-only: every clauth-owned file is `0600`, every directory `0700`; the one exception is the inside of a codex home (`profiles/<name>/codex-home*`: the durable store and every session home, each itself `0700`), where codex's own files keep the modes codex gives them. The only credential copy outside it is the macOS Keychain item below. clauth's one other tree of its own is `~/.local/share/clauth/`, which holds the bundled plugin and no credentials; what a switch writes into Claude Code's own `~/.claude/` is listed at the end of this section.
 
 | Path | Contents | Unix mode |
 |------|----------|-----------|
@@ -22,6 +22,11 @@ Per-profile state lives under `~/.clauth/`. On Unix that whole tree is owner-onl
 | `~/.clauth/profiles/<name>/session-token.static.json` | the `claude setup-token` mint a rolling token superseded, kept so `clauth static-token <p>` (or a dead chain) can restore it | file `0600`, dirs `0700` |
 | `~/.clauth/profiles/<name>/quarantine/<ts>-<seq>.<basename>` | credential files moved aside before repair, kept as evidence — a mis-filled sidecar (`….session-token.json`, which by definition carries a refresh token: that is what made it a mis-fill) or a backup slot whose content was not a mint (`….session-token.static.json`). Evidence can hold live credentials, which is why the dir is `0700`, why nothing prunes it automatically, and why it lives under the profile so `clauth delete` removes it with everything else that account owns | file `0600`, dir `0700` |
 | `~/.clauth/profiles/<name>/config.toml` | base URL, API key (endpoint profiles), env block | `0600` |
+| `~/.clauth/codex-profiles.toml` | the codex roster: profile names, the active codex slot, the codex fallback chain and its settings; no credentials | `0600` |
+| `~/.clauth/profiles/<name>/auth.json` | a codex profile's ChatGPT token chain in codex's own `auth.json` shape (access, refresh and id tokens, account id); the one file codex sessions on that profile read and refresh through a link | `0600` |
+| `~/.clauth/profiles/<name>/auth.attempt`, `auth.lkg.json`, `auth.quarantine.json` | beside a codex store: a fingerprint of the refresh token last sent (never the token), the last-known-good copy of the chain, and the terminal verdict on a dead chain (the server's, or clauth's own when a rotation the server accepted never reached the store) | `0600` |
+| `~/.clauth/profiles/<name>/codex-home/` | a codex profile's durable store: its sqlite state, `history.jsonl` and the rollout roots (`sessions/`, `archived_sessions/`) that every shared session links into | `0700` |
+| `~/.clauth/profiles/<name>/codex-home-<sid>/` | one live codex session's `CODEX_HOME`: links to the profile's `auth.json`, sqlite state and rollout roots, a copy of your `~/.codex/config.toml` with the store and lockfile keys stripped, and per-session scratch | `0700` |
 | `~/.clauth/profiles/<name>/usage_cache.json` | last-known utilization and plan | `0600` |
 | `~/.clauth/profiles/<name>/runtime-<sid>/settings.json` | one live session's Claude Code settings. An endpoint profile's key is **not** in it: the file carries an `apiKeyHelper` line naming `clauth __api-key <profile>`, which Claude Code runs per request to mint the key | `0600` |
 | `~/.clauth/devices.json` | the devices that may call the daemon's REST API: each one's name, tier (`view` or `control`), when and how it joined, and a SHA-256 of its bearer token, plus a SHA-256 of the last token imported from before pairing, so a revoked one is not imported again. Never the token, which is shown once, when it is minted. Only if you have paired or added a device, or run `clauth daemon --listen` over a token from before pairing | `0600` |
@@ -42,10 +47,11 @@ On macOS a second copy of the active login lives outside this tree, in the login
 clauth reads that item before every write (to carry your MCP-server logins across) and reads it back after every write to verify it landed: a write that reads back corrupt fails the switch, and one that cannot be checked completes with a note on its event line. The write goes to `security -i` over stdin while the command line fits 4096 bytes, keeping the token out of the process table; a larger item rides the tool's argument vector instead — visible to processes of your own user for the life of the call, and disclosed on the event line — and one past 512 KiB is refused outright, naming the size and how to shrink the item. A failed write reports the tool's exit code and the size of its stderr, never the stderr itself, since the tool can echo the value being written. Access is whatever the login Keychain grants, not `0600`.
 
 - Writes are atomic. The temp file gets mode `0600` at creation, not a chmod afterward, so a loose umask never leaves a readable window; it's fsynced, then renamed into place. A rotation caught mid-write lands as `credentials.json.pending` and is promoted only once it's durable.
-- Modes are enforced on Unix two ways: each writer creates its file owner-only, and every launch re-tightens the whole `~/.clauth` tree, repairing a store from an older build or a loose umask.
+- Modes are enforced on Unix two ways: each writer creates its file owner-only, and every launch re-tightens the whole `~/.clauth` tree, repairing a store from an older build or a loose umask; the sweep stops at each codex home's `0700` node (the durable store and the session homes) and leaves codex's own files inside it alone.
   - The repair never follows a symlink out of the tree, so it can't touch a file clauth doesn't own. On Windows, access falls to the default user-profile ACLs, which clauth does not loosen.
 - A switch rewrites three files: `~/.claude/.credentials.json`, parts of `~/.claude/settings.json` (the `env` block, the top-level `model` key, `apiKeyHelper`), and `~/.claude.json`, whose stale account-identity block is dropped so Claude Code re-derives identity from the new token.
   - The rest of `~/.claude/` is left alone. On macOS the switch writes the Keychain item above as well, because Claude Code reads the Keychain before the file there.
+- `clauth login <name> --codex` is the one write into codex's own tree: it replaces `~/.codex/auth.json` with a symlink onto that profile's store (staged beside it and renamed over), so your codex and every clauth session share one chain; deleting the profile removes that link and says so. On a host without symlinks the file is copied instead and your codex keeps a second live copy of the chain, which clauth tells you at capture time.
 
 ## Network activity
 
@@ -67,9 +73,12 @@ Every request clauth makes, and what rides along with it:
 | `openrouter.ai/api/v1/credits` and `/api/v1/key` | only for profiles whose base URL is OpenRouter | that provider's API key |
 | an Alibaba console gateway (`bailian-cs.console.aliyun.com` or its regional twin for your site) | usage poll for a Model Studio profile, whose API key cannot read its own quota | that profile's stored `[console]` session, never its API key |
 | `bailian.console.aliyun.com` or `modelstudio.console.alibabacloud.com` | `clauth login` on a Model Studio profile, opened in your browser to capture that console session | no credentials; the callback comes back to a loopback listener |
+| `auth.openai.com/oauth/authorize` | `clauth login <name> --codex --browser`, opened in your browser | no credentials; the callback comes back to a loopback listener on codex's registered ports (1455, then 1457) |
+| `auth.openai.com/oauth/token` | that login's code exchange, and the refresh of a codex profile's chain when its access token nears expiry (single-use refresh tokens: each one is sent at most once, a fingerprint file remembers which) | the one-time authorization code and PKCE verifier for the exchange; the codex refresh token for a refresh; the id token for the optional API-key exchange |
+| `chatgpt.com/backend-api/wham/usage` | usage poll for a codex profile on the refresh interval | the codex access token (Bearer) and the account id header |
 | a custom base URL you set | requests against an API-endpoint profile, plus a best-effort usage probe against that same origin | whatever you configured |
 
-Your stored Claude access tokens go to `api.anthropic.com` and nowhere else. Your refresh token goes to `platform.claude.com`, which is the token endpoint Claude Code's own client refreshes against: every pair is minted there, whether from a refresh or from the interactive `clauth login`, which follows Claude Code's OAuth flow by opening `claude.com` in your browser to authorize (or showing you the same link to open on any device) and posting the one-time code back to `platform.claude.com`. clauth runs no telemetry or analytics; it talks to the hosts above and no others.
+Your stored Claude access tokens go to `api.anthropic.com` and nowhere else; a codex profile's tokens go to `auth.openai.com` and `chatgpt.com` and nowhere else. Your refresh token goes to `platform.claude.com`, which is the token endpoint Claude Code's own client refreshes against: every pair is minted there, whether from a refresh or from the interactive `clauth login`, which follows Claude Code's OAuth flow by opening `claude.com` in your browser to authorize (or showing you the same link to open on any device) and posting the one-time code back to `platform.claude.com`. clauth runs no telemetry or analytics; it talks to the hosts above and no others.
 
 ### Listening sockets
 
@@ -114,7 +123,7 @@ Agent-invoked, only when the Claude Code plugin is installed:
 
 - **`delegate` (MCP tool).** Sends a real, billed `/v1/messages` request on a target profile under its own OAuth token, opening a full 5-hour usage window on that account.
   - It fires only when an agent calls the tool, and is hard-capped at recursion depth 1 (a delegated session cannot call `delegate` again).
-- **`switch_profile` (MCP tool).** Relinks the global `~/.claude` credentials to another profile, the same write `clauth switch` performs. It changes which account the global session refreshes onto; it sends no inference itself.
+- **`switch_profile` (MCP tool).** Relinks the global `~/.claude` credentials to another profile, the same write the bare `clauth <name>` performs. It changes which account the global session refreshes onto; it sends no inference itself.
 
 Network-invoked, only while `clauth daemon --listen` is running:
 

@@ -2,7 +2,7 @@
 
 An ordered chain of accounts clauth hops down when the active one runs out of headroom. Opt-in: an account outside the chain is never switched to or away from, and an empty chain means clauth never switches on its own.
 
-Edit the chain on the Fallback tab, as `fallback_chain` in `profiles.toml`, or over the REST API (the `--listen` route table on the [Daemon](Daemon) page).
+Edit the chain on the Fallback tab, as `fallback_chain` in `profiles.toml`, or over the REST API (the `--listen` route table on the [Daemon](Daemon) page). Codex profiles have a separate chain of their own ([below](Auto-Switch#codex)).
 
 ## The decision
 
@@ -46,7 +46,7 @@ The walk skips a member for any of these, worst first. The Overview and Fallback
 |--------|---------|
 | `disabled` | you ran `clauth disable <name>`, or flipped it on the Setup tab |
 | `canceled` | the subscription reads canceled at Anthropic |
-| `auth broken` | a refresh was rejected for good; the login needs `clauth login <name>` |
+| `auth broken` | a refresh was rejected for good; the login needs `clauth login <name>` (a codex chain: `clauth login <name> --codex --browser`) |
 | `weekly spent` | 7d at 100%, dead until the week resets |
 | `claude code blocked` | the messages limiter keeps refusing this account, twice running, with quota still ahead |
 | `extra usage spent` | out of subscription quota and out of the spend ceiling below |
@@ -128,3 +128,11 @@ The candidate set is the fallback chain — the accounts you have already said m
 ## Mixing account types
 
 A chain holding both OAuth and API-key accounts raises a confirm before it is saved. Switching away from an API-key member does not unset the environment variables a running bare `claude` already read, so that session can keep using the old endpoint until it restarts. `clauth start` sessions are unaffected.
+
+## Codex
+
+Codex profiles ([Codex](Codex)) have a chain of their own, and the two never mix: it is `fallback_chain` in `~/.clauth/codex-profiles.toml`, hand-edited, with the codex active marker as its anchor, its own `wrap_off`, and its own `weekly_switch_threshold` (default `98.0`, band 50-100) in place of the Config tab's `weekly limit` ([Configuration](Configuration#codex-profilestoml)). The Fallback tab and the REST chain routes edit the Claude Code chain alone.
+
+The decision is the one above: the active codex profile has to be a chain member, it has to be exhausted or dead, and the walk takes the next member with headroom in chain order, preferring one whose usage was read live. Exhausted means the 5h window past `95%` or the weekly window past the codex line; every codex member takes those two lines and nothing else, there being no per-member card to set `rotate at`, `last resort`, `preferred`, a spend ceiling or a gate on. Dead means the chain is quarantined (`×` on the row, `broken` in the feed) or the account's usage polls keep answering 401 past two forced refreshes. Per-model weekly windows, burn-aware switching and extra usage are Claude Code concepts and do not apply.
+
+What differs is when it lands. There is no live-session swap for codex and `--with-fallback` is refused on a codex profile: codex reads its login once at start, so a switch moves the active marker and takes effect at the next `clauth start`, while a running session finishes on the account it started with. The daemon log reads `clauth: codex auto-switched to '<name>' — live at the next codex session`. With every member spent, `wrap_off = false` stays on the last one, and `wrap_off = true` clears the active slot (`clauth: every codex account is spent — codex active slot cleared`); a cleared slot re-arms nothing on its own, so `clauth <name>` on a codex profile is how the chain starts walking again.
