@@ -37,28 +37,32 @@ pub(crate) enum HerdrProbeOut {
     Ran(Option<HerdrOut>),
 }
 
-/// The seam between the daemon's routes and the herdr subprocess, argv in and
-/// the bounded call's outcome out, so no test runs a real herdr: this route's
-/// `pane list` and `process-info`, the terminal bridge's `api snapshot`, and
-/// the agent routes' `agent prompt` and `pane send-keys` all go through it.
-/// The daemon fills [`ApiContext::herdr_probe`] with [`real_probe`]; tests
-/// fill it with fixture-backed probes.
-pub(crate) type PaneProbe = Box<dyn Fn(&[&str]) -> HerdrProbeOut + Send + Sync>;
+/// The seam between the daemon's routes and the herdr subprocess, argv and a
+/// per-call deadline in and the bounded call's outcome out, so no test runs a
+/// real herdr: this route's `pane list` and `process-info`, the terminal
+/// bridge's `api snapshot`, the agent routes' `agent prompt` and `pane
+/// send-keys`, and the session route's `tab create`/`agent start`/`pane run`
+/// all go through it. The daemon fills [`ApiContext::herdr_probe`] with
+/// [`real_probe`]; tests fill it with fixture-backed probes.
+pub(crate) type PaneProbe =
+    Box<dyn Fn(&[&str], std::time::Duration) -> HerdrProbeOut + Send + Sync>;
 
 /// The real probe: [`crate::herdr::resolved_bin`] + the daemon-scoped
-/// [`crate::herdr::daemon_bounded_output`] (session env stripped).
+/// [`crate::herdr::daemon_bounded_output_deadline`] (session env stripped) at
+/// the call's own deadline.
 pub(crate) fn real_probe() -> PaneProbe {
-    Box::new(|args| match crate::herdr::resolved_bin() {
+    Box::new(|args, deadline| match crate::herdr::resolved_bin() {
         None => HerdrProbeOut::NotInstalled,
         Some(bin) => HerdrProbeOut::Ran(
             // The daemon-scoped call: the session env is stripped so a daemon
             // started inside a herdr pane still serves the default session
             // (owner ruling 2026-09-15, row 7; threat-model HB-4).
-            crate::herdr::daemon_bounded_output(&bin.to_string_lossy(), args).map(|out| HerdrOut {
-                success: out.status.success(),
-                stdout: out.stdout,
-                stderr: out.stderr,
-            }),
+            crate::herdr::daemon_bounded_output_deadline(&bin.to_string_lossy(), args, deadline)
+                .map(|out| HerdrOut {
+                    success: out.status.success(),
+                    stdout: out.stdout,
+                    stderr: out.stderr,
+                }),
         ),
     })
 }
@@ -67,7 +71,7 @@ pub(crate) fn real_probe() -> PaneProbe {
 /// build a context but never ask for panes.
 #[cfg(test)]
 pub(crate) fn absent_probe() -> PaneProbe {
-    Box::new(|_| HerdrProbeOut::NotInstalled)
+    Box::new(|_, _| HerdrProbeOut::NotInstalled)
 }
 
 /// The one fixed sentence each absent state carries; nothing off the wire.
@@ -204,7 +208,7 @@ pub(crate) enum SessionKind {
 )]
 pub(crate) fn panes(ctx: &ApiContext, _: &Request, _: &Caller<'_>) -> Response {
     let rows = crate::live_sessions::list();
-    let herdr_panes = match (ctx.herdr_probe)(&["pane", "list"]) {
+    let herdr_panes = match (ctx.herdr_probe)(&["pane", "list"], crate::herdr::PROBE_TIMEOUT) {
         HerdrProbeOut::NotInstalled => {
             return Response::serialize(200, &absent_body(NOT_INSTALLED));
         }
@@ -356,7 +360,7 @@ fn pane_entry(pane: HerdrPane, group_id: Option<u32>, sessions: Vec<PaneSession>
 /// envelope.
 fn process_info(ctx: &ApiContext, pane_id: &str) -> Option<ProcessInfo> {
     let args = ["pane", "process-info", "--pane", pane_id];
-    let out = match (ctx.herdr_probe)(&args) {
+    let out = match (ctx.herdr_probe)(&args, crate::herdr::PROBE_TIMEOUT) {
         HerdrProbeOut::NotInstalled | HerdrProbeOut::Ran(None) => return None,
         HerdrProbeOut::Ran(Some(out)) => out,
     };

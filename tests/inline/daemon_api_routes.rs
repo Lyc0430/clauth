@@ -388,6 +388,7 @@ fn the_route_table_is_exactly_this() {
             ("HEAD", "/panes", Access::View),
             ("GET", "/sessions", Access::View),
             ("HEAD", "/sessions", Access::View),
+            ("POST", "/sessions", Access::Control),
             ("GET", "/sessions/{id}", Access::View),
             ("HEAD", "/sessions/{id}", Access::View),
             ("POST", "/panes/{id}/prompt", Access::Control),
@@ -1095,7 +1096,7 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         std::sync::Arc::clone(&config),
         ctx.status_path.clone(),
         None,
-        Box::new(|args| {
+        Box::new(|args, _deadline| {
             let sent = match args {
                 ["agent", "prompt", _, text] => *text,
                 ["pane", "send-keys", _, key, ..] => *key,
@@ -1154,6 +1155,144 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
     ] {
         let resp = call(&ctx, &req("POST", &concrete(path), Some(TOKEN), body));
         check_answer(&doc, "POST", path, 503, &resp, &mut driven, &mut produced);
+    }
+
+    // The session-creation route, through a herdr table answering tab create,
+    // agent start and pane get. The config key and the grant are staged per arm.
+    {
+        let mut state = crate::profile::load_app_state().expect("load state");
+        state.serve.session_creation = false;
+        crate::profile::save_app_state(&state).expect("save session_creation off");
+        crate::daemon::api::devices::allow_sessions(DEVICE).expect("grant sessions");
+
+        let key_off = call(
+            &ctx,
+            &req("POST", "/api/v1/sessions", Some(TOKEN), r#"{"cwd":"/"}"#),
+        );
+        check_answer(
+            &doc,
+            "POST",
+            "/sessions",
+            403,
+            &key_off,
+            &mut driven,
+            &mut produced,
+        );
+
+        state.serve.session_creation = true;
+        crate::profile::save_app_state(&state).expect("save session_creation on");
+
+        let ctx_create = ApiContext::for_tests(
+            std::sync::Arc::clone(&config),
+            ctx.status_path.clone(),
+            None,
+            Box::new(|args, _deadline| {
+                let out = |success: bool, stdout: &str, stderr: &str| {
+                    panes::HerdrProbeOut::Ran(Some(panes::HerdrOut {
+                        success,
+                        stdout: stdout.as_bytes().to_vec(),
+                        stderr: stderr.as_bytes().to_vec(),
+                    }))
+                };
+                match args {
+                    [
+                        "tab",
+                        "create",
+                        "--cwd",
+                        "/",
+                        "--no-focus",
+                        "--workspace",
+                        "w9",
+                    ] => out(
+                        false,
+                        "",
+                        r#"{"error":{"code":"workspace_not_found","message":"workspace w9:nope not found"},"id":"cli:tab:create"}"#,
+                    ),
+                    ["tab", "create", ..] => out(
+                        true,
+                        r#"{"id":"cli:tab:create","result":{"root_pane":{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1","agent_status":"unknown"},"tab":{"tab_id":"w1:t2","workspace_id":"w1"},"type":"tab_created"}}"#,
+                        "",
+                    ),
+                    ["agent", "start", _, "--kind", "bogus", ..] => {
+                        out(false, "", "unsupported interactive agent kind: bogus")
+                    }
+                    ["agent", "start", _, "--kind", "claude", ..] => out(
+                        false,
+                        "",
+                        r#"{"error":{"code":"agent_not_ready","message":"agent claude blocked during startup"},"id":"cli:agent:start"}"#,
+                    ),
+                    ["pane", "run", "w1:p2", "clauth", "start", "alpha"] => out(
+                        false,
+                        "",
+                        r#"{"error":{"code":"pane_not_found","message":"pane w1:p2 not found"},"id":"cli:pane:run"}"#,
+                    ),
+                    ["pane", "get", "w1:p2"] => out(
+                        true,
+                        r#"{"id":"cli:pane:get","result":{"pane":{"agent":"claude","agent_status":"blocked","cwd":"/","focused":false,"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1"},"type":"pane_info"}}"#,
+                        "",
+                    ),
+                    ["tab", "close", "w1:t2"] => out(true, "", ""),
+                    _ => panes::HerdrProbeOut::Ran(None),
+                }
+            }),
+        );
+
+        for (body, status) in [
+            (r#"{"cwd":"/"}"#, 200),
+            (r#"{"cwd":"relative"}"#, 400),
+            (r#"{"cwd":"/","profile":"ghost"}"#, 404),
+            (r#"{"cwd":"/","profile":"alpha"}"#, 502),
+            (r#"{"cwd":"/","workspace":"w9"}"#, 409),
+            (r#"{"cwd":"/","kind":"bogus"}"#, 502),
+        ] {
+            let resp = call(
+                &ctx_create,
+                &req("POST", "/api/v1/sessions", Some(TOKEN), body),
+            );
+            check_answer(
+                &doc,
+                "POST",
+                "/sessions",
+                status,
+                &resp,
+                &mut driven,
+                &mut produced,
+            );
+        }
+        let absent = call(
+            &ctx,
+            &req("POST", "/api/v1/sessions", Some(TOKEN), r#"{"cwd":"/"}"#),
+        );
+        check_answer(
+            &doc,
+            "POST",
+            "/sessions",
+            503,
+            &absent,
+            &mut driven,
+            &mut produced,
+        );
+
+        let nogrant_token = "c".repeat(64);
+        seed_device("nogrunt", Tier::Control, &nogrant_token);
+        let no_grant = call(
+            &ctx,
+            &req(
+                "POST",
+                "/api/v1/sessions",
+                Some(&nogrant_token),
+                r#"{"cwd":"/"}"#,
+            ),
+        );
+        check_answer(
+            &doc,
+            "POST",
+            "/sessions",
+            403,
+            &no_grant,
+            &mut driven,
+            &mut produced,
+        );
     }
 
     let status = call(&ctx, &req("GET", "/api/v1/status", Some(TOKEN), ""));
@@ -1348,6 +1487,7 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         ("GET", "/panes"),
         ("GET", "/sessions"),
         ("GET", "/sessions/{id}"),
+        ("POST", "/sessions"),
         ("POST", "/switch"),
         ("POST", "/chain/order"),
         ("POST", "/chain/threshold"),
@@ -1383,6 +1523,7 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         ("/chain/wrap-off", r#"{"wrap_off":true}"#),
         ("/panes/{id}/prompt", r#"{"text":"fix the tests"}"#),
         ("/panes/{id}/keys", r#"{"keys":["y","enter"]}"#),
+        ("/sessions", r#"{"cwd":"/"}"#),
     ] {
         let resp = call(&ctx, &req("POST", &concrete(path), Some(OTHER_TOKEN), body));
         check_answer(&doc, "POST", path, 403, &resp, &mut driven, &mut produced);
@@ -1397,6 +1538,7 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         ("GET", "/panes"),
         ("GET", "/sessions"),
         ("GET", "/sessions/{id}"),
+        ("POST", "/sessions"),
         ("POST", "/switch"),
         ("POST", "/chain/order"),
         ("POST", "/chain/threshold"),
@@ -1818,6 +1960,7 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         ("GET", "/panes"),
         ("GET", "/sessions"),
         ("GET", "/sessions/{id}"),
+        ("POST", "/sessions"),
         ("POST", "/switch"),
         ("POST", "/chain/order"),
         ("POST", "/chain/threshold"),

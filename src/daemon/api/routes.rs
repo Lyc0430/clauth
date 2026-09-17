@@ -29,6 +29,7 @@ use crate::profile::ConfigHandle;
 
 use super::agent;
 use super::chain;
+use super::create;
 use super::devices::{self, Device, Tier};
 use super::events::__path_events;
 use super::events::HerdrSeam;
@@ -218,6 +219,12 @@ pub(crate) static ROUTES: &[Route] = &[
         path: "/sessions",
         access: Access::View,
         handler: sessions::sessions,
+    },
+    Route {
+        method: "POST",
+        path: "/sessions",
+        access: Access::Control,
+        handler: create::create,
     },
     Route {
         method: "GET",
@@ -954,7 +961,7 @@ fn pair(_: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
 /// endpoint cannot ship undocumented.
 #[derive(utoipa::OpenApi)]
 #[openapi(
-    paths(health, status, events, switch, chain::order, chain::threshold, chain::wrap_off, pair, openapi_document, panes::panes, sessions::sessions, sessions::session_history, agent::prompt, agent::keys),
+    paths(health, status, events, switch, chain::order, chain::threshold, chain::wrap_off, pair, openapi_document, panes::panes, sessions::sessions, sessions::session_history, create::create, agent::prompt, agent::keys),
     modifiers(&BearerScheme)
 )]
 struct ApiDoc;

@@ -49,7 +49,11 @@ pub(crate) fn production_herdr_resolver() -> HerdrSeam {
 #[cfg(unix)]
 fn resolve_herdr_socket() -> Option<PathBuf> {
     let bin = crate::herdr::resolved_bin()?;
-    let out = crate::herdr::daemon_bounded_output(bin.to_str()?, &["status", "server", "--json"])?;
+    let out = crate::herdr::daemon_bounded_output_deadline(
+        bin.to_str()?,
+        &["status", "server", "--json"],
+        crate::herdr::PROBE_TIMEOUT,
+    )?;
     if !out.status.success() {
         return None;
     }

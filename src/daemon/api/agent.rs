@@ -69,7 +69,7 @@ const KEY_MAX_CHARS: usize = 32;
 /// The fixed sentences; nothing off the wire reaches a body.
 const AGENT_BLOCKED: &str =
     "the agent is waiting on a prompt of its own; answer it with keys or the terminal stream";
-const HERDR_REFUSED: &str = "herdr refused the request; see daemon.log";
+pub(crate) const HERDR_REFUSED: &str = "herdr refused the request; see daemon.log";
 
 /// herdr's error envelope (measured 2026-09-17, herdr 0.9.0, the streams
 /// separated): every one is printed on STDERR with an empty stdout at exit 1,
@@ -91,7 +91,7 @@ struct ErrorDetail {
 /// The envelope's code off whichever stream carries one. stdout is tried
 /// first only because it is cheap: a success never coexists with an error,
 /// and every envelope herdr emits sits on stderr.
-fn error_code(out: &HerdrOut) -> Option<String> {
+pub(crate) fn error_code(out: &HerdrOut) -> Option<String> {
     [&out.stdout, &out.stderr].into_iter().find_map(|stream| {
         serde_json::from_slice::<ErrorEnvelope>(stream)
             .ok()
@@ -116,7 +116,7 @@ enum Refusal {
 /// One herdr call through the seam, its outcome reduced to the answer. A
 /// success's stdout is never read: the exit status is the whole answer.
 fn drive(ctx: &ApiContext, args: &[&str]) -> Result<(), Refusal> {
-    match (ctx.herdr_probe)(args) {
+    match (ctx.herdr_probe)(args, crate::herdr::PROBE_TIMEOUT) {
         HerdrProbeOut::NotInstalled => Err(Refusal::Unavailable(NOT_INSTALLED)),
         HerdrProbeOut::Ran(None) => Err(Refusal::Unavailable(NO_SERVER)),
         HerdrProbeOut::Ran(Some(HerdrOut { success: true, .. })) => Ok(()),
@@ -131,7 +131,7 @@ fn drive(ctx: &ApiContext, args: &[&str]) -> Result<(), Refusal> {
 
 /// What a refused call printed, for one log line: stderr when stdout is
 /// empty (herdr's every envelope), else stdout, through the sanitizer.
-fn output_for_log(out: &HerdrOut) -> String {
+pub(crate) fn output_for_log(out: &HerdrOut) -> String {
     let stream = if out.stdout.is_empty() {
         &out.stderr
     } else {

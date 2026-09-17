@@ -47,7 +47,7 @@ type Calls = Arc<Mutex<Vec<Vec<String>>>>;
 fn seam(answer: Answer) -> (PaneProbe, Calls) {
     let calls: Calls = Arc::new(Mutex::new(Vec::new()));
     let recorded = Arc::clone(&calls);
-    let probe: PaneProbe = Box::new(move |args| {
+    let probe: PaneProbe = Box::new(move |args, _deadline| {
         recorded
             .lock()
             .unwrap()

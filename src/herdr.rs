@@ -471,11 +471,15 @@ pub(crate) fn strip_session_env(cmd: &mut Command) {
     }
 }
 
-/// [`bounded_output`] plus [`strip_session_env`]: the bounded herdr call shape
-/// every daemon-side spawn uses. Pane-side callers (the T6 pane reporter, the
-/// Plugin tab) keep plain [`bounded_output`], because a call made from inside a
-/// pane must target that pane's own session.
-pub(crate) fn daemon_bounded_output(bin: &str, args: &[&str]) -> Option<Output> {
+/// [`bounded_output`] plus [`strip_session_env`] at a per-call deadline: the
+/// bounded herdr call shape every daemon-side spawn uses. Pane-side callers
+/// (the T6 pane reporter, the Plugin tab) keep plain [`bounded_output`],
+/// because a call made from inside a pane must target that pane's own session.
+pub(crate) fn daemon_bounded_output_deadline(
+    bin: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Option<Output> {
     let mut cmd = Command::new(bin);
     cmd.args(args)
         .stdin(Stdio::null())
@@ -483,7 +487,7 @@ pub(crate) fn daemon_bounded_output(bin: &str, args: &[&str]) -> Option<Output> 
         .stderr(Stdio::piped());
     strip_session_env(&mut cmd);
     let child = cmd.spawn().ok()?;
-    run_bounded(child, PROBE_TIMEOUT)
+    run_bounded(child, timeout)
 }
 
 /// One `panes[]` entry of `herdr api snapshot`'s rect, in cells. The snapshot

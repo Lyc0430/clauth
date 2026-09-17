@@ -211,7 +211,7 @@ enum HerdrPaneRect {
 
 fn herdr_pane_rect(ctx: &ApiContext, pane_id: &str) -> HerdrPaneRect {
     use super::panes::{HerdrOut, HerdrProbeOut};
-    match (ctx.herdr_probe)(&["api", "snapshot"]) {
+    match (ctx.herdr_probe)(&["api", "snapshot"], crate::herdr::PROBE_TIMEOUT) {
         HerdrProbeOut::NotInstalled => HerdrPaneRect::Reason(NOT_INSTALLED),
         HerdrProbeOut::Ran(None) => HerdrPaneRect::Reason(NO_SERVER),
         HerdrProbeOut::Ran(Some(HerdrOut { success: false, .. })) => {

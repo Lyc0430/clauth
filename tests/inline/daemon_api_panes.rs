@@ -107,7 +107,7 @@ fn clone_outcome(out: &HerdrProbeOut) -> HerdrProbeOut {
 /// A probe that answers `list` for `pane list` and `infos` per pane id; any
 /// other call (or an unknown pane) answers `Ran(None)`.
 fn probe(list: HerdrProbeOut, infos: Vec<(String, HerdrProbeOut)>) -> PaneProbe {
-    Box::new(move |args| match args {
+    Box::new(move |args, _deadline| match args {
         ["pane", "list"] => clone_outcome(&list),
         ["pane", "process-info", "--pane", pane_id] => infos
             .iter()
@@ -311,7 +311,7 @@ fn agent_session_id_is_the_id_kind_value_or_null() {
         .expect("a pane object")
         .remove("agent_session");
     let list = serde_json::to_vec(&list).expect("serializes");
-    let probe: PaneProbe = Box::new(move |args| match args {
+    let probe: PaneProbe = Box::new(move |args, _deadline| match args {
         ["pane", "list"] => HerdrProbeOut::Ran(Some(HerdrOut {
             success: true,
             stdout: list.clone(),
