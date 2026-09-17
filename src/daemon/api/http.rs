@@ -756,6 +756,7 @@ fn reason_phrase(status: u16) -> &'static str {
         413 => "Payload Too Large",
         431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
+        502 => "Bad Gateway",
         503 => "Service Unavailable",
         _ => "Unknown",
     }

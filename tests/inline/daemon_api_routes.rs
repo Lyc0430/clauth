@@ -53,8 +53,38 @@ fn ctx_with_live(
     ApiContext::for_tests(config, status_path, Some(live), panes::absent_probe())
 }
 
+/// The id every templated session row is driven with: the transcript stem
+/// `tests/fixtures/sessions/history.jsonl` is stored under, which is also the
+/// `agent_session` id the `w1N:p19` fixture pane carries.
+const FIXTURE_ID: &str = "1cb26556-3532-45e1-8b39-37f0b53a8e4f";
+/// The id every templated pane row is driven with: that fixture pane, shaped
+/// the way the agent routes require before they ask herdr.
+const FIXTURE_PANE_ID: &str = "w1N:p19";
+
+/// The captured transcript, so `GET /sessions/{id}` has a session to page.
+fn seed_history_transcript() {
+    let path = crate::profile::claude_dir()
+        .expect("claude dir")
+        .join(format!("projects/-home-user-repos-app/{FIXTURE_ID}.jsonl"));
+    std::fs::create_dir_all(path.parent().expect("a parent")).expect("create the slug dir");
+    std::fs::write(&path, include_bytes!("../fixtures/sessions/history.jsonl"))
+        .expect("write the transcript");
+}
+
+/// A documented path as a request path: under the prefix, a `{id}` filled
+/// with [`FIXTURE_PANE_ID`] on a pane row and [`FIXTURE_ID`] elsewhere.
+fn concrete(path: &str) -> String {
+    let id = if path.starts_with("/panes/") {
+        FIXTURE_PANE_ID
+    } else {
+        FIXTURE_ID
+    };
+    format!("{API_PREFIX}{}", path.replace("{id}", id))
+}
+
+/// A row's concrete request path.
 fn route_path(route: &Route) -> String {
-    format!("{API_PREFIX}{}", route.path)
+    concrete(route.path)
 }
 
 /// A conditional GET, for the feed's 304 and `?wait` paths.
@@ -356,8 +386,77 @@ fn the_route_table_is_exactly_this() {
             ("POST", "/pair", Access::None),
             ("GET", "/panes", Access::View),
             ("HEAD", "/panes", Access::View),
+            ("GET", "/sessions", Access::View),
+            ("HEAD", "/sessions", Access::View),
+            ("GET", "/sessions/{id}", Access::View),
+            ("HEAD", "/sessions/{id}", Access::View),
+            ("POST", "/panes/{id}/prompt", Access::Control),
+            ("POST", "/panes/{id}/keys", Access::Control),
         ]
     );
+}
+
+/// The one path-parameter spelling: a `{id}` segment binds any non-empty
+/// request segment, percent-decoded once, and nothing else; every other
+/// segment matches exactly. A `%` not followed by two hex digits, or bytes
+/// that are not UTF-8, match nothing; a `+` stays a `+`.
+#[test]
+fn the_template_matcher_binds_one_segment_decoded_and_nothing_else() {
+    assert_eq!(
+        match_template("/sessions/{id}", "/sessions/abc"),
+        Some(Some("abc".to_string()))
+    );
+    assert_eq!(
+        match_template("/panes/{id}/prompt", "/panes/w1N:p19/prompt"),
+        Some(Some("w1N:p19".to_string()))
+    );
+    assert_eq!(
+        match_template("/panes/{id}/prompt", "/panes/w1N%3Ap19/prompt"),
+        Some(Some("w1N:p19".to_string()))
+    );
+    assert_eq!(
+        match_template("/panes/{id}/prompt", "/panes/w1N%3ap19/prompt"),
+        Some(Some("w1N:p19".to_string()))
+    );
+    assert_eq!(
+        match_template("/sessions/{id}", "/sessions/a%2Fb%2E%2e+c%C3%A9"),
+        Some(Some("a/b..+c\u{e9}".to_string()))
+    );
+    // Decoded once: a double-encoded `%25XX` yields the `%XX` text, never a
+    // second pass over it.
+    assert_eq!(
+        match_template("/sessions/{id}", "/sessions/%2525"),
+        Some(Some("%25".to_string()))
+    );
+    assert_eq!(
+        match_template("/panes/{id}/prompt", "/panes/w1N%253Ap19/prompt"),
+        Some(Some("w1N%3Ap19".to_string()))
+    );
+    assert_eq!(
+        match_template("/panes/{id}/prompt", "/panes/../prompt"),
+        Some(Some("..".to_string()))
+    );
+    assert_eq!(match_template("/sessions", "/sessions"), Some(None));
+    for (template, path) in [
+        ("/sessions/{id}", "/sessions/"),
+        ("/sessions/{id}", "/sessions"),
+        ("/sessions/{id}", "/sessions/a/b"),
+        ("/sessions/{id}", "/sessions//"),
+        ("/sessions/{id}", "/sessions/%"),
+        ("/sessions/{id}", "/sessions/%4"),
+        ("/sessions/{id}", "/sessions/%zz"),
+        ("/sessions/{id}", "/sessions/%+1"),
+        ("/sessions/{id}", "/sessions/%-1"),
+        ("/sessions/{id}", "/sessions/%FF"),
+        ("/sessions/{id}", "/sessions/a%C3"),
+        ("/panes/{id}/prompt", "/panes/w1/keys"),
+        ("/panes/{id}/prompt", "/panes//prompt"),
+        ("/panes/{id}/prompt", "/panes/w1/prompt/"),
+        ("/sessions", "/sessions/"),
+        ("/sessions", "/sessions/x"),
+    ] {
+        assert_eq!(match_template(template, path), None, "{template} vs {path}");
+    }
 }
 
 // -------------------------------------------------------------- openapi
@@ -883,6 +982,180 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         &mut produced,
     );
 
+    // The sessions routes: the listing over the still-empty store, then the
+    // captured transcript paged under the fixture id. A record is the one
+    // free-form body besides the document's own: documented as a bare object
+    // (pinned below), so the walk sees the envelope with each record blanked;
+    // the records themselves are pinned byte for byte in
+    // `daemon_api_sessions.rs`.
+    let sessions = call(&ctx, &req("GET", "/api/v1/sessions", Some(TOKEN), ""));
+    check_answer(
+        &doc,
+        "GET",
+        "/sessions",
+        200,
+        &sessions,
+        &mut driven,
+        &mut produced,
+    );
+    seed_history_transcript();
+    let history = call(
+        &ctx,
+        &req("GET", &concrete("/sessions/{id}"), Some(TOKEN), ""),
+    );
+    assert_eq!(history.status, 200);
+    let mut envelope = body_json(&history);
+    let records = envelope["records"].as_array_mut().expect("records");
+    assert!(!records.is_empty(), "the fixture transcript pages");
+    for record in records.iter_mut() {
+        record["record"] = serde_json::json!({});
+    }
+    check_answer(
+        &doc,
+        "GET",
+        "/sessions/{id}",
+        200,
+        &Response::json(200, &envelope),
+        &mut driven,
+        &mut produced,
+    );
+    let record_schema = doc
+        .components
+        .as_ref()
+        .expect("the document has components")
+        .schemas
+        .get("HistoryRecord")
+        .expect("the record schema");
+    let utoipa::openapi::RefOr::T(utoipa::openapi::Schema::Object(record_schema)) = record_schema
+    else {
+        panic!("HistoryRecord must be an inline object schema");
+    };
+    assert_eq!(
+        serde_json::to_value(
+            record_schema
+                .properties
+                .get("record")
+                .expect("the record property")
+        )
+        .expect("schema serializes"),
+        serde_json::json!({
+            "type": "object",
+            "description": "One Claude Code transcript record, verbatim.",
+        }),
+        "a transcript record must stay documented as a bare object"
+    );
+    let listing_bad = call(
+        &ctx,
+        &req("GET", "/api/v1/sessions?limit=0", Some(TOKEN), ""),
+    );
+    check_answer(
+        &doc,
+        "GET",
+        "/sessions",
+        400,
+        &listing_bad,
+        &mut driven,
+        &mut produced,
+    );
+    let history_bad = call(
+        &ctx,
+        &req(
+            "GET",
+            &format!("{}?before=x", concrete("/sessions/{id}")),
+            Some(TOKEN),
+            "",
+        ),
+    );
+    check_answer(
+        &doc,
+        "GET",
+        "/sessions/{id}",
+        400,
+        &history_bad,
+        &mut driven,
+        &mut produced,
+    );
+    let history_missing = call(&ctx, &req("GET", "/api/v1/sessions/ghost", Some(TOKEN), ""));
+    check_answer(
+        &doc,
+        "GET",
+        "/sessions/{id}",
+        404,
+        &history_missing,
+        &mut driven,
+        &mut produced,
+    );
+
+    // The agent routes, through a herdr table keyed on what is sent: the
+    // text or first key `missing`, `blocked` and `boom` draw herdr's refusals
+    // (its measured envelopes, on stderr with stdout empty as herdr prints
+    // them), anything else succeeds. The plain context's absent probe is the
+    // herdr-unavailable arm.
+    let ctx_herdr = ApiContext::for_tests(
+        std::sync::Arc::clone(&config),
+        ctx.status_path.clone(),
+        None,
+        Box::new(|args| {
+            let sent = match args {
+                ["agent", "prompt", _, text] => *text,
+                ["pane", "send-keys", _, key, ..] => *key,
+                _ => return panes::HerdrProbeOut::Ran(None),
+            };
+            let envelope = match sent {
+                "missing" => {
+                    r#"{"error":{"code":"agent_not_found","message":"agent target w9:p99 not found"},"id":"cli:agent:prompt"}"#
+                }
+                "blocked" => {
+                    r#"{"error":{"code":"agent_blocked","message":"agent w9:p99 is blocked"},"id":"cli:agent:prompt"}"#
+                }
+                "boom" => {
+                    r#"{"error":{"code":"timeout","message":"no matching state within 5000ms"},"id":"cli:agent:prompt"}"#
+                }
+                _ => {
+                    return panes::HerdrProbeOut::Ran(Some(panes::HerdrOut {
+                        success: true,
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                    }));
+                }
+            };
+            panes::HerdrProbeOut::Ran(Some(panes::HerdrOut {
+                success: false,
+                stdout: Vec::new(),
+                stderr: envelope.as_bytes().to_vec(),
+            }))
+        }),
+    );
+    for (path, body, status) in [
+        ("/panes/{id}/prompt", r#"{"text":"fix the tests"}"#, 200),
+        ("/panes/{id}/prompt", r#"{"text":"missing"}"#, 404),
+        ("/panes/{id}/prompt", r#"{"text":"blocked"}"#, 409),
+        ("/panes/{id}/prompt", r#"{"text":"boom"}"#, 502),
+        ("/panes/{id}/prompt", "{}", 400),
+        ("/panes/{id}/keys", r#"{"keys":["y","enter"]}"#, 200),
+        ("/panes/{id}/keys", r#"{"keys":["missing"]}"#, 404),
+        ("/panes/{id}/keys", r#"{"keys":["boom"]}"#, 502),
+        ("/panes/{id}/keys", "{}", 400),
+    ] {
+        let resp = call(&ctx_herdr, &req("POST", &concrete(path), Some(TOKEN), body));
+        check_answer(
+            &doc,
+            "POST",
+            path,
+            status,
+            &resp,
+            &mut driven,
+            &mut produced,
+        );
+    }
+    for (path, body) in [
+        ("/panes/{id}/prompt", r#"{"text":"fix the tests"}"#),
+        ("/panes/{id}/keys", r#"{"keys":["y","enter"]}"#),
+    ] {
+        let resp = call(&ctx, &req("POST", &concrete(path), Some(TOKEN), body));
+        check_answer(&doc, "POST", path, 503, &resp, &mut driven, &mut produced);
+    }
+
     let status = call(&ctx, &req("GET", "/api/v1/status", Some(TOKEN), ""));
     check_answer(
         &doc,
@@ -1071,12 +1344,16 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         ("GET", "/events"),
         ("GET", "/openapi.json"),
         ("GET", "/panes"),
+        ("GET", "/sessions"),
+        ("GET", "/sessions/{id}"),
         ("POST", "/switch"),
         ("POST", "/chain/order"),
         ("POST", "/chain/threshold"),
         ("POST", "/chain/wrap-off"),
+        ("POST", "/panes/{id}/prompt"),
+        ("POST", "/panes/{id}/keys"),
     ] {
-        let resp = call(&ctx, &req(method, &format!("{API_PREFIX}{path}"), None, ""));
+        let resp = call(&ctx, &req(method, &concrete(path), None, ""));
         check_answer(&doc, method, path, 401, &resp, &mut driven, &mut produced);
     }
     seed_device("viewer", Tier::View, OTHER_TOKEN);
@@ -1102,16 +1379,10 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         ("/chain/order", r#"{"members":["alpha","beta","gamma"]}"#),
         ("/chain/threshold", r#"{"profile":"alpha","threshold":90}"#),
         ("/chain/wrap-off", r#"{"wrap_off":true}"#),
+        ("/panes/{id}/prompt", r#"{"text":"fix the tests"}"#),
+        ("/panes/{id}/keys", r#"{"keys":["y","enter"]}"#),
     ] {
-        let resp = call(
-            &ctx,
-            &req(
-                "POST",
-                &format!("{API_PREFIX}{path}"),
-                Some(OTHER_TOKEN),
-                body,
-            ),
-        );
+        let resp = call(&ctx, &req("POST", &concrete(path), Some(OTHER_TOKEN), body));
         check_answer(&doc, "POST", path, 403, &resp, &mut driven, &mut produced);
     }
     let wall_token = "b".repeat(64);
@@ -1122,25 +1393,21 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         ("GET", "/events"),
         ("GET", "/openapi.json"),
         ("GET", "/panes"),
+        ("GET", "/sessions"),
+        ("GET", "/sessions/{id}"),
         ("POST", "/switch"),
         ("POST", "/chain/order"),
         ("POST", "/chain/threshold"),
         ("POST", "/chain/wrap-off"),
+        ("POST", "/panes/{id}/prompt"),
+        ("POST", "/panes/{id}/keys"),
     ] {
         let body = if method == "POST" {
             r#"{"profile":"beta"}"#
         } else {
             ""
         };
-        let resp = call(
-            &ctx,
-            &req(
-                method,
-                &format!("{API_PREFIX}{path}"),
-                Some(&wall_token),
-                body,
-            ),
-        );
+        let resp = call(&ctx, &req(method, &concrete(path), Some(&wall_token), body));
         check_answer(&doc, method, path, 403, &resp, &mut driven, &mut produced);
     }
 
@@ -1312,11 +1579,15 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
 
     // HEAD routes like GET at the router and arrive bodyless on the wire, the
     // serve loop's strip the router never sees.
-    for path in ["/health", "/status", "/events", "/openapi.json"] {
-        let resp = call(
-            &ctx,
-            &req("HEAD", &format!("{API_PREFIX}{path}"), Some(TOKEN), ""),
-        );
+    for path in [
+        "/health",
+        "/status",
+        "/events",
+        "/openapi.json",
+        "/sessions",
+        "/sessions/{id}",
+    ] {
+        let resp = call(&ctx, &req("HEAD", &concrete(path), Some(TOKEN), ""));
         assert_eq!(resp.status, 200, "HEAD {path}");
         let head = resp.into_head();
         assert!(head.body.is_empty(), "HEAD {path} must arrive with no body");
@@ -1543,20 +1814,21 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         ("GET", "/events"),
         ("GET", "/openapi.json"),
         ("GET", "/panes"),
+        ("GET", "/sessions"),
+        ("GET", "/sessions/{id}"),
         ("POST", "/switch"),
         ("POST", "/chain/order"),
         ("POST", "/chain/threshold"),
         ("POST", "/chain/wrap-off"),
+        ("POST", "/panes/{id}/prompt"),
+        ("POST", "/panes/{id}/keys"),
     ] {
         let body = if method == "POST" {
             r#"{"profile":"beta"}"#
         } else {
             ""
         };
-        let resp = call(
-            &ctx,
-            &req(method, &format!("{API_PREFIX}{path}"), Some(TOKEN), body),
-        );
+        let resp = call(&ctx, &req(method, &concrete(path), Some(TOKEN), body));
         check_answer(&doc, method, path, 500, &resp, &mut driven, &mut produced);
     }
     let pair_failed = call(&ctx, &req("POST", "/api/v1/pair", None, &pair_body2));
@@ -1763,11 +2035,15 @@ fn a_view_device_is_refused_every_control_route() {
     assert_eq!(resp.status, 200, "the control device passes the same route");
 }
 
+/// Every view row answers 200 to a view device with an empty query: an empty
+/// store lists zero sessions, and the one templated view row pages the
+/// fixture transcript seeded under [`FIXTURE_ID`].
 #[test]
 fn a_view_device_reads_every_view_route() {
     let _home = HomeSandbox::new();
     let ctx = ctx_with(seeded_config());
     seed_device("phone", Tier::View, OTHER_TOKEN);
+    seed_history_transcript();
     for route in ROUTES.iter().filter(|route| route.access == Access::View) {
         let resp = call(
             &ctx,

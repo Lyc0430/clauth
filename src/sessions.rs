@@ -2,24 +2,28 @@
 //!
 //! Builds a newest-first, workspace-grouped inventory of CC sessions across the
 //! global `~/.claude/projects/` store plus every live isolated runtime's own
-//! store. The cost ceiling is deliberate: a session's first and last user
-//! message come from a bounded HEAD read and a seek-from-end TAIL read of each
-//! JSONL, never a full-transcript parse — the token subsystem already shows a
-//! full parse is too heavy to run per index build.
+//! store. Two tiers, each surface paying only its own: [`walk`] lists every
+//! transcript from filenames and mtimes alone (nothing opened), and
+//! [`preview`] reads ONE transcript's bounded HEAD and seek-from-end TAIL for
+//! its workspace and message previews — never a full-transcript parse, which
+//! the token subsystem already shows is too heavy to run per index build.
+//! [`build_index`] previews the whole walk; a page previews only its rows.
+//! [`read_page`] serves one transcript's records backward from a byte cursor
+//! through the same backward line walker the tail preview uses.
 //!
-//! This is the A1 foundation: the index core plus preview redaction. Later
-//! passes fill the remaining [`SessionInfo`] fields — A2 the per-session
-//! `tokens`/`cost` annotation, A3 the `last_ran_profile` stamp — so those fields
-//! are defined now but left `None` here.
+//! The `tokens`/`cost` annotation ([`annotate`]) and the `last_ran_profile`
+//! stamp ([`annotate_owners`]) are separate passes over the rows a caller
+//! already holds; a row missing from either renders blank, never `0`.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::hash_map::Entry;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -37,6 +41,11 @@ const TAIL_CHUNK: u64 = 64 * 1024;
 /// Ceiling the tail window grows to when a chunk holds no user line, bounding
 /// the read on a transcript whose tail is all tool traffic.
 const TAIL_MAX: u64 = 1024 * 1024;
+/// Byte budget of one history page ([`read_page`]): the page stops adding
+/// older records once the next one would push it past this, except that an
+/// empty page takes that one record whatever its size, so no record is ever
+/// truncated or unreachable.
+pub(crate) const PAGE_MAX_BYTES: u64 = 4 * 1024 * 1024;
 /// Preview length cap, in characters (not bytes — truncation lands on a char
 /// boundary so non-ASCII never panics).
 const PREVIEW_MAX_CHARS: usize = 200;
@@ -64,10 +73,10 @@ pub(crate) enum SessionSource {
     Isolated { profile: String },
 }
 
-/// One indexed session.
+/// One indexed session: a [`Walked`] entry plus its previews.
 ///
-/// `tokens`, `cost`, and `last_ran_profile` are populated by later passes (A2
-/// token/cost annotation, A3 profile tracking) and are left `None` here. They
+/// `tokens`, `cost`, and `last_ran_profile` are populated by separate passes
+/// ([`annotate`], [`annotate_owners`]) and are `None` off [`preview`]. They
 /// stay `Option` on purpose: a session missing from the token stats or the
 /// last-ran map renders blank, never `0`/empty-string.
 #[derive(Debug, Clone)]
@@ -94,7 +103,6 @@ pub(crate) struct SessionInfo {
     /// Last user message, redacted preview (`None` when the tail held none).
     pub(crate) last_message: Option<String>,
     /// Which store the transcript came from.
-    #[allow(dead_code, reason = "written at index time; read by the Sessions tab")]
     pub(crate) source: SessionSource,
     /// Per-session token total — A2 fills this; `None` = absent from stats.
     pub(crate) tokens: Option<u64>,
@@ -326,62 +334,181 @@ fn read_head(path: &Path) -> Head {
     }
 }
 
-/// The last user message, found by seeking from the end and scanning a bounded
-/// tail window backward — never a full parse. The window grows up to [`TAIL_MAX`]
-/// if a chunk holds only tool traffic. Fail-soft: any IO error yields `None`.
+/// The last user message, found by walking the tail's lines backward — never a
+/// full parse. The walk covers at most [`TAIL_MAX`] bytes from the end, so a
+/// transcript whose tail is all tool traffic yields `None`. Fail-soft: any IO
+/// error yields `None`.
 fn read_last_user_message(path: &Path) -> Option<String> {
-    let mut file = File::open(path).ok()?;
-    let len = file.metadata().ok()?.len();
-    if len == 0 {
-        return None;
-    }
-    let mut window = TAIL_CHUNK;
-    loop {
-        let read_len = window.min(len);
-        file.seek(SeekFrom::Start(len - read_len)).ok()?;
-        let mut buf = Vec::with_capacity(read_len as usize);
-        file.by_ref().take(read_len).read_to_end(&mut buf).ok()?;
-
-        // Unless the window starts at byte 0, its first line is a partial cut —
-        // drop up to the first newline so every scanned line is whole.
-        let slice: &[u8] = if read_len < len {
-            match buf.iter().position(|&b| b == b'\n') {
-                Some(i) => &buf[i + 1..],
-                None => &buf[..],
-            }
+    let mut found = None;
+    lines_before(path, None, TAIL_WINDOW, |_, line| {
+        found = std::str::from_utf8(line)
+            .ok()
+            .and_then(|text| serde_json::from_str::<TranscriptLine>(text).ok())
+            .and_then(|parsed| user_text(&parsed));
+        if found.is_some() {
+            ControlFlow::Break(())
         } else {
-            &buf[..]
-        };
-
-        if let Some(msg) = last_user_in_slice(slice) {
-            return Some(msg);
+            ControlFlow::Continue(())
         }
-        // Whole file already covered, or the window hit its ceiling: give up.
-        if read_len >= len || window >= TAIL_MAX {
-            return None;
-        }
-        window = (window * 2).min(TAIL_MAX);
-    }
+    })
+    .ok()?;
+    found
 }
 
-/// Scan `slice`'s lines back-to-front, returning the first (i.e. latest) user
-/// message text.
-fn last_user_in_slice(slice: &[u8]) -> Option<String> {
-    for line in slice.split(|&b| b == b'\n').rev() {
-        if line.is_empty() {
+/// How far a backward line walk reads: its first window, doubled whenever a
+/// window holds no whole line, and the floor below the walk's end it never
+/// reads past.
+#[derive(Clone, Copy)]
+struct Window {
+    first: u64,
+    max_bytes: u64,
+}
+
+/// The tail preview's walk: bounded, so a tail of pure tool traffic costs at
+/// most [`TAIL_MAX`].
+const TAIL_WINDOW: Window = Window {
+    first: TAIL_CHUNK,
+    max_bytes: TAIL_MAX,
+};
+
+/// The history page's walk: unbounded below, because a record is served whole
+/// whatever its size (the page budget is [`PAGE_MAX_BYTES`], applied by the
+/// visitor); the walk still reads one window at a time and stops the moment
+/// the visitor has its page.
+const PAGE_WINDOW: Window = Window {
+    first: TAIL_CHUNK,
+    max_bytes: u64::MAX,
+};
+
+/// Visit the whole lines of `path` whose bytes end at or before `end` (the
+/// file's end when `None`), newest first, each with the byte offset it
+/// starts at, until `visit` breaks or the walk reaches byte 0 or its floor
+/// (`end - max_bytes`).
+///
+/// One window at a time, seeking backward: a window's first line is dropped
+/// as a cut unless the window starts at byte 0 (the next window ends right
+/// after that line so it is visited whole), and a window holding no whole
+/// line doubles. A line straddling the floor is never visited, and neither is
+/// the head of a line an `end` inside it cut: that line ends past `end`, so
+/// it is nobody's. The terminator of the last line is not a line; an empty
+/// line elsewhere is one, so a blank line reaches the visitor. `Err` when the
+/// file cannot be opened or read; the lines visited before a mid-walk error
+/// stand.
+fn lines_before(
+    path: &Path,
+    end: Option<u64>,
+    window: Window,
+    mut visit: impl FnMut(u64, &[u8]) -> ControlFlow<()>,
+) -> std::io::Result<()> {
+    let mut file = File::open(path)?;
+    let len = file.metadata()?.len();
+    let mut end = end.map_or(len, |end| end.min(len));
+    let floor = end.saturating_sub(window.max_bytes);
+    let mut size = window.first.max(1);
+    let mut buf = Vec::new();
+    while end > floor {
+        let start = end.saturating_sub(size).max(floor);
+        let read_len = end - start;
+        file.seek(SeekFrom::Start(start))?;
+        buf.clear();
+        file.by_ref().take(read_len).read_to_end(&mut buf)?;
+        if buf.len() as u64 != read_len {
+            // The file shrank under the walk: whatever came before is gone.
+            return Ok(());
+        }
+
+        let whole_from = if start == 0 {
+            0
+        } else {
+            match buf.iter().position(|&b| b == b'\n') {
+                Some(cut) => cut + 1,
+                None => buf.len(),
+            }
+        };
+        let region = &buf[whole_from..];
+        if region.is_empty() {
+            if start <= floor {
+                return Ok(());
+            }
+            size = size.saturating_mul(2);
             continue;
         }
-        let Ok(text) = std::str::from_utf8(line) else {
-            continue;
-        };
-        let Ok(parsed) = serde_json::from_str::<TranscriptLine>(text) else {
-            continue;
-        };
-        if let Some(msg) = user_text(&parsed) {
-            return Some(msg);
+
+        let base = start + whole_from as u64;
+        // The newest segment is not a line when it is the last line's
+        // terminator, or the head of a line that `end` cut inside (only the
+        // first window can end anywhere but after a newline or at the file's
+        // end); every later window ends right after a newline.
+        let skip_newest = region.last() == Some(&b'\n') || end < len;
+        let mut seg_end = region.len();
+        for (i, seg) in region.rsplit(|&b| b == b'\n').enumerate() {
+            let seg_start = seg_end - seg.len();
+            if !(i == 0 && skip_newest) && visit(base + seg_start as u64, seg).is_break() {
+                return Ok(());
+            }
+            seg_end = seg_start.saturating_sub(1);
         }
+        end = base;
+        size = size.saturating_mul(2);
     }
-    None
+    Ok(())
+}
+
+/// One page of a transcript's records, oldest first, as [`read_page`] serves
+/// it.
+pub(crate) struct Page {
+    /// `(start offset, record)` per JSON-object line, in file order.
+    pub(crate) records: Vec<(u64, serde_json::Value)>,
+    /// The cursor for the page of older records, `None` when nothing older
+    /// remains: every line below the newest one served was consumed.
+    pub(crate) next_before: Option<u64>,
+    /// Lines in the consumed range that were not a JSON object: a torn last
+    /// line mid-write, a blank line.
+    pub(crate) malformed: u32,
+}
+
+/// The last `limit` records of `path` ending at or before `before` (the file's
+/// end when `None`), each a JSONL line parsed as a JSON object and nothing
+/// more, within a `max_bytes` budget an empty page may exceed by its one
+/// record. A line that is not a JSON object is skipped and counted. The walk
+/// reads only what the page consumes, one window at a time.
+pub(crate) fn read_page(
+    path: &Path,
+    before: Option<u64>,
+    limit: usize,
+    max_bytes: u64,
+) -> std::io::Result<Page> {
+    let mut records: Vec<(u64, serde_json::Value)> = Vec::new();
+    let mut malformed = 0u32;
+    let mut bytes = 0u64;
+    let mut consumed_floor: Option<u64> = None;
+    lines_before(path, before, PAGE_WINDOW, |offset, line| {
+        let Some(record) = serde_json::from_slice::<serde_json::Value>(line)
+            .ok()
+            .filter(serde_json::Value::is_object)
+        else {
+            malformed += 1;
+            consumed_floor = Some(offset);
+            return ControlFlow::Continue(());
+        };
+        if !records.is_empty() && bytes.saturating_add(line.len() as u64) > max_bytes {
+            return ControlFlow::Break(());
+        }
+        bytes = bytes.saturating_add(line.len() as u64);
+        records.push((offset, record));
+        consumed_floor = Some(offset);
+        if records.len() >= limit {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    })?;
+    records.reverse();
+    Ok(Page {
+        records,
+        next_before: consumed_floor.filter(|&offset| offset > 0),
+        malformed,
+    })
 }
 
 /// The session id: the transcript filename stem. CC names each transcript
@@ -404,24 +531,58 @@ fn mtime_of(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).ok()?.modified().ok()
 }
 
-/// Index one file into a [`SessionInfo`], or `None` when it has no usable
-/// filename stem or its metadata can't be read. Head metadata is best-effort.
-fn scan_file(path: &Path, source: &SessionSource) -> Option<SessionInfo> {
-    let id = session_id_from_path(path)?;
-    let updated = mtime_of(path)?;
-    let head = read_head(path);
-    Some(SessionInfo {
-        id,
+/// One transcript the walk located: its filename stem, mtime and store, with
+/// nothing opened. [`preview`] turns it into a [`SessionInfo`] by reading the
+/// head and tail — the per-row cost a page pays for its rows alone.
+#[derive(Debug, Clone)]
+pub(crate) struct Walked {
+    /// The transcript filename stem, the same id [`SessionInfo::id`] carries.
+    pub(crate) id: String,
+    pub(crate) path: PathBuf,
+    /// File mtime, the listing's ordering key.
+    pub(crate) updated: SystemTime,
+    pub(crate) source: SessionSource,
+}
+
+impl Walked {
+    /// The listing's sort key, for [`newest_first`].
+    pub(crate) fn sort_key(&self) -> (SystemTime, &str) {
+        (self.updated, &self.id)
+    }
+}
+
+impl SessionInfo {
+    /// The listing's sort key, for [`newest_first`].
+    pub(crate) fn sort_key(&self) -> (SystemTime, &str) {
+        (self.updated, &self.id)
+    }
+}
+
+/// The listing order every surface shares: `updated` desc, then `id` asc, so
+/// equal mtimes still order deterministically.
+pub(crate) fn newest_first(a: (SystemTime, &str), b: (SystemTime, &str)) -> std::cmp::Ordering {
+    b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1))
+}
+
+/// Read one located transcript's head and tail into its [`SessionInfo`]: the
+/// workspace and first user message off the head, the last user message off
+/// the tail. Best-effort: an unreadable file yields an empty workspace and no
+/// previews rather than dropping the session, whose id came from the filename.
+pub(crate) fn preview(entry: Walked) -> SessionInfo {
+    let head = read_head(&entry.path);
+    let last_message = read_last_user_message(&entry.path);
+    SessionInfo {
+        id: entry.id,
         workspace: head.workspace,
-        path: path.to_path_buf(),
-        updated,
+        path: entry.path,
+        updated: entry.updated,
         first_message: head.first_message,
-        last_message: read_last_user_message(path),
-        source: source.clone(),
+        last_message,
+        source: entry.source,
         tokens: None,
         cost: None,
         last_ran_profile: None,
-    })
+    }
 }
 
 /// Recursively collect `*.jsonl` paths under `dir` (depth-capped). A symlinked
@@ -467,15 +628,25 @@ fn collect_jsonl(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) -> bool {
     complete
 }
 
-/// Index every `*.jsonl` under one store's `projects/` dir into `by_id`, keeping
-/// the newest entry when a session id appears in more than one file.
-fn index_store(projects: &Path, source: &SessionSource, by_id: &mut HashMap<String, SessionInfo>) {
+/// Walk every `*.jsonl` under one store's `projects/` dir into `by_id`, keeping
+/// the newest entry when a session id appears in more than one file. A file
+/// with no usable stem or an unreadable mtime is skipped.
+fn walk_store(projects: &Path, source: &SessionSource, by_id: &mut HashMap<String, Walked>) {
     let mut paths = Vec::new();
     collect_jsonl(projects, WALK_MAX_DEPTH, &mut paths);
     for path in paths {
-        if let Some(info) = scan_file(&path, source) {
-            insert_newest(by_id, info);
-        }
+        let (Some(id), Some(updated)) = (session_id_from_path(&path), mtime_of(&path)) else {
+            continue;
+        };
+        insert_newest(
+            by_id,
+            Walked {
+                id,
+                path,
+                updated,
+                source: source.clone(),
+            },
+        );
     }
 }
 
@@ -483,18 +654,18 @@ fn index_store(projects: &Path, source: &SessionSource, by_id: &mut HashMap<Stri
 /// one store or project-slug dir) to the newest by mtime. On an equal mtime the
 /// lexicographically greater source path wins, so the pick stays stable
 /// regardless of `read_dir` order.
-fn insert_newest(map: &mut HashMap<String, SessionInfo>, info: SessionInfo) {
-    match map.entry(info.id.clone()) {
+fn insert_newest(map: &mut HashMap<String, Walked>, entry: Walked) {
+    match map.entry(entry.id.clone()) {
         Entry::Occupied(mut e) => {
             let cur = e.get();
-            let wins =
-                info.updated > cur.updated || (info.updated == cur.updated && info.path > cur.path);
+            let wins = entry.updated > cur.updated
+                || (entry.updated == cur.updated && entry.path > cur.path);
             if wins {
-                e.insert(info);
+                e.insert(entry);
             }
         }
         Entry::Vacant(e) => {
-            e.insert(info);
+            e.insert(entry);
         }
     }
 }
@@ -510,7 +681,7 @@ fn group_by_workspace(sessions: Vec<SessionInfo>) -> Vec<WorkspaceGroup> {
     let mut out: Vec<WorkspaceGroup> = groups
         .into_iter()
         .map(|(workspace, mut sessions)| {
-            sessions.sort_by(|a, b| b.updated.cmp(&a.updated).then_with(|| a.id.cmp(&b.id)));
+            sessions.sort_by(|a, b| newest_first(a.sort_key(), b.sort_key()));
             WorkspaceGroup {
                 workspace,
                 sessions,
@@ -525,20 +696,45 @@ fn group_by_workspace(sessions: Vec<SessionInfo>) -> Vec<WorkspaceGroup> {
     out
 }
 
-/// Build the session index: the global store plus every live isolated runtime's
-/// own store, deduped by session id and grouped by workspace, newest-first.
-/// Fail-soft throughout — an unreadable file or store is skipped, never fatal.
-pub(crate) fn build_index() -> Vec<WorkspaceGroup> {
-    let mut by_id: HashMap<String, SessionInfo> = HashMap::new();
+/// Every transcript across the stores `clauth sessions` browses — the global
+/// store plus every live isolated runtime's own — deduped by session id and
+/// unsorted, with nothing opened: a `read_dir` walk and one stat per file.
+/// Fail-soft throughout — an unreadable store is skipped, never fatal.
+pub(crate) fn walk() -> Vec<Walked> {
+    let mut by_id: HashMap<String, Walked> = HashMap::new();
 
     if let Ok(projects) = claude_dir().map(|d| d.join("projects")) {
-        index_store(&projects, &SessionSource::Global, &mut by_id);
+        walk_store(&projects, &SessionSource::Global, &mut by_id);
     }
     for (profile, projects) in crate::runtime::live_isolated_stores() {
-        index_store(&projects, &SessionSource::Isolated { profile }, &mut by_id);
+        walk_store(&projects, &SessionSource::Isolated { profile }, &mut by_id);
     }
 
-    group_by_workspace(by_id.into_values().collect())
+    by_id.into_values().collect()
+}
+
+/// One session by exact id across the stores the listing browses: the file the
+/// listing shows for that id. A lookup among the stems the walk yields, never a
+/// path join, so an id spelled as a path (`../x`, `a/b`) can only miss.
+pub(crate) fn locate(session_id: &str) -> Option<Walked> {
+    walk().into_iter().find(|entry| entry.id == session_id)
+}
+
+/// Build the session index: every transcript the walk finds, previewed and
+/// grouped by workspace, newest-first.
+pub(crate) fn build_index() -> Vec<WorkspaceGroup> {
+    group_by_workspace(walk().into_iter().map(preview).collect())
+}
+
+/// A file mtime as ISO-8601 UTC (`YYYY-MM-DDTHH:MM:SS+00:00`), the machine
+/// shape `clauth sessions --json` and the sessions API share. A pre-epoch time
+/// clamps to epoch 0.
+pub(crate) fn updated_iso(t: SystemTime) -> String {
+    let secs = t
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    crate::usage::epoch_secs_to_iso(secs)
 }
 
 // ── Targeted lookup: one session, without the index's per-transcript reads ────
@@ -1074,15 +1270,22 @@ pub(crate) fn owner_of(session_id: &str) -> Option<String> {
 /// paying the per-session full-transcript parse [`annotate`] costs. Leaves
 /// `None` for a session that is absent or `Contested` (both mean "unknown").
 pub(crate) fn annotate_owners(groups: &mut [WorkspaceGroup]) {
+    annotate_owners_of(
+        groups
+            .iter_mut()
+            .flat_map(|group| group.sessions.iter_mut()),
+    );
+}
+
+/// [`annotate_owners`] over any rows a caller holds — a page's, say.
+pub(crate) fn annotate_owners_of<'a>(rows: impl IntoIterator<Item = &'a mut SessionInfo>) {
     let Some(path) = store_path() else {
         return;
     };
     let store = load_store(&path);
-    for group in groups.iter_mut() {
-        for session in group.sessions.iter_mut() {
-            session.last_ran_profile = crate::hook_note::resolved_account(&session.id)
-                .or_else(|| owner_in(&store, &session.id));
-        }
+    for session in rows {
+        session.last_ran_profile = crate::hook_note::resolved_account(&session.id)
+            .or_else(|| owner_in(&store, &session.id));
     }
 }
 

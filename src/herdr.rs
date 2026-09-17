@@ -562,11 +562,37 @@ pub(crate) struct HerdrPane {
     pub(crate) cwd: Option<String>,
     pub(crate) focused: bool,
     pub(crate) tokens: Option<HerdrTokens>,
+    /// The agent session herdr detected in the pane, `null` when none.
+    #[serde(default)]
+    pub(crate) agent_session: Option<HerdrAgentSession>,
 }
 
 #[derive(Deserialize)]
 pub(crate) struct HerdrTokens {
     pub(crate) clauth: Option<String>,
+}
+
+/// `pane list`'s `agent_session` (herdr 0.9.0: `{"agent":"claude","kind":"id",
+/// "source":"herdr:claude","value":"<session uuid>"}`). Only the `id` kind
+/// carries a session id in `value`; the other fields are herdr's own.
+#[derive(Deserialize)]
+pub(crate) struct HerdrAgentSession {
+    /// Defaulted like `value`: a row missing either must not fail the whole
+    /// `pane list` parse, and an empty kind is not `id`.
+    #[serde(default)]
+    pub(crate) kind: String,
+    #[serde(default)]
+    pub(crate) value: Option<String>,
+}
+
+impl HerdrAgentSession {
+    /// The agent's session id — the transcript stem the sessions index keys
+    /// on — when herdr detected one by id, else `None`.
+    pub(crate) fn session_id(&self) -> Option<&str> {
+        (self.kind == "id")
+            .then_some(self.value.as_deref())
+            .flatten()
+    }
 }
 
 /// `herdr pane list`'s `result.panes`, or `None` when the stdout is not the

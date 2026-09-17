@@ -76,6 +76,7 @@ fn ran_ok(stdout: &'static str) -> HerdrProbeOut {
     HerdrProbeOut::Ran(Some(HerdrOut {
         success: true,
         stdout: stdout.as_bytes().to_vec(),
+        stderr: Vec::new(),
     }))
 }
 
@@ -83,6 +84,7 @@ fn ran_failed() -> HerdrProbeOut {
     HerdrProbeOut::Ran(Some(HerdrOut {
         success: false,
         stdout: Vec::new(),
+        stderr: Vec::new(),
     }))
 }
 
@@ -97,6 +99,7 @@ fn clone_outcome(out: &HerdrProbeOut) -> HerdrProbeOut {
         HerdrProbeOut::Ran(Some(o)) => HerdrProbeOut::Ran(Some(HerdrOut {
             success: o.success,
             stdout: o.stdout.clone(),
+            stderr: o.stderr.clone(),
         })),
     }
 }
@@ -248,6 +251,83 @@ fn the_fixture_panes_join_to_the_pinned_answer() {
     let expected: serde_json::Value = serde_json::from_str(PANES_ANSWER).expect("pin parses");
     assert_eq!(body, expected);
     crate::testutil::schema_agrees_with_type::<PanesBody>(&body);
+}
+
+/// `agent_session_id` is herdr's `agent_session.value` exactly when its
+/// `kind` is `id` — the transcript stem the sessions routes page — and `null`
+/// for a pane with no agent session, one of another kind, or one with no
+/// `kind` at all (which parses rather than failing the whole list).
+#[test]
+fn agent_session_id_is_the_id_kind_value_or_null() {
+    let _home = HomeSandbox::new();
+    let by_pane = |body: &serde_json::Value| -> Vec<(String, serde_json::Value)> {
+        body["panes"]
+            .as_array()
+            .expect("panes")
+            .iter()
+            .map(|pane| {
+                (
+                    pane["pane_id"].as_str().expect("pane id").to_string(),
+                    pane["agent_session_id"].clone(),
+                )
+            })
+            .collect()
+    };
+
+    let body = body_json(&call(&ctx(fixture_probe()), "GET", "/api/v1/panes"));
+    assert_eq!(
+        by_pane(&body),
+        vec![
+            (
+                "w1N:p19".to_string(),
+                serde_json::json!("1cb26556-3532-45e1-8b39-37f0b53a8e4f")
+            ),
+            ("w0:pK".to_string(), serde_json::Value::Null),
+            (
+                "wP:pAA".to_string(),
+                serde_json::json!("cd1d7f14-4d0a-4616-b6e7-bed7b2feaea8")
+            ),
+        ]
+    );
+
+    // The same list with `w1N:p19`'s session detected by another kind,
+    // `w0:pK` carrying an `agent_session` with no `kind` at all, and
+    // `wP:pAA`'s `agent_session` key absent altogether: every row still
+    // parses, and each projects `null`.
+    let mut list: serde_json::Value = serde_json::from_str(PANE_LIST).expect("fixture parses");
+    let panes = list["result"]["panes"].as_array_mut().expect("panes");
+    panes[0]["agent_session"] = serde_json::json!({
+        "agent": "claude",
+        "kind": "title",
+        "source": "herdr:claude",
+        "value": "Refactor the parser",
+    });
+    panes[1]["agent_session"] = serde_json::json!({
+        "agent": "claude",
+        "value": "1cb26556-3532-45e1-8b39-37f0b53a8e4f",
+    });
+    panes[2]
+        .as_object_mut()
+        .expect("a pane object")
+        .remove("agent_session");
+    let list = serde_json::to_vec(&list).expect("serializes");
+    let probe: PaneProbe = Box::new(move |args| match args {
+        ["pane", "list"] => HerdrProbeOut::Ran(Some(HerdrOut {
+            success: true,
+            stdout: list.clone(),
+            stderr: Vec::new(),
+        })),
+        _ => HerdrProbeOut::Ran(None),
+    });
+    let body = body_json(&call(&ctx(probe), "GET", "/api/v1/panes"));
+    assert_eq!(
+        by_pane(&body),
+        vec![
+            ("w1N:p19".to_string(), serde_json::Value::Null),
+            ("w0:pK".to_string(), serde_json::Value::Null),
+            ("wP:pAA".to_string(), serde_json::Value::Null),
+        ]
+    );
 }
 
 /// A row whose pid is a listed `clauth mcp` (never the group leader, never a

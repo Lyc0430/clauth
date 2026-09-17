@@ -2483,13 +2483,16 @@ fn status_schema_agrees_with_the_serialized_body() {
 
 /// The always-serialized `Option` fields in the answer bodies are required in
 /// their schemas (`SwitchOk.previous`, `PaneEntry.title`/`agent`/`tag`/
-/// `foreground_process_group_id`/`cwd`, and `PaneSession.cwd` answer `null`,
-/// never a dropped key), and the skip-when-absent `Option`s (`ErrorBody.reason`,
+/// `foreground_process_group_id`/`cwd`/`agent_session_id`, `PaneSession.cwd`,
+/// `SessionsBody.next_before`, `SessionRow.last_ran_profile`/`first_message`/
+/// `last_message` and `HistoryBody.next_before` answer `null`, never a dropped
+/// key), and the skip-when-absent `Option`s (`ErrorBody.reason`,
 /// `HerdrState.reason`) stay optional.
 #[test]
 fn always_serialized_option_fields_are_required_and_skipped_ones_are_not() {
     use crate::daemon::api::panes::{HerdrState, PaneEntry, PaneSession};
     use crate::daemon::api::routes::{ErrorBody, SwitchOk};
+    use crate::daemon::api::sessions::{HistoryBody, SessionRow, SessionsBody};
 
     let no_components: BTreeMap<String, RefOr<Schema>> = BTreeMap::new();
 
@@ -2513,6 +2516,7 @@ fn always_serialized_option_fields_are_required_and_skipped_ones_are_not() {
         "tag",
         "foreground_process_group_id",
         "cwd",
+        "agent_session_id",
     ] {
         assert!(
             pane_entry_required.iter().any(|name| name == field),
@@ -2524,6 +2528,28 @@ fn always_serialized_option_fields_are_required_and_skipped_ones_are_not() {
     assert!(
         pane_session_required.iter().any(|name| name == "cwd"),
         "PaneSession.cwd is serialized on every answer, so its schema requires it"
+    );
+
+    let sessions_body_required = required(&SessionsBody::schema(), "SessionsBody");
+    assert!(
+        sessions_body_required
+            .iter()
+            .any(|name| name == "next_before"),
+        "SessionsBody.next_before is serialized on every answer, so its schema requires it"
+    );
+    let session_row_required = required(&SessionRow::schema(), "SessionRow");
+    for field in ["last_ran_profile", "first_message", "last_message"] {
+        assert!(
+            session_row_required.iter().any(|name| name == field),
+            "SessionRow.{field} is serialized on every answer, so its schema requires it"
+        );
+    }
+    let history_body_required = required(&HistoryBody::schema(), "HistoryBody");
+    assert!(
+        history_body_required
+            .iter()
+            .any(|name| name == "next_before"),
+        "HistoryBody.next_before is serialized on every answer, so its schema requires it"
     );
 
     let herdr_state_required = required(&HerdrState::schema(), "HerdrState");
@@ -2539,9 +2565,11 @@ fn always_serialized_option_fields_are_required_and_skipped_ones_are_not() {
     );
 }
 
-/// Every REST body's `ToSchema`-derived schema agrees with its wire shape: each
-/// required property present, each body key a schema property, required-ness
-/// matching presence. Request bodies are pinned by their literal JSON because
+/// The health, switch, pair, error and panes bodies' `ToSchema`-derived
+/// schemas agree with their wire shapes: each required property present, each
+/// body key a schema property, required-ness matching presence (the sessions,
+/// history and agent bodies are walked in their own modules and the
+/// router-wide pin). Request bodies are pinned by their literal JSON because
 /// they only deserialize.
 #[test]
 fn every_rest_body_schema_agrees_with_its_wire_shape() {
@@ -2611,6 +2639,7 @@ fn every_rest_body_schema_agrees_with_its_wire_shape() {
                 "isolated": false,
                 "cwd": null,
             }],
+            "agent_session_id": null,
         }],
     }));
 

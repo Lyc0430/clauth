@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 
 use super::devices::{Device, Tier};
 use super::http::{Request, Response, accept_key};
-use super::panes::{NO_SERVER, NOT_INSTALLED};
+use super::panes::{NO_SERVER, NOT_INSTALLED, PANE_NOT_FOUND};
 use super::routes::{self, ApiContext, Handled};
 use crate::herdr::parse_snapshot_rects;
 
@@ -90,14 +90,16 @@ pub(crate) struct Hijack {
 }
 
 /// `/panes/<id>/stream` with `<id>` non-empty and slash-free, else `None`.
-/// The id is herdr's own pane id (`w1:p1`), used verbatim as the target.
-pub(crate) fn pane_stream_target(path: &str) -> Option<&str> {
+/// The id is herdr's own pane id (`w1:p1`), decoded once through the route
+/// table's [`routes::decode_segment`] (a client encodes the `:`), then used
+/// as the target.
+pub(crate) fn pane_stream_target(path: &str) -> Option<String> {
     let rest = path.strip_prefix("/panes/")?;
     let (id, tail) = rest.split_once('/')?;
     if tail != "stream" || id.is_empty() || id.contains('/') {
         return None;
     }
-    Some(id)
+    routes::decode_segment(id)
 }
 
 /// The route half: validate, decide the mode, and hand back the hijack. Every
@@ -159,11 +161,7 @@ pub(crate) fn request(ctx: &ApiContext, req: &Request, device: &Device, pane_id:
     let rect = match herdr_pane_rect(ctx, pane_id) {
         HerdrPaneRect::Absent => {
             return Handled {
-                response: Response::refused(
-                    404,
-                    "pane_not_found",
-                    "no pane with that id in herdr's default session",
-                ),
+                response: Response::refused(404, "pane_not_found", PANE_NOT_FOUND),
                 device: Some(device.name.clone()),
                 hijack: None,
             };

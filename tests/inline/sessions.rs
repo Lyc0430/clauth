@@ -2195,3 +2195,396 @@ fn the_targeted_lookup_never_reaches_a_live_isolated_store() {
     assert!(newest_session().is_none(), "not even as the newest session");
     drop(lock_file);
 }
+
+// ── the walk/preview split, the backward line walk, history pages ────────────
+
+/// The captured transcript the history route pages: seven records, one
+/// carrying a `tool_use` block, one a `tool_result` block, and a torn trailing
+/// line with no newline after it.
+const HISTORY: &[u8] = include_bytes!("../fixtures/sessions/history.jsonl");
+
+/// Every `(offset, line)` of `bytes` in file order, derived from the bytes
+/// alone: a line is what sits between newlines, the last one whatever follows
+/// the last newline.
+fn lines_of(bytes: &[u8]) -> Vec<(u64, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'\n' {
+            out.push((start as u64, bytes[start..i].to_vec()));
+            start = i + 1;
+        }
+    }
+    if start < bytes.len() {
+        out.push((start as u64, bytes[start..].to_vec()));
+    }
+    out
+}
+
+/// Every `(offset, line)` the walk visits, in visiting order (newest first).
+fn walk_lines(path: &Path, end: Option<u64>, window: Window) -> Vec<(u64, Vec<u8>)> {
+    let mut seen = Vec::new();
+    lines_before(path, end, window, |offset, line| {
+        seen.push((offset, line.to_vec()));
+        ControlFlow::Continue(())
+    })
+    .unwrap();
+    seen
+}
+
+fn offsets(lines: &[(u64, Vec<u8>)]) -> Vec<u64> {
+    lines.iter().map(|(offset, _)| *offset).collect()
+}
+
+fn history_at(sb: &HomeSandbox) -> PathBuf {
+    let path = sb.home().join("history.jsonl");
+    fs::write(&path, HISTORY).unwrap();
+    path
+}
+
+/// Whatever the first window and however many doublings, the walk visits
+/// every line of the file exactly once, newest first, byte-equal to the file
+/// and at the offset the file holds it at.
+#[test]
+fn lines_before_visits_every_whole_line_newest_first_at_its_offset() {
+    let sb = HomeSandbox::new();
+    let path = history_at(&sb);
+    let in_file_order = lines_of(HISTORY);
+    assert_eq!(in_file_order.len(), 8, "seven records and the torn line");
+    let mut rejoined = Vec::new();
+    for (offset, line) in &in_file_order {
+        assert_eq!(*offset as usize, rejoined.len());
+        rejoined.extend_from_slice(line);
+        rejoined.push(b'\n');
+    }
+    rejoined.pop();
+    assert_eq!(rejoined, HISTORY, "the derived lines re-join into the file");
+
+    let mut expected = in_file_order;
+    expected.reverse();
+    for first in [1, 50, 200, TAIL_CHUNK] {
+        let seen = walk_lines(
+            &path,
+            None,
+            Window {
+                first,
+                max_bytes: u64::MAX,
+            },
+        );
+        assert_eq!(seen, expected, "first window of {first} bytes");
+    }
+}
+
+/// The cursor ends the walk at a line start, the floor drops the line it cuts,
+/// and a cursor inside a line drops the head it cut rather than handing it
+/// over as a line.
+#[test]
+fn lines_before_honours_the_cursor_and_drops_the_line_straddling_the_floor() {
+    let sb = HomeSandbox::new();
+    let path = history_at(&sb);
+    let small = Window {
+        first: 50,
+        max_bytes: u64::MAX,
+    };
+
+    // Record 3 starts at 776: the walk below that cursor is records 2, 1, 0.
+    assert_eq!(
+        offsets(&walk_lines(&path, Some(776), small)),
+        vec![325, 148, 0]
+    );
+
+    // 700 bytes below 776 is a floor at 76, inside record 0: dropped, not cut.
+    for first in [50, 4096] {
+        let bounded = Window {
+            first,
+            max_bytes: 700,
+        };
+        assert_eq!(
+            offsets(&walk_lines(&path, Some(776), bounded)),
+            vec![325, 148],
+            "first window of {first} bytes"
+        );
+    }
+
+    // A cursor two bytes into record 1 cuts it: only lines whose bytes end
+    // at or before the cursor are visited, and the cut head is nobody's line,
+    // whatever the first window's size.
+    for first in [1, 50, 4096] {
+        let seen = walk_lines(
+            &path,
+            Some(150),
+            Window {
+                first,
+                max_bytes: u64::MAX,
+            },
+        );
+        assert_eq!(offsets(&seen), vec![0], "first window of {first} bytes");
+    }
+    // A cursor one byte into record 1 (right after record 0's newline) is
+    // that boundary: record 0 alone, and never a one-byte line.
+    assert_eq!(offsets(&walk_lines(&path, Some(149), small)), vec![0]);
+
+    // Nothing ends at or before byte 0; a cursor past the end is the end.
+    assert!(walk_lines(&path, Some(0), small).is_empty());
+    assert_eq!(
+        offsets(&walk_lines(&path, Some(1_000_000), small)),
+        offsets(&walk_lines(&path, None, small))
+    );
+}
+
+/// The tail preview walks through the same walker: a user line straddling a
+/// window boundary is recovered whole from the next window, and a tail of pure
+/// tool traffic gives up at [`TAIL_MAX`].
+#[test]
+fn the_tail_preview_recovers_a_straddling_user_line_and_stops_at_its_ceiling() {
+    let sb = HomeSandbox::new();
+    let path = sb.home().join("tail.jsonl");
+    let mut lines = vec![user_line("s", "/w", "the tail question")];
+    lines.push(assistant_line_of_len("s", "/w", TAIL_CHUNK as usize - 40));
+    write_jsonl(&path, &lines);
+    assert_eq!(
+        read_last_user_message(&path).as_deref(),
+        Some("the tail question")
+    );
+
+    let mut buried = vec![user_line("s", "/w", "buried")];
+    let filler = assistant_line("s", "/w", &"z".repeat(1000));
+    let mut bytes = 0usize;
+    while bytes <= TAIL_MAX as usize {
+        buried.push(filler.clone());
+        bytes += filler.len() + 1;
+    }
+    write_jsonl(&path, &buried);
+    assert_eq!(read_last_user_message(&path), None);
+}
+
+fn page_offsets(page: &Page) -> Vec<u64> {
+    page.records.iter().map(|(offset, _)| *offset).collect()
+}
+
+/// Two pages cover the transcript with no overlap and no gap, each record
+/// re-serializes to the exact line bytes, the torn line counts once, and the
+/// cursor goes `null` once byte 0 is reached.
+#[test]
+fn read_page_pages_backward_verbatim_and_counts_the_torn_line() {
+    let sb = HomeSandbox::new();
+    let path = history_at(&sb);
+    let lines = lines_of(HISTORY);
+
+    let first = read_page(&path, None, 4, PAGE_MAX_BYTES).unwrap();
+    assert_eq!(page_offsets(&first), vec![776, 978, 1404, 1544]);
+    assert_eq!(first.malformed, 1);
+    assert_eq!(first.next_before, Some(776));
+
+    let second = read_page(&path, first.next_before, 4, PAGE_MAX_BYTES).unwrap();
+    assert_eq!(page_offsets(&second), vec![0, 148, 325]);
+    assert_eq!(second.malformed, 0);
+    assert_eq!(second.next_before, None);
+
+    for (offset, record) in second.records.iter().chain(&first.records) {
+        let (_, line) = lines
+            .iter()
+            .find(|(at, _)| at == offset)
+            .expect("a record offset is a line offset");
+        assert_eq!(
+            &serde_json::to_vec(record).unwrap(),
+            line,
+            "offset {offset}"
+        );
+    }
+
+    let whole = read_page(&path, None, 500, PAGE_MAX_BYTES).unwrap();
+    assert_eq!(
+        page_offsets(&whole),
+        vec![0, 148, 325, 776, 978, 1404, 1544]
+    );
+    assert_eq!((whole.malformed, whole.next_before), (1, None));
+}
+
+/// The byte budget stops the page before the record that would overflow it,
+/// and a page that would otherwise be empty takes that record alone.
+#[test]
+fn read_page_keeps_to_its_byte_budget_unless_the_page_is_empty() {
+    assert_eq!(PAGE_MAX_BYTES, 4 * 1024 * 1024);
+    let sb = HomeSandbox::new();
+    let path = history_at(&sb);
+
+    // From the end: 155 + 139 bytes fit a 300-byte budget, the 425-byte record
+    // at 978 would not.
+    let page = read_page(&path, None, 100, 300).unwrap();
+    assert_eq!(page_offsets(&page), vec![1404, 1544]);
+    assert_eq!((page.malformed, page.next_before), (1, Some(1404)));
+
+    // The over-long record comes back alone, on the page that starts empty.
+    let alone = read_page(&path, page.next_before, 100, 300).unwrap();
+    assert_eq!(page_offsets(&alone), vec![978]);
+    assert_eq!((alone.malformed, alone.next_before), (0, Some(978)));
+
+    // 201 fits; the 450-byte record at 325 does not.
+    let next = read_page(&path, alone.next_before, 100, 300).unwrap();
+    assert_eq!(page_offsets(&next), vec![776]);
+    assert_eq!(next.next_before, Some(776));
+}
+
+/// The shapes a real store holds beyond the captured fixture: every Claude
+/// Code transcript ends in a newline (the terminator is not a line, so the
+/// newest page has no phantom record at `len` and `malformed` is 0), a blank
+/// line counts once, and a JSON-array line counts and is never served. A
+/// cursor inside a line consumes nothing of it.
+#[test]
+fn read_page_handles_a_terminated_file_a_blank_line_an_array_line_and_a_mid_line_cursor() {
+    let sb = HomeSandbox::new();
+    let path = sb.home().join("shapes.jsonl");
+    let rec = |n: u32| serde_json::json!({"n": n}).to_string();
+
+    // "{"n":1}\n{"n":2}\n{"n":3}\n": records at 0, 8, 16; the terminator at 23.
+    let terminated = format!("{}\n{}\n{}\n", rec(1), rec(2), rec(3));
+    fs::write(&path, &terminated).unwrap();
+    assert_eq!(terminated.len(), 24);
+    let page = read_page(&path, None, 500, PAGE_MAX_BYTES).unwrap();
+    assert_eq!(page_offsets(&page), vec![0, 8, 16]);
+    assert_eq!((page.malformed, page.next_before), (0, None));
+    let newest = read_page(&path, None, 1, PAGE_MAX_BYTES).unwrap();
+    assert_eq!(page_offsets(&newest), vec![16]);
+    assert_eq!((newest.malformed, newest.next_before), (0, Some(16)));
+
+    // A blank line between two records counts once and is never a record.
+    fs::write(&path, format!("{}\n\n{}\n", rec(1), rec(2))).unwrap();
+    let page = read_page(&path, None, 500, PAGE_MAX_BYTES).unwrap();
+    assert_eq!(page_offsets(&page), vec![0, 9]);
+    assert_eq!((page.malformed, page.next_before), (1, None));
+
+    // A JSON array line is not a record: counted, never served.
+    fs::write(&path, format!("{}\n[1,2,3]\n{}\n", rec(1), rec(2))).unwrap();
+    let page = read_page(&path, None, 500, PAGE_MAX_BYTES).unwrap();
+    assert_eq!(page_offsets(&page), vec![0, 16]);
+    assert_eq!(
+        page.records
+            .iter()
+            .map(|(_, r)| r.clone())
+            .collect::<Vec<_>>(),
+        vec![serde_json::json!({"n": 1}), serde_json::json!({"n": 2})]
+    );
+    assert_eq!((page.malformed, page.next_before), (1, None));
+
+    // A cursor inside record 2 of a three-record file: record 1 alone, the
+    // cut head neither served nor counted.
+    fs::write(&path, format!("{}\n{}\n{}\n", rec(1), rec(2), rec(3))).unwrap();
+    let page = read_page(&path, Some(12), 500, PAGE_MAX_BYTES).unwrap();
+    assert_eq!(page_offsets(&page), vec![0]);
+    assert_eq!((page.malformed, page.next_before), (0, None));
+}
+
+/// The walk lists both stores from filenames and mtimes, deduped by stem; the
+/// preview of one entry is the row the index builds for it.
+#[test]
+fn walk_lists_both_stores_and_preview_fills_the_row() {
+    let sb = HomeSandbox::new();
+    let g = sb.home().join(".claude/projects/-w-global/sg.jsonl");
+    write_jsonl(
+        &g,
+        &[
+            user_line("sg", "/w/global", "hi global"),
+            user_line("sg", "/w/global", "bye global"),
+        ],
+    );
+    let dup = sb.home().join(".claude/projects/-w-other/sg.jsonl");
+    write_jsonl(&dup, &[user_line("sg", "/w/other", "older copy")]);
+    let iso = sb
+        .home()
+        .join(".clauth/profiles/iso/runtime-isolated/projects/-w-iso/si.jsonl");
+    write_jsonl(&iso, &[user_line("si", "/w/iso", "hi iso")]);
+    let sessions_dir = sb.home().join(".clauth/profiles/iso/sessions-isolated");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    let lock_file = crate::runtime::open_pid_file(&sessions_dir.join("12345")).unwrap();
+    lock_file.lock().unwrap();
+    let t_g = SystemTime::UNIX_EPOCH + Duration::from_secs(3_000);
+    let t_iso = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+    set_mtime(&g, t_g);
+    set_mtime(&dup, SystemTime::UNIX_EPOCH + Duration::from_secs(2_000));
+    set_mtime(&iso, t_iso);
+
+    let mut walked = walk();
+    drop(lock_file);
+    walked.sort_by(|a, b| newest_first(a.sort_key(), b.sort_key()));
+    let listed: Vec<(&str, SystemTime, &SessionSource, &Path)> = walked
+        .iter()
+        .map(|w| (w.id.as_str(), w.updated, &w.source, w.path.as_path()))
+        .collect();
+    assert_eq!(
+        listed,
+        vec![
+            ("sg", t_g, &SessionSource::Global, g.as_path()),
+            (
+                "si",
+                t_iso,
+                &SessionSource::Isolated {
+                    profile: "iso".to_string()
+                },
+                iso.as_path()
+            ),
+        ]
+    );
+
+    let row = preview(walked.remove(0));
+    assert_eq!(row.id, "sg");
+    assert_eq!(row.workspace, "/w/global");
+    assert_eq!(row.updated, t_g);
+    assert_eq!(row.first_message.as_deref(), Some("hi global"));
+    assert_eq!(row.last_message.as_deref(), Some("bye global"));
+    assert_eq!(row.source, SessionSource::Global);
+    assert_eq!(
+        (row.tokens, row.cost, row.last_ran_profile),
+        (None, None, None)
+    );
+}
+
+/// `locate` answers from both stores by stem alone, so an id spelled as a path
+/// or an empty one can only miss.
+#[test]
+fn locate_answers_from_both_stores_by_stem_alone() {
+    let sb = HomeSandbox::new();
+    let g = sb.home().join(".claude/projects/-w-global/sg.jsonl");
+    write_jsonl(&g, &[user_line("sg", "/w/global", "hi")]);
+    let iso = sb
+        .home()
+        .join(".clauth/profiles/iso/runtime-isolated/projects/-w-iso/si.jsonl");
+    write_jsonl(&iso, &[user_line("si", "/w/iso", "hi iso")]);
+    let sessions_dir = sb.home().join(".clauth/profiles/iso/sessions-isolated");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    let lock_file = crate::runtime::open_pid_file(&sessions_dir.join("12345")).unwrap();
+    lock_file.lock().unwrap();
+
+    let found = locate("sg").expect("the global session");
+    assert_eq!(
+        (found.id.as_str(), found.path.as_path()),
+        ("sg", g.as_path())
+    );
+    let held = locate("si").expect("the live isolated session");
+    assert_eq!(
+        (held.path.as_path(), held.source),
+        (
+            iso.as_path(),
+            SessionSource::Isolated {
+                profile: "iso".to_string()
+            }
+        )
+    );
+    for miss in ["", "..", "../sg", "-w-global/sg", "sg.jsonl", "SG", "zz"] {
+        assert!(locate(miss).is_none(), "{miss:?} must miss");
+    }
+    drop(lock_file);
+}
+
+/// The machine timestamp the listing and the sessions API share.
+#[test]
+fn updated_iso_is_the_utc_machine_shape_and_clamps_pre_epoch() {
+    assert_eq!(
+        updated_iso(SystemTime::UNIX_EPOCH + Duration::from_secs(1_789_435_569)),
+        "2026-09-15T01:26:09+00:00"
+    );
+    assert_eq!(
+        updated_iso(SystemTime::UNIX_EPOCH - Duration::from_secs(5)),
+        "1970-01-01T00:00:00+00:00"
+    );
+}

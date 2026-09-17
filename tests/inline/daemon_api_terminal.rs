@@ -21,7 +21,7 @@ use crate::daemon::api::panes::{HerdrOut, HerdrProbeOut};
 use crate::daemon::api::routes::{ApiContext, handle};
 use crate::daemon::api::tests as server_tests;
 use crate::daemon::api::{Limits, serve_connection, tls};
-use crate::testutil::HomeSandbox;
+use crate::testutil::{HomeSandbox, body_json};
 
 /// The bearer of the control-tier device; the bridge gives it `control`.
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -82,6 +82,7 @@ fn snapshot_out() -> HerdrProbeOut {
     HerdrProbeOut::Ran(Some(HerdrOut {
         success: true,
         stdout: SNAPSHOT.as_bytes().to_vec(),
+        stderr: Vec::new(),
     }))
 }
 
@@ -228,15 +229,47 @@ fn absent_herdr_answers_503() {
     assert!(String::from_utf8_lossy(&resp.body).contains("herdr is not installed"));
 }
 
+/// The pane id is looked up in the snapshot after one percent-decode at the
+/// binding (a generated client sends `w9%3Ap1`), and a pane the snapshot does
+/// not hold answers 404 however it is spelled.
 #[test]
 fn a_pane_missing_from_the_snapshot_answers_404() {
     let _home = HomeSandbox::new();
     let ctx = ctx(":");
-    let resp = call(
+    let pane_not_found = serde_json::json!({
+        "ok": false,
+        "error": "pane_not_found",
+        "reason": "no pane with that id in herdr's default session",
+    });
+    for path in [
+        "/api/v1/panes/w9:pZZ/stream",
+        "/api/v1/panes/w9%3ApZZ/stream",
+    ] {
+        let resp = call(&ctx, &ws_request("GET", path, TOKEN));
+        assert_eq!(
+            (resp.status, body_json(&resp)),
+            (404, pane_not_found.clone()),
+            "{path}"
+        );
+    }
+    for path in ["/api/v1/panes/w9:p1/stream", "/api/v1/panes/w9%3Ap1/stream"] {
+        let handled = handle(&ctx, &ws_request("GET", path, TOKEN), peer());
+        assert_eq!(handled.response.status, 101, "{path}");
+        assert_eq!(
+            handled.hijack.map(|hijack| hijack.pane_id),
+            Some("w9:p1".to_string()),
+            "{path}"
+        );
+    }
+    let malformed = call(
         &ctx,
-        &ws_request("GET", "/api/v1/panes/w9:pZZ/stream", TOKEN),
+        &ws_request("GET", "/api/v1/panes/w9%3zp1/stream", TOKEN),
     );
-    assert_eq!(resp.status, 404);
+    assert_eq!(
+        (malformed.status, body_json(&malformed)),
+        (404, serde_json::json!({"ok": false, "error": "not_found"})),
+        "a malformed encoding is no route at all, never a missing pane"
+    );
 }
 
 // --- The bridge, end to end over TLS -----------------------------------------

@@ -370,7 +370,7 @@ fn session_json_row(s: &SessionInfo) -> serde_json::Value {
         "id": s.id,
         "last_ran_profile": s.last_ran_profile,
         "workspace": s.workspace,
-        "updated": updated_iso(s.updated),
+        "updated": crate::sessions::updated_iso(s.updated),
         "first_message": s.first_message,
         "last_message": s.last_message,
         "tokens": s.tokens,
@@ -465,18 +465,6 @@ fn preview_pair(s: &SessionInfo) -> String {
         (true, false) => last,
         (false, false) => format!("{first} | {last}"),
     }
-}
-
-/// The `--json` row's `updated` cell: a file mtime as ISO-8601 UTC, reusing
-/// clauth's shared formatter. Deliberately the machine shape — the human
-/// table renders the same instant in local wall clock with a relative age.
-/// A pre-epoch time clamps to epoch 0.
-fn updated_iso(t: SystemTime) -> String {
-    let secs = t
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    crate::usage::epoch_secs_to_iso(secs)
 }
 
 #[cfg(test)]

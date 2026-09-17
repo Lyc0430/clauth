@@ -63,6 +63,11 @@ fn percent_decode_survives_malformed_and_multibyte() {
     assert_eq!(percent_decode("a%zz"), "a%zz");
     // Valid escapes still decode.
     assert_eq!(percent_decode("%2Fpath"), "/path");
+    // A form value's `+` is a space; `percent_encode` never writes one, so the
+    // round trip above cannot pin this half.
+    assert_eq!(percent_decode("a+b"), "a b");
+    // `%+1` is not an escape: `from_str_radix` alone would take the `+`.
+    assert_eq!(percent_decode("%+1"), "% 1");
 }
 
 #[test]

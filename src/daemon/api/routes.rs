@@ -24,8 +24,10 @@ use crate::lock::StateLockTimeout;
 use crate::lockorder::{RankedMutex, rank};
 use crate::logline::logline;
 use crate::oauth;
+use crate::oauth_login::{Malformed, percent_decode_bytes};
 use crate::profile::ConfigHandle;
 
+use super::agent;
 use super::chain;
 use super::devices::{self, Device, Tier};
 use super::events::__path_events;
@@ -35,6 +37,7 @@ pub(crate) use super::http::ErrorBody;
 use super::http::{Request, Response, flatten_control_chars, sanitize_for_log};
 use super::pairing::{self, Code, Redeemed};
 use super::panes::{self, PaneProbe};
+use super::sessions;
 use super::terminal;
 
 /// Every route lives under this prefix, and it is spelled once.
@@ -61,10 +64,50 @@ pub(crate) enum Access {
 /// One row of [`ROUTES`].
 pub(crate) struct Route {
     pub(crate) method: &'static str,
-    /// The path under [`API_PREFIX`].
+    /// The path under [`API_PREFIX`], as the OpenAPI document spells it: one
+    /// segment may be [`ID_SEGMENT`], which matches any non-empty request
+    /// segment [`decode_segment`] accepts and hands the decoded id to the
+    /// handler as [`Caller::target`].
     pub(crate) path: &'static str,
     pub(crate) access: Access,
     handler: fn(&ApiContext, &Request, &Caller<'_>) -> Response,
+}
+
+/// The one path-parameter spelling a row may carry, utoipa's own, so the
+/// route table and the document compare by the same string.
+const ID_SEGMENT: &str = "{id}";
+
+/// A bound path segment as the client meant it: `%XX` pairs decoded to their
+/// bytes, once, at the binding. The PWA's generator runtime (`openapi-fetch`)
+/// substitutes a path parameter through `encodeURIComponent`, so every pane
+/// id arrives as `w1N%3Ap19`; a `+` is a `+` (a path segment, not a form).
+/// `None` for a `%` not followed by two hex digits or bytes that are not
+/// UTF-8: the segment then matches nothing, and the request answers what an
+/// unknown path answers.
+pub(crate) fn decode_segment(segment: &str) -> Option<String> {
+    let bytes = percent_decode_bytes(segment, false, Malformed::Refuse)?;
+    String::from_utf8(bytes).ok()
+}
+
+/// Whether `path` is an instance of `template`: the same segments, with an
+/// [`ID_SEGMENT`] matching any non-empty request segment that
+/// [`decode_segment`] accepts. `Some(bound)` on a match, the bound id `None`
+/// for a row that names no parameter; the terminal bridge binds its pane id
+/// through the same decoder.
+fn match_template(template: &str, path: &str) -> Option<Option<String>> {
+    let mut want = template.split('/');
+    let mut have = path.split('/');
+    let mut bound = None;
+    loop {
+        match (want.next(), have.next()) {
+            (None, None) => return Some(bound),
+            (Some(ID_SEGMENT), Some(segment)) if !segment.is_empty() => {
+                bound = Some(decode_segment(segment)?);
+            }
+            (Some(expected), Some(segment)) if expected == segment => {}
+            _ => return None,
+        }
+    }
 }
 
 /// Every route the API serves. A path in no row is 404 and a known path with
@@ -164,14 +207,53 @@ pub(crate) static ROUTES: &[Route] = &[
         access: Access::View,
         handler: panes::panes,
     },
+    Route {
+        method: "GET",
+        path: "/sessions",
+        access: Access::View,
+        handler: sessions::sessions,
+    },
+    Route {
+        method: "HEAD",
+        path: "/sessions",
+        access: Access::View,
+        handler: sessions::sessions,
+    },
+    Route {
+        method: "GET",
+        path: "/sessions/{id}",
+        access: Access::View,
+        handler: sessions::session_history,
+    },
+    Route {
+        method: "HEAD",
+        path: "/sessions/{id}",
+        access: Access::View,
+        handler: sessions::session_history,
+    },
+    Route {
+        method: "POST",
+        path: "/panes/{id}/prompt",
+        access: Access::Control,
+        handler: agent::prompt,
+    },
+    Route {
+        method: "POST",
+        path: "/panes/{id}/keys",
+        access: Access::Control,
+        handler: agent::keys,
+    },
 ];
 
-/// Who a handler is answering.
+/// Who a handler is answering, and what its path named.
 pub(crate) struct Caller<'a> {
     pub(crate) peer: SocketAddr,
     /// The device the bearer authenticated as; `None` exactly on an
     /// [`Access::None`] route, which reads no bearer.
     pub(crate) device: Option<&'a Device>,
+    /// The request segment the row's [`ID_SEGMENT`] bound — the pane or
+    /// session the request names; `None` on a row without one.
+    pub(crate) target: Option<&'a str>,
 }
 
 impl Caller<'_> {
@@ -210,7 +292,8 @@ pub(crate) struct ApiContext {
     /// where there is no scheduler to ask — the tests that exercise a route
     /// without a daemon behind it.
     pub(crate) live: Option<crate::daemon::LiveStores>,
-    /// The seam the pane route drives herdr through; see [`super::panes`].
+    /// The seam every bounded herdr call goes through (the pane route, the
+    /// terminal bridge's snapshot, the agent routes); see [`super::panes`].
     pub(crate) herdr_probe: PaneProbe,
     /// Resolves herdr's API socket for `GET /events`. The daemon passes the
     /// production resolver; a test passes an explicit path or `None`.
@@ -310,15 +393,26 @@ pub(crate) fn handle(ctx: &ApiContext, req: &Request, peer: SocketAddr) -> Handl
 
     let path = req.path.strip_prefix(API_PREFIX);
     let route = path.and_then(|path| {
-        ROUTES
-            .iter()
-            .find(|route| route.method == req.method && route.path == path)
+        ROUTES.iter().find_map(|route| {
+            (route.method == req.method)
+                .then(|| match_template(route.path, path))
+                .flatten()
+                .map(|target| (route, target))
+        })
     });
-    if let Some(route) = route
+    if let Some((route, target)) = &route
         && route.access == Access::None
     {
         return Handled {
-            response: (route.handler)(ctx, req, &Caller { peer, device: None }),
+            response: (route.handler)(
+                ctx,
+                req,
+                &Caller {
+                    peer,
+                    device: None,
+                    target: target.as_deref(),
+                },
+            ),
             device: None,
             hijack: None,
         };
@@ -352,17 +446,18 @@ pub(crate) fn handle(ctx: &ApiContext, req: &Request, peer: SocketAddr) -> Handl
     // WebSocket is not an HTTP resource — OpenAPI covers HTTP only, and the
     // frame vocabulary is hand-written in the plan doc.
     if let Some(pane_id) = path.and_then(terminal::pane_stream_target) {
-        return terminal::request(ctx, req, &device, pane_id);
+        return terminal::request(ctx, req, &device, &pane_id);
     }
 
     let response = match route {
-        Some(route) => match authorize(&device.tier, route.access) {
+        Some((route, target)) => match authorize(&device.tier, route.access) {
             Grant::Allowed => (route.handler)(
                 ctx,
                 req,
                 &Caller {
                     peer,
                     device: Some(&device),
+                    target: target.as_deref(),
                 },
             ),
             Grant::NeedsControl => Response::refused(403, "control_required", CONTROL_REQUIRED),
@@ -370,7 +465,12 @@ pub(crate) fn handle(ctx: &ApiContext, req: &Request, peer: SocketAddr) -> Handl
         },
         // A known path reached with the wrong method is 405, so a client with a
         // typo'd verb gets told which half is wrong.
-        None if path.is_some_and(|path| ROUTES.iter().any(|route| route.path == path)) => {
+        None if path.is_some_and(|path| {
+            ROUTES
+                .iter()
+                .any(|route| match_template(route.path, path).is_some())
+        }) =>
+        {
             Response::error(405, "method_not_allowed")
         }
         None => Response::error(404, "not_found"),
@@ -854,7 +954,7 @@ fn pair(_: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
 /// endpoint cannot ship undocumented.
 #[derive(utoipa::OpenApi)]
 #[openapi(
-    paths(health, status, events, switch, chain::order, chain::threshold, chain::wrap_off, pair, openapi_document, panes::panes),
+    paths(health, status, events, switch, chain::order, chain::threshold, chain::wrap_off, pair, openapi_document, panes::panes, sessions::sessions, sessions::session_history, agent::prompt, agent::keys),
     modifiers(&BearerScheme)
 )]
 struct ApiDoc;

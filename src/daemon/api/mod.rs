@@ -25,6 +25,7 @@
 //!     across requests and serve pipelined ones in order; see [`http`] for the
 //!     framing rules that makes safe. No async runtime.
 
+pub(crate) mod agent;
 pub(crate) mod chain;
 pub(crate) mod devices;
 mod events;
@@ -32,6 +33,7 @@ pub(crate) mod http;
 pub(crate) mod pairing;
 pub(crate) mod panes;
 pub(crate) mod routes;
+pub(crate) mod sessions;
 pub(crate) mod terminal;
 pub(crate) mod tls;
 

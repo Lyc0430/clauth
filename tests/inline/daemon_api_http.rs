@@ -758,6 +758,7 @@ fn a_status_no_route_emits_has_no_reason_phrase() {
     assert_eq!(reason_phrase(418), "Unknown");
     assert_eq!(reason_phrase(201), "Created");
     assert_eq!(reason_phrase(403), "Forbidden");
+    assert_eq!(reason_phrase(502), "Bad Gateway");
 }
 
 /// A writer that fails with `BrokenPipe` on its `fail_on`-th write.
