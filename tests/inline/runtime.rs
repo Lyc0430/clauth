@@ -6113,7 +6113,8 @@ fn session_row_is_live_finds_the_marker_a_real_session_stamped() {
             !session_row_is_live(
                 &crate::profile::ProfileName::from("rowlive-a"),
                 false,
-                "9999-0"
+                // pid 0 is never minted: `mint` stamps `<pid>-<seq>` with the live pid.
+                "0-0"
             ),
             "an unstamped session id must read dead"
         );
