@@ -2415,6 +2415,7 @@ fn a_pairing_over_tls_hands_back_a_working_token_and_logs_no_secret() {
     let pending = crate::daemon::api::pairing::begin(
         &crate::daemon::api::devices::DeviceName::parse("phone").expect("name"),
         Tier::View,
+        false,
     )
     .expect("begin");
     let code = pending.code().to_string();

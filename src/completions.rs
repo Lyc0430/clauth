@@ -38,9 +38,9 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "jobs" ]; then
         COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "devices" ]; then
-        COMPREPLY=( $(compgen -W "pair add revoke --json" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "pair add revoke allow-sessions --json" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "devices" ] && { [ "${COMP_WORDS[2]}" = "pair" ] || [ "${COMP_WORDS[2]}" = "add" ]; } && [ "${cur:0:2}" = "--" ]; then
-        COMPREPLY=( $(compgen -W "--control" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "--control --sessions" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "herdr" ]; then
         COMPREPLY=( $(compgen -W "install uninstall config" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 3 ] && [ "${COMP_WORDS[1]}" = "herdr" ] && [ "${COMP_WORDS[2]}" = "config" ]; then
@@ -91,7 +91,7 @@ _clauth() {
             'resume[resume a session under a chosen profile]' \
             'info[print resume command + storage path for a session]' \
             'daemon[run the headless scheduler with no TUI]' \
-            'devices[pair, list and revoke the devices that may call the REST API]' \
+            'devices[pair, list, grant sessions to, and revoke the devices that may call the REST API]' \
             'status[print the usage / auto-switch snapshot as JSON]' \
             'mcp[run the stdio MCP server]' \
             'herdr[install the herdr plugin and bind a key to it]' \
@@ -130,10 +130,12 @@ _clauth() {
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == devices ]]; then
         _values 'subcommand' 'pair[print a one-time pairing code and wait for it]' \
             'add[mint a token for a device here and print it once]' \
-            'revoke[remove a device]'
+            'revoke[remove a device]' \
+            'allow-sessions[grant a control device the sessions flag]'
         _values 'flag' '--json[emit the device list as JSON]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == devices && "${words[3]}" == (pair|add) ]]; then
-        _values 'flag' '--control[the device may switch accounts, not only read]'
+        _values 'flag' '--control[the device may switch accounts, not only read]' \
+            '--sessions[the device may mint sessions through the API]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == which ]]; then
         _values 'flag' '--json[emit JSON instead of plain name]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == sessions ]]; then
@@ -191,7 +193,7 @@ complete -c clauth -f -n __fish_is_first_token -a resume -d "Resume a session un
 complete -c clauth -f -n __fish_is_first_token -a info -d "Print resume command + storage path"
 complete -c clauth -f -n __fish_is_first_token -a completions -d "Emit shell completion script"
 complete -c clauth -f -n __fish_is_first_token -a daemon -d "Run the headless scheduler with no TUI"
-complete -c clauth -f -n __fish_is_first_token -a devices -d "Pair, list and revoke the devices that may call the REST API"
+complete -c clauth -f -n __fish_is_first_token -a devices -d "Pair, list, grant sessions to, and revoke the devices that may call the REST API"
 complete -c clauth -f -n __fish_is_first_token -a status -d "Print the usage / auto-switch snapshot as JSON"
 complete -c clauth -f -n __fish_is_first_token -a mcp -d "Run the stdio MCP server"
 complete -c clauth -f -n __fish_is_first_token -a herdr -d "Install the herdr plugin, read its knobs, or uninstall it"
@@ -242,8 +244,10 @@ complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --dump-openapi 
 complete -c clauth -f -n "__fish_seen_subcommand_from devices" -a pair -d "Print a one-time pairing code and wait for it"
 complete -c clauth -f -n "__fish_seen_subcommand_from devices" -a add -d "Mint a token for a device here and print it once"
 complete -c clauth -f -n "__fish_seen_subcommand_from devices" -a revoke -d "Remove a device"
+complete -c clauth -f -n "__fish_seen_subcommand_from devices" -a allow-sessions -d "Grant a control device the sessions flag"
 complete -c clauth -f -n "__fish_seen_subcommand_from devices" -a --json -d "Emit the device list as JSON"
 complete -c clauth -f -n "__fish_seen_subcommand_from devices; and __fish_seen_subcommand_from pair add" -a --control -d "The device may switch accounts, not only read"
+complete -c clauth -f -n "__fish_seen_subcommand_from devices; and __fish_seen_subcommand_from pair add" -a --sessions -d "The device may mint sessions through the API"
 "#;
 
 /// The placeholder each script carries where its `login` flag list goes; the

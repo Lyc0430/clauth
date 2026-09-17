@@ -205,7 +205,7 @@ fn a_code_and_a_redemption_never_format_their_secret() {
 #[test]
 fn the_pairing_file_is_owner_only_and_holds_no_code() {
     let _home = HomeSandbox::new();
-    let pending = begin(&name("phone"), Tier::View).expect("begin");
+    let pending = begin(&name("phone"), Tier::View, false).expect("begin");
     let body = std::fs::read_to_string(pairing_path().expect("path")).expect("read");
     assert!(
         !body.contains(&pending.code().0) && !body.contains(&pending.code().to_string()),
@@ -223,8 +223,8 @@ fn the_pairing_file_is_owner_only_and_holds_no_code() {
 #[test]
 fn pairing_refuses_a_name_a_device_holds() {
     let _home = HomeSandbox::new();
-    devices::add(&name("phone"), Tier::View).expect("add");
-    let Err(err) = begin(&name("PHONE"), Tier::View) else {
+    devices::add(&name("phone"), Tier::View, false).expect("add");
+    let Err(err) = begin(&name("PHONE"), Tier::View, false) else {
         panic!("the name is taken");
     };
     assert_eq!(
@@ -239,8 +239,9 @@ fn pairing_refuses_a_name_a_device_holds() {
 #[test]
 fn a_waiting_code_holds_its_name_against_add() {
     let _home = HomeSandbox::new();
-    let _pending = begin(&name("phone"), Tier::View).expect("begin");
-    let err = devices::add(&name("Phone"), Tier::Control).expect_err("the code holds the name");
+    let _pending = begin(&name("phone"), Tier::View, false).expect("begin");
+    let err =
+        devices::add(&name("Phone"), Tier::Control, false).expect_err("the code holds the name");
     assert_eq!(
         err.to_string(),
         "a pairing code for 'phone' is waiting to be entered; let it finish or pick another name"
@@ -250,8 +251,14 @@ fn a_waiting_code_holds_its_name_against_add() {
 #[test]
 fn an_expired_code_holds_no_name() {
     let _home = HomeSandbox::new();
-    begin_at(&name("phone"), Tier::View, now_epoch_secs() - CODE_TTL_SECS).expect("begin");
-    devices::add(&name("phone"), Tier::View).expect("an expired code blocks nothing");
+    begin_at(
+        &name("phone"),
+        Tier::View,
+        false,
+        now_epoch_secs() - CODE_TTL_SECS,
+    )
+    .expect("begin");
+    devices::add(&name("phone"), Tier::View, false).expect("an expired code blocks nothing");
 }
 
 // ── redemption ──────────────────────────────────────────────────────────────
@@ -260,7 +267,7 @@ fn an_expired_code_holds_no_name() {
 fn the_right_code_mints_a_device_with_the_pairings_tier() {
     for tier in [Tier::View, Tier::Control] {
         let _home = HomeSandbox::new();
-        let pending = begin(&name("phone"), tier.clone()).expect("begin");
+        let pending = begin(&name("phone"), tier.clone(), false).expect("begin");
         let Redeemed::Paired {
             name: minted_name,
             tier: minted_tier,
@@ -284,7 +291,7 @@ fn the_right_code_mints_a_device_with_the_pairings_tier() {
 #[test]
 fn a_wrong_code_is_refused_and_costs_one_attempt() {
     let _home = HomeSandbox::new();
-    let pending = begin(&name("phone"), Tier::View).expect("begin");
+    let pending = begin(&name("phone"), Tier::View, false).expect("begin");
     assert!(!paired(
         &redeem(&wrong_code(pending.code())).expect("redeem")
     ));
@@ -303,7 +310,7 @@ fn a_wrong_code_is_refused_and_costs_one_attempt() {
 #[test]
 fn the_fifth_wrong_try_burns_the_code() {
     let _home = HomeSandbox::new();
-    let pending = begin(&name("phone"), Tier::View).expect("begin");
+    let pending = begin(&name("phone"), Tier::View, false).expect("begin");
     let wrong = wrong_code(pending.code());
     let lines = crate::logline::LogLines::new();
     let _capture = lines.capture_here();
@@ -342,7 +349,7 @@ fn the_fifth_wrong_try_burns_the_code() {
 fn a_code_redeems_until_its_expiry_and_not_at_it() {
     let _home = HomeSandbox::new();
     let t0 = 1_800_000_000;
-    let pending = begin_at(&name("phone"), Tier::View, t0).expect("begin");
+    let pending = begin_at(&name("phone"), Tier::View, false, t0).expect("begin");
     assert_eq!(
         (pending.expires_at, live_pairing().expect("live").expires_at),
         (t0 + 300, epoch_secs_to_iso(t0 + 300)),
@@ -357,7 +364,7 @@ fn a_code_redeems_until_its_expiry_and_not_at_it() {
         "the attempt that found it expired deleted it"
     );
 
-    let pending = begin_at(&name("phone"), Tier::View, t0).expect("begin");
+    let pending = begin_at(&name("phone"), Tier::View, false, t0).expect("begin");
     assert!(
         paired(&redeem_at(pending.code(), t0 + 299).expect("redeem")),
         "one second before, it pairs"
@@ -368,7 +375,7 @@ fn a_code_redeems_until_its_expiry_and_not_at_it() {
 #[test]
 fn a_redeemed_code_is_refused_the_second_time() {
     let _home = HomeSandbox::new();
-    let pending = begin(&name("phone"), Tier::View).expect("begin");
+    let pending = begin(&name("phone"), Tier::View, false).expect("begin");
     assert!(paired(&redeem(pending.code()).expect("first")));
     assert!(!paired(&redeem(pending.code()).expect("second")));
     assert_eq!(devices::read_store().expect("read").devices.len(), 1);
@@ -402,7 +409,7 @@ fn with_no_code_live_a_redemption_is_refused() {
 #[test]
 fn a_failed_store_write_leaves_the_code_live() {
     let _home = HomeSandbox::new();
-    let pending = begin(&name("phone"), Tier::View).expect("begin");
+    let pending = begin(&name("phone"), Tier::View, false).expect("begin");
     devices::fail_next_write();
     let err = redeem(pending.code()).expect_err("the injected write failure propagates");
     assert!(
@@ -425,7 +432,7 @@ fn concurrent_redemptions_of_one_code_yield_one_201() {
     const RACERS: usize = 16;
     let _home = HomeSandbox::new();
     let ctx = ctx();
-    let pending = begin(&name("phone"), Tier::View).expect("begin");
+    let pending = begin(&name("phone"), Tier::View, false).expect("begin");
     let body = pair_body(pending.code());
     let barrier = std::sync::Barrier::new(RACERS);
 
@@ -463,7 +470,7 @@ fn concurrent_redemptions_of_one_code_yield_one_201() {
 /// logged.
 fn race_wrong_codes(racers: usize) -> (Vec<u16>, Vec<String>) {
     let ctx = ctx();
-    let pending = begin(&name("phone"), Tier::View).expect("begin");
+    let pending = begin(&name("phone"), Tier::View, false).expect("begin");
     let body = pair_body(&wrong_code(pending.code()));
     let barrier = std::sync::Barrier::new(racers);
     let lines = crate::logline::LogLines::new();
@@ -520,7 +527,7 @@ fn concurrent_wrong_codes_burn_the_code_at_the_fifth() {
 fn the_201_carries_the_token_and_no_log_line_carries_a_secret() {
     let _home = HomeSandbox::new();
     let ctx = ctx();
-    let pending = begin(&name("phone"), Tier::Control).expect("begin");
+    let pending = begin(&name("phone"), Tier::Control, false).expect("begin");
     let lines = crate::logline::LogLines::new();
     let _capture = lines.capture_here();
 
@@ -563,7 +570,7 @@ fn the_201_carries_the_token_and_no_log_line_carries_a_secret() {
 fn the_pairing_line_sanitizes_the_tier_it_read() {
     let _home = HomeSandbox::new();
     let ctx = ctx();
-    let pending = begin(&name("phone"), Tier::View).expect("begin");
+    let pending = begin(&name("phone"), Tier::View, false).expect("begin");
     let path = pairing_path().expect("path");
     let mut file = read_pairing(&path).expect("read").expect("live");
     file.tier = Tier::Unknown("view\nclauth api: forged".to_string());
@@ -591,7 +598,7 @@ fn every_failed_redemption_answers_the_same_bytes() {
 
     let none = post_pair(&ctx, r#"{"code":"ABCD-2345"}"#);
 
-    let pending = begin(&name("phone"), Tier::View).expect("begin");
+    let pending = begin(&name("phone"), Tier::View, false).expect("begin");
     let wrong_body = pair_body(&wrong_code(pending.code()));
     let wrong = post_pair(&ctx, &wrong_body);
     for _ in 1..CODE_ATTEMPTS {
@@ -599,8 +606,13 @@ fn every_failed_redemption_answers_the_same_bytes() {
     }
     let burned = post_pair(&ctx, &pair_body(pending.code()));
 
-    let stale =
-        begin_at(&name("phone"), Tier::View, now_epoch_secs() - CODE_TTL_SECS).expect("begin");
+    let stale = begin_at(
+        &name("phone"),
+        Tier::View,
+        false,
+        now_epoch_secs() - CODE_TTL_SECS,
+    )
+    .expect("begin");
     let expired = post_pair(&ctx, &pair_body(stale.code()));
 
     assert_eq!(
@@ -633,7 +645,7 @@ fn every_failed_redemption_answers_the_same_bytes() {
 fn a_body_holding_no_code_is_400_and_costs_no_attempt() {
     let _home = HomeSandbox::new();
     let ctx = ctx();
-    let _pending = begin(&name("phone"), Tier::View).expect("begin");
+    let _pending = begin(&name("phone"), Tier::View, false).expect("begin");
     for body in [
         "",
         "not json",
@@ -665,8 +677,8 @@ fn a_body_holding_no_code_is_400_and_costs_no_attempt() {
 #[test]
 fn a_new_code_replaces_the_one_waiting() {
     let _home = HomeSandbox::new();
-    let first = begin(&name("phone"), Tier::View).expect("first");
-    let second = begin(&name("tablet"), Tier::Control).expect("second");
+    let first = begin(&name("phone"), Tier::View, false).expect("first");
+    let second = begin(&name("tablet"), Tier::Control, false).expect("second");
     let now = now_epoch_secs();
     assert_eq!(
         observe(&first, now).expect("observe"),
@@ -689,7 +701,7 @@ fn a_new_code_replaces_the_one_waiting() {
 fn the_wait_reads_each_ending() {
     {
         let _home = HomeSandbox::new();
-        let pending = begin(&name("phone"), Tier::Control).expect("begin");
+        let pending = begin(&name("phone"), Tier::Control, false).expect("begin");
         redeem(pending.code()).expect("redeem");
         assert_eq!(
             observe(&pending, now_epoch_secs()).expect("observe"),
@@ -698,7 +710,7 @@ fn the_wait_reads_each_ending() {
     }
     {
         let _home = HomeSandbox::new();
-        let pending = begin(&name("phone"), Tier::View).expect("begin");
+        let pending = begin(&name("phone"), Tier::View, false).expect("begin");
         for _ in 0..CODE_ATTEMPTS {
             redeem(&wrong_code(pending.code())).expect("redeem");
         }
@@ -710,7 +722,8 @@ fn the_wait_reads_each_ending() {
     {
         let _home = HomeSandbox::new();
         let now = now_epoch_secs();
-        let pending = begin_at(&name("phone"), Tier::View, now - CODE_TTL_SECS).expect("begin");
+        let pending =
+            begin_at(&name("phone"), Tier::View, false, now - CODE_TTL_SECS).expect("begin");
         assert_eq!(
             observe(&pending, now).expect("observe"),
             Some(Outcome::Expired),
@@ -728,7 +741,7 @@ fn the_wait_reads_each_ending() {
 #[test]
 fn the_wait_ends_when_another_thread_redeems() {
     let _home = HomeSandbox::new();
-    let pending = begin(&name("phone"), Tier::View).expect("begin");
+    let pending = begin(&name("phone"), Tier::View, false).expect("begin");
     let code = pending.code().clone();
     // Bounded: a redemption that never lands must fail the test, not park it
     // until the code expires 5 minutes later.
@@ -753,7 +766,7 @@ fn the_wait_ends_when_another_thread_redeems() {
 #[test]
 fn a_signal_withdraws_the_code_and_exits_128_plus_the_signal() {
     let _home = HomeSandbox::new();
-    let pending = begin(&name("phone"), Tier::View).expect("begin");
+    let pending = begin(&name("phone"), Tier::View, false).expect("begin");
     let waited = wait_for(&pending, || Some(2), Duration::from_millis(5)).expect("wait");
     assert_eq!(waited, Waited::Interrupted(2));
     assert!(
@@ -769,7 +782,7 @@ fn a_signal_withdraws_the_code_and_exits_128_plus_the_signal() {
 #[test]
 fn every_other_ending_exits_one_with_its_reason() {
     let _home = HomeSandbox::new();
-    let pending = begin(&name("phone"), Tier::View).expect("begin");
+    let pending = begin(&name("phone"), Tier::View, false).expect("begin");
     let failures = [Outcome::Replaced, Outcome::Burned, Outcome::Expired]
         .map(|outcome| finish(&pending, Ok(Waited::Done(outcome))).expect_err("not paired"));
     assert_eq!(
@@ -797,7 +810,7 @@ fn every_other_ending_exits_one_with_its_reason() {
 #[test]
 fn a_signal_after_the_code_paired_reports_the_pairing() {
     let _home = HomeSandbox::new();
-    let pending = begin(&name("phone"), Tier::Control).expect("begin");
+    let pending = begin(&name("phone"), Tier::Control, false).expect("begin");
     assert!(paired(&redeem(pending.code()).expect("redeem")));
 
     let result = finish(&pending, Ok(Waited::Interrupted(2)));
@@ -820,8 +833,8 @@ fn a_signal_after_the_code_paired_reports_the_pairing() {
 #[test]
 fn a_signal_after_the_code_was_replaced_reports_the_replacement() {
     let _home = HomeSandbox::new();
-    let first = begin(&name("phone"), Tier::View).expect("first");
-    let _second = begin(&name("tablet"), Tier::View).expect("second");
+    let first = begin(&name("phone"), Tier::View, false).expect("first");
+    let _second = begin(&name("tablet"), Tier::View, false).expect("second");
 
     let Err(err) = finish(&first, Ok(Waited::Interrupted(2))) else {
         panic!("a replaced code is no pairing");
@@ -841,7 +854,7 @@ fn a_signal_after_the_code_was_replaced_reports_the_replacement() {
 #[test]
 fn a_code_whose_name_was_taken_is_refused_and_consumed() {
     let _home = HomeSandbox::new();
-    let pending = begin(&name("phone"), Tier::View).expect("begin");
+    let pending = begin(&name("phone"), Tier::View, false).expect("begin");
     devices::seed_for_tests(
         "phone",
         Tier::View,
@@ -899,11 +912,11 @@ fn an_unparseable_pairing_file_is_deleted_by_the_attempt_that_finds_it() {
 #[test]
 fn a_burned_code_is_not_read_as_paired_by_a_later_add() {
     let _home = HomeSandbox::new();
-    let pending = begin(&name("phone"), Tier::View).expect("begin");
+    let pending = begin(&name("phone"), Tier::View, false).expect("begin");
     for _ in 0..CODE_ATTEMPTS {
         redeem(&wrong_code(pending.code())).expect("redeem");
     }
-    devices::add(&name("phone"), Tier::Control).expect("a burned code holds no name");
+    devices::add(&name("phone"), Tier::Control, false).expect("a burned code holds no name");
 
     assert_eq!(
         observe(&pending, now_epoch_secs()).expect("observe"),
@@ -919,7 +932,7 @@ fn a_burned_code_is_not_read_as_paired_by_a_later_add() {
 #[test]
 fn a_lost_code_line_with_a_failed_withdraw_pins_its_sentence() {
     let _home = HomeSandbox::new();
-    let pending = begin(&name("tray"), Tier::View).expect("mint the code");
+    let pending = begin(&name("tray"), Tier::View, false).expect("mint the code");
     let path = pairing_path().expect("path");
     std::fs::remove_file(&path).expect("remove the code file");
     std::fs::create_dir(&path).expect("replace it with an unreadable entry");
@@ -944,7 +957,7 @@ fn a_lost_code_line_with_a_failed_withdraw_pins_its_sentence() {
 #[test]
 fn a_lost_code_line_with_a_write_error_and_a_failed_withdraw_pins_its_sentence() {
     let _home = HomeSandbox::new();
-    let pending = begin(&name("tray"), Tier::View).expect("mint the code");
+    let pending = begin(&name("tray"), Tier::View, false).expect("mint the code");
     let path = pairing_path().expect("path");
     std::fs::remove_file(&path).expect("remove the code file");
     std::fs::create_dir(&path).expect("replace it with an unreadable entry");
@@ -966,7 +979,7 @@ fn a_lost_code_line_with_a_write_error_and_a_failed_withdraw_pins_its_sentence()
 #[test]
 fn a_lost_code_line_with_a_withdrawn_code_pins_its_sentence() {
     let _home = HomeSandbox::new();
-    let pending = begin(&name("tray"), Tier::View).expect("mint the code");
+    let pending = begin(&name("tray"), Tier::View, false).expect("mint the code");
     let err = withdraw_lost(&pending, None).expect_err("the withdraw lands");
     assert_eq!(
         err.to_string(),
@@ -979,7 +992,7 @@ fn a_lost_code_line_with_a_withdrawn_code_pins_its_sentence() {
 #[test]
 fn a_lost_code_line_with_a_write_error_pins_the_cause_and_withdrawal() {
     let _home = HomeSandbox::new();
-    let pending = begin(&name("tray"), Tier::View).expect("mint the code");
+    let pending = begin(&name("tray"), Tier::View, false).expect("mint the code");
     let write_err = std::io::Error::other("full disk");
     let err = withdraw_lost(&pending, Some(write_err)).expect_err("the withdraw lands");
     assert_eq!(
@@ -993,8 +1006,8 @@ fn a_lost_code_line_with_a_write_error_pins_the_cause_and_withdrawal() {
 #[test]
 fn a_lost_code_line_on_a_replaced_code_says_replaced() {
     let _home = HomeSandbox::new();
-    let first = begin(&name("tray"), Tier::View).expect("first code");
-    begin(&name("tray"), Tier::View).expect("a newer pair replaces it");
+    let first = begin(&name("tray"), Tier::View, false).expect("first code");
+    begin(&name("tray"), Tier::View, false).expect("a newer pair replaces it");
     let err = withdraw_lost(&first, None).expect_err("the code is already gone");
     assert_eq!(
         err.to_string(),
@@ -1007,12 +1020,53 @@ fn a_lost_code_line_on_a_replaced_code_says_replaced() {
 #[test]
 fn a_lost_code_line_with_a_write_error_and_a_replaced_code_pins_its_sentence() {
     let _home = HomeSandbox::new();
-    let first = begin(&name("tray"), Tier::View).expect("first code");
-    begin(&name("tray"), Tier::View).expect("a newer pair replaces it");
+    let first = begin(&name("tray"), Tier::View, false).expect("first code");
+    begin(&name("tray"), Tier::View, false).expect("a newer pair replaces it");
     let write_err = std::io::Error::other("full disk");
     let err = withdraw_lost(&first, Some(write_err)).expect_err("the code is already gone");
     assert_eq!(
         err.to_string(),
         "the pairing code for 'tray' never reached its reader (full disk); a newer `clauth devices pair` had already replaced it"
     );
+}
+
+// ── sessions grant ─────────────────────────────────────────────────────────
+
+/// A code minted with the grant carries it into the redeemed device; a code
+/// minted without it redeems to a device with the grant off.
+#[test]
+fn a_pairing_code_carries_the_sessions_grant() {
+    for sessions in [false, true] {
+        let _home = HomeSandbox::new();
+        let pending = begin(&name("phone"), Tier::Control, sessions).expect("begin");
+        let Redeemed::Paired { token, .. } = redeem(pending.code()).expect("redeem") else {
+            panic!("the right code must pair");
+        };
+        let device = devices::authenticate(Some(&token))
+            .expect("read")
+            .expect("the minted token verifies");
+        assert_eq!(device.sessions, sessions, "the grant rides the pairing");
+        assert!(live_pairing().is_none(), "a redeemed code is gone");
+    }
+}
+
+/// A pending file written by a build before the sessions field existed (no
+/// key) redeems to an ungranted device, not a refused pairing.
+#[test]
+fn a_pre_sessions_pairing_file_redeems_ungranted() {
+    let _home = HomeSandbox::new();
+    let pending = begin(&name("phone"), Tier::Control, true).expect("begin");
+    let path = pairing_path().expect("path");
+    let mut body: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("json");
+    body.as_object_mut().expect("object").remove("sessions");
+    std::fs::write(&path, body.to_string()).expect("strip the key");
+
+    let Redeemed::Paired { token, .. } = redeem(pending.code()).expect("redeem") else {
+        panic!("a pre-field pending file must still pair");
+    };
+    let device = devices::authenticate(Some(&token))
+        .expect("read")
+        .expect("the minted token verifies");
+    assert!(!device.sessions, "a missing key reads as the grant off");
 }

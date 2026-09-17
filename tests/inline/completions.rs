@@ -288,6 +288,55 @@ fn herdr_flags_are_offered_only_under_install_and_uninstall() {
     );
 }
 
+/// `clauth devices pair` and `clauth devices add` are the only devices verbs
+/// that take `--control`/`--sessions`: clap refuses them after `revoke` and
+/// `allow-sessions`, so each shell's flag offer is gated on exactly those two
+/// verbs, by the guard text the walk above cannot judge (it asserts presence,
+/// so a guard loosened to a third verb would still pass it). Each flag occurs
+/// once per script, so no ungated twin can slip in beside the gated offer.
+#[test]
+fn devices_flags_are_offered_only_under_pair_and_add() {
+    let cases = [
+        (
+            &BASH,
+            concat!(
+                r#"elif [ "${COMP_WORDS[1]}" = "devices" ] && { [ "${COMP_WORDS[2]}" = "pair" ] || [ "${COMP_WORDS[2]}" = "add" ]; } && [ "${cur:0:2}" = "--" ]; then"#,
+                "\n        COMPREPLY=( $(compgen -W \"--control --sessions\" -- \"${cur}\") )",
+            ),
+        ),
+        (
+            &ZSH,
+            concat!(
+                r#"elif (( CURRENT >= 4 )) && [[ "${words[2]}" == devices && "${words[3]}" == (pair|add) ]]; then"#,
+                "\n        _values 'flag' '--control[",
+            ),
+        ),
+        (
+            &FISH,
+            "-n \"__fish_seen_subcommand_from devices; and __fish_seen_subcommand_from pair add\" -a --control",
+        ),
+    ];
+    for (script, gated_offer) in cases {
+        assert!(
+            script.contains(gated_offer),
+            "the devices flag offer must be gated to `pair`/`add`, missing {gated_offer:?}"
+        );
+        for flag in ["--control", "--sessions"] {
+            assert_eq!(
+                script.matches(flag).count(),
+                1,
+                "{flag} occurs once: offered under that guard alone, and no description names it"
+            );
+        }
+    }
+    assert!(
+        FISH.contains(
+            "-n \"__fish_seen_subcommand_from devices; and __fish_seen_subcommand_from pair add\" -a --sessions"
+        ),
+        "fish gates `--sessions` on the same two verbs"
+    );
+}
+
 /// The scripts are hand-written (clap_complete's stable generator can't
 /// reproduce the live `clauth __complete` profile-name shellout), so nothing
 /// structural keeps them level with the grammar — they had already drifted three
@@ -330,6 +379,26 @@ fn every_visible_subcommand_and_long_flag_is_offered_by_all_three_scripts() {
         {
             expected.push((name.clone(), format!("--{long}")));
         }
+        // One level deeper: a nested verb's NAME is offered in the PARENT's
+        // branch, its FLAGS under a guard naming BOTH the parent and the verb
+        // (bash `"${COMP_WORDS[1]}" = "devices"` + `"${COMP_WORDS[2]}" =
+        // "pair"`, zsh `"${words[2]}" == devices && "${words[3]}" ==
+        // (pair|add)`, fish `__fish_seen_subcommand_from devices; and
+        // __fish_seen_subcommand_from pair add`), so the walk pairs the name
+        // with the parent and each flag with `<parent> <verb>`: a verb guard
+        // re-parented onto another subcommand is drift, not a match.
+        for verb in sub.get_subcommands().filter(|s| !s.is_hide_set()) {
+            let verb_name = verb.get_name().to_string();
+            expected.push((name.clone(), verb_name.clone()));
+            for long in verb
+                .get_arguments()
+                .filter(|a| !a.is_hide_set())
+                .filter_map(|a| a.get_long())
+                .filter(|l| !generated.contains(l))
+            {
+                expected.push((format!("{name} {verb_name}"), format!("--{long}")));
+            }
+        }
     }
 
     assert!(
@@ -354,10 +423,13 @@ fn every_visible_subcommand_and_long_flag_is_offered_by_all_three_scripts() {
     let mut missing: Vec<String> = Vec::new();
     for (shell, script) in [("bash", &BASH), ("zsh", &ZSH), ("fish", &FISH)] {
         for (owner, token) in &expected {
-            // A subcommand's own name is offered by the first-word branch; only
-            // its flags live under the branch named after it.
+            // A subcommand's own name is offered by the first-word branch; its
+            // own flags under the branch named after it; a nested verb's flags
+            // under the guard naming its parent AND the verb.
             let branch = if owner == "<root>" || owner == token {
                 root_branch(shell, script)
+            } else if let Some((parent, verb)) = owner.split_once(' ') {
+                verb_branch(shell, script, parent, verb)
             } else {
                 subcommand_branch(shell, script, owner)
             };
@@ -406,23 +478,67 @@ fn subcommand_branch(shell: &str, script: &str, name: &str) -> Option<String> {
                 || guard.contains(&format!("\"$prev\" = \"{name}\""))
         }),
         // zsh pins it in `[[ "${words[2]}" == … ]]`, bare or as an alternation.
-        "zsh" => guarded_arms(script, |guard| {
-            guard
-                .split("\"${words[2]}\" == ")
-                .skip(1)
-                .filter_map(|rest| rest.split_whitespace().next())
-                .any(|pat| pat.trim_matches(['(', ')']).split('|').any(|a| a == name))
-        }),
+        "zsh" => guarded_arms(script, |guard| zsh_word_matches(guard, 2, name)),
         // fish pins it in a `__fish_seen_subcommand_from` condition, which may
-        // name several subcommands.
+        // name several subcommands, and chains them with `; and `. A chained
+        // line's first group reads `devices;`, so the token compare strips the
+        // separator.
         "fish" => joined(script.lines().filter(|l| {
             l.split("__fish_seen_subcommand_from ")
                 .skip(1)
                 .filter_map(|rest| rest.split('"').next())
-                .any(|list| list.split_whitespace().any(|w| w == name))
+                .any(|list| {
+                    list.split_whitespace()
+                        .any(|w| w.trim_end_matches(';') == name)
+                })
         })),
         _ => None,
     }
+}
+
+/// The slice of `script` that completes a nested VERB's own flags: the arm
+/// gated on `parent` as the second word AND `verb` as the third (`pair`/`add`
+/// under `devices`, `install`/`uninstall` under `herdr`). Both halves are
+/// required, so a verb guard re-parented onto another subcommand is no match.
+/// `None` means the script has no such arm.
+fn verb_branch(shell: &str, script: &str, parent: &str, verb: &str) -> Option<String> {
+    match shell {
+        // bash pins the parent as the second word and the verb as the third.
+        "bash" => guarded_arms(script, |guard| {
+            guard.contains(&format!("\"${{COMP_WORDS[1]}}\" = \"{parent}\""))
+                && guard.contains(&format!("\"${{COMP_WORDS[2]}}\" = \"{verb}\""))
+        }),
+        // zsh pins them in `[[ "${words[2]}" == … && "${words[3]}" == … ]]`,
+        // each bare or as an alternation.
+        "zsh" => guarded_arms(script, |guard| {
+            zsh_word_matches(guard, 2, parent) && zsh_word_matches(guard, 3, verb)
+        }),
+        // fish chains two `__fish_seen_subcommand_from` groups with `; and `:
+        // the first names the parent, the second the verb(s).
+        "fish" => joined(script.lines().filter(|l| {
+            let mut groups = l.split("__fish_seen_subcommand_from ").skip(1).map(|rest| {
+                rest.split('"')
+                    .next()
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .map(|w| w.trim_end_matches(';'))
+                    .collect::<Vec<_>>()
+            });
+            groups.next().is_some_and(|first| first.contains(&parent))
+                && groups.next().is_some_and(|second| second.contains(&verb))
+        })),
+        _ => None,
+    }
+}
+
+/// Whether a zsh guard pins `words[index]` to `name`, bare or inside an
+/// alternation (`(pair|add)`).
+fn zsh_word_matches(guard: &str, index: usize, name: &str) -> bool {
+    guard
+        .split(&format!("\"${{words[{index}]}}\" == "))
+        .skip(1)
+        .filter_map(|rest| rest.split_whitespace().next())
+        .any(|pat| pat.trim_matches(['(', ')']).split('|').any(|a| a == name))
 }
 
 /// Every arm of the script's `if`/`elif` chain whose guard line satisfies

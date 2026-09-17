@@ -1282,6 +1282,7 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
     let code = pairing::begin(
         &devices::DeviceName::parse("phone").expect("device name"),
         Tier::View,
+        false,
     )
     .expect("mint a pairing code")
     .code()
@@ -1331,6 +1332,7 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
     let code2 = pairing::begin(
         &devices::DeviceName::parse("tablet").expect("device name"),
         Tier::View,
+        false,
     )
     .expect("mint a second pairing code")
     .code()

@@ -381,3 +381,195 @@ fn pair_with_full_stdout_withdraws_and_exits_1() {
         String::from_utf8_lossy(&added.stderr)
     );
 }
+
+/// `add --control --sessions` still puts the token alone on stdout, and its
+/// stderr names the grant. The stored row and `--json` both carry it.
+#[test]
+fn add_with_sessions_prints_the_token_and_names_the_grant() {
+    let home = tempfile::tempdir().expect("home");
+    let out = clauth(home.path())
+        .args(["devices", "add", "tray", "--control", "--sessions"])
+        .output()
+        .expect("run clauth devices add");
+    assert_eq!(out.status.code(), Some(0));
+
+    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
+    let token = stdout.strip_suffix('\n').unwrap_or_default();
+    assert!(
+        token.len() == 64
+            && token
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "stdout must hold the token and nothing else"
+    );
+    assert_eq!(
+        String::from_utf8(out.stderr).expect("utf8 stderr"),
+        "clauth: added device 'tray' (control). That token is its only copy: clauth keeps just \
+         a SHA-256 of it and cannot show it again.\nclauth: 'tray' may mint sessions\n"
+    );
+
+    let list = std::fs::read_to_string(home.path().join(".clauth/devices.json")).expect("list");
+    assert!(!list.contains(token), "the list must hold no token");
+
+    let listed = clauth(home.path())
+        .args(["devices", "--json"])
+        .output()
+        .expect("run clauth devices --json");
+    assert_eq!(listed.status.code(), Some(0));
+    let rows: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(listed.stdout).expect("utf8")).expect("json rows");
+    assert_eq!(rows[0]["sessions"], serde_json::json!(true));
+}
+
+/// `allow-sessions` pins each of its four outcomes on the real binary: the
+/// view refusal, the missing name, the fresh grant, and the already-granted
+/// no-op.
+#[test]
+fn allow_sessions_prints_its_fixed_lines() {
+    let home = tempfile::tempdir().expect("home");
+
+    let view = clauth(home.path())
+        .args(["devices", "add", "viewer"])
+        .output()
+        .expect("add a view device");
+    assert_eq!(view.status.code(), Some(0));
+
+    let refused = clauth(home.path())
+        .args(["devices", "allow-sessions", "viewer"])
+        .output()
+        .expect("allow-sessions on a view device");
+    assert_eq!(refused.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8(refused.stderr).expect("utf8 stderr"),
+        "Error: a device without the control tier cannot mint sessions; revoke 'viewer' and \
+         re-pair it with --control\n"
+    );
+
+    let missing = clauth(home.path())
+        .args(["devices", "allow-sessions", "ghost"])
+        .output()
+        .expect("allow-sessions on a missing name");
+    assert_eq!(missing.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8(missing.stderr).expect("utf8 stderr"),
+        "Error: no device named 'ghost'; `clauth devices` lists the paired ones\n"
+    );
+
+    let control = clauth(home.path())
+        .args(["devices", "add", "tray", "--control"])
+        .output()
+        .expect("add a control device");
+    assert_eq!(control.status.code(), Some(0));
+
+    let granted = clauth(home.path())
+        .args(["devices", "allow-sessions", "tray"])
+        .output()
+        .expect("allow-sessions on a control device");
+    assert_eq!(granted.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(granted.stdout).expect("utf8 stdout"),
+        "clauth: 'tray' may now mint sessions\n"
+    );
+
+    let again = clauth(home.path())
+        .args(["devices", "allow-sessions", "tray"])
+        .output()
+        .expect("allow-sessions again");
+    assert_eq!(again.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(again.stdout).expect("utf8 stdout"),
+        "clauth: 'tray' already may mint sessions\n"
+    );
+}
+
+/// `--sessions` without `--control` is clap's own usage error on both minting
+/// verbs.
+#[test]
+fn sessions_without_control_is_a_usage_error() {
+    let home = tempfile::tempdir().expect("home");
+    for verb in ["pair", "add"] {
+        let out = clauth(home.path())
+            .args(["devices", verb, "tray", "--sessions"])
+            .output()
+            .expect("run clauth devices");
+        assert_eq!(out.status.code(), Some(2), "{verb}: {:?}", out.status);
+        let stderr = String::from_utf8(out.stderr).expect("utf8 stderr");
+        assert!(
+            stderr.contains("--control"),
+            "clap must name the missing --control: {stderr}"
+        );
+    }
+}
+
+/// Every `--json` row carries the sessions flag, granted or not.
+#[test]
+fn devices_json_carries_sessions_on_every_row() {
+    let home = tempfile::tempdir().expect("home");
+    let granted = clauth(home.path())
+        .args(["devices", "add", "tray", "--control", "--sessions"])
+        .output()
+        .expect("add a granted device");
+    assert_eq!(granted.status.code(), Some(0));
+    let plain = clauth(home.path())
+        .args(["devices", "add", "phone"])
+        .output()
+        .expect("add a view device");
+    assert_eq!(plain.status.code(), Some(0));
+
+    let listed = clauth(home.path())
+        .args(["devices", "--json"])
+        .output()
+        .expect("run clauth devices --json");
+    assert_eq!(listed.status.code(), Some(0));
+    let rows: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(listed.stdout).expect("utf8")).expect("json rows");
+    let rows = rows.as_array().expect("array");
+    let tray = rows
+        .iter()
+        .find(|r| r["name"].as_str() == Some("tray"))
+        .expect("tray");
+    let phone = rows
+        .iter()
+        .find(|r| r["name"].as_str() == Some("phone"))
+        .expect("phone");
+    assert_eq!(tray["sessions"], serde_json::json!(true));
+    assert_eq!(phone["sessions"], serde_json::json!(false));
+}
+
+/// `pair --control --sessions` says the grant on stderr before any device
+/// exists, phrased conditionally like its control neighbour.
+#[test]
+fn pair_with_sessions_names_the_grant_before_any_device_exists() {
+    let home = tempfile::tempdir().expect("home");
+    let mut child = clauth(home.path())
+        .args(["devices", "pair", "phone", "--control", "--sessions"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn clauth devices pair");
+    let mut stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
+    let mut line = String::new();
+    stdout.read_line(&mut line).expect("read the code line");
+    assert!(
+        is_display_code(line.strip_suffix('\n').unwrap_or_default()),
+        "stdout opens with the code alone"
+    );
+
+    Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .expect("run kill");
+    assert_eq!(
+        wait_bounded(&mut child, Duration::from_secs(10)).code(),
+        Some(130)
+    );
+
+    let stderr = read_stderr(&mut child);
+    assert!(
+        stderr.contains(
+            "clauth: until it is used the code also grants sessions: whoever enters it first \
+             can mint them through the API"
+        ),
+        "{stderr}"
+    );
+}

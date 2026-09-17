@@ -1005,10 +1005,11 @@ fn dump_openapi_conflicts_with_every_daemon_starting_or_probing_flag() {
 
 // ── devices ─────────────────────────────────────────────────────────────────
 
-/// `devices` parses its four verbs: bare lists, with or without `--json`;
-/// `pair` and `add` take a name and an optional `--control`; `revoke` a name.
+/// `devices` parses its five verbs: bare lists, with or without `--json`;
+/// `pair` and `add` take a name and an optional `--control` plus
+/// `--control`-gated `--sessions`; `revoke` and `allow-sessions` a name.
 #[test]
-fn devices_parses_its_four_verbs() {
+fn devices_parses_its_five_verbs() {
     use crate::cli::DevicesCommand;
 
     assert!(matches!(
@@ -1025,36 +1026,72 @@ fn devices_parses_its_four_verbs() {
             cmd: None
         }
     ));
-    for (args, want_control) in [
-        (["devices", "pair", "phone"].as_slice(), false),
-        (["devices", "pair", "phone", "--control"].as_slice(), true),
-        (["devices", "pair", "--control", "phone"].as_slice(), true),
+    for (args, want_control, want_sessions) in [
+        (["devices", "pair", "phone"].as_slice(), false, false),
+        (
+            ["devices", "pair", "phone", "--control"].as_slice(),
+            true,
+            false,
+        ),
+        (
+            ["devices", "pair", "--control", "phone"].as_slice(),
+            true,
+            false,
+        ),
+        (
+            ["devices", "pair", "phone", "--control", "--sessions"].as_slice(),
+            true,
+            true,
+        ),
     ] {
         let Command::Devices {
-            cmd: Some(DevicesCommand::Pair { name, control }),
+            cmd:
+                Some(DevicesCommand::Pair {
+                    name,
+                    control,
+                    sessions,
+                }),
             ..
         } = command(args)
         else {
             panic!("{args:?} must parse as pair");
         };
         assert_eq!(
-            (name.as_str(), control),
-            ("phone", want_control),
+            (name.as_str(), control, sessions),
+            ("phone", want_control, want_sessions),
             "{args:?}"
         );
     }
-    for (args, want_control) in [
-        (["devices", "add", "tray"].as_slice(), false),
-        (["devices", "add", "tray", "--control"].as_slice(), true),
+    for (args, want_control, want_sessions) in [
+        (["devices", "add", "tray"].as_slice(), false, false),
+        (
+            ["devices", "add", "tray", "--control"].as_slice(),
+            true,
+            false,
+        ),
+        (
+            ["devices", "add", "tray", "--control", "--sessions"].as_slice(),
+            true,
+            true,
+        ),
     ] {
         let Command::Devices {
-            cmd: Some(DevicesCommand::Add { name, control }),
+            cmd:
+                Some(DevicesCommand::Add {
+                    name,
+                    control,
+                    sessions,
+                }),
             ..
         } = command(args)
         else {
             panic!("{args:?} must parse as add");
         };
-        assert_eq!((name.as_str(), control), ("tray", want_control), "{args:?}");
+        assert_eq!(
+            (name.as_str(), control, sessions),
+            ("tray", want_control, want_sessions),
+            "{args:?}"
+        );
     }
     let Command::Devices {
         cmd: Some(DevicesCommand::Revoke { name }),
@@ -1065,15 +1102,27 @@ fn devices_parses_its_four_verbs() {
     };
     assert_eq!(name, "phone");
 
+    let Command::Devices {
+        cmd: Some(DevicesCommand::AllowSessions { name }),
+        ..
+    } = command(&["devices", "allow-sessions", "phone"])
+    else {
+        panic!("allow-sessions must parse");
+    };
+    assert_eq!(name, "phone");
+
     for args in [
         ["devices", "pair"].as_slice(),
         ["devices", "add"].as_slice(),
         ["devices", "revoke"].as_slice(),
+        ["devices", "allow-sessions"].as_slice(),
         ["devices", "revoke", "phone", "--control"].as_slice(),
         ["devices", "pair", "phone", "extra"].as_slice(),
         ["devices", "--json", "pair", "phone"].as_slice(),
         ["devices", "pair", "phone", "--json"].as_slice(),
         ["devices", "list"].as_slice(),
+        ["devices", "pair", "phone", "--sessions"].as_slice(),
+        ["devices", "add", "tray", "--sessions"].as_slice(),
     ] {
         assert_eq!(parse_exit_code(args), 2, "{args:?} must be a usage error");
     }

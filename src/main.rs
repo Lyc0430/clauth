@@ -352,13 +352,20 @@ fn write_openapi_document<W: std::io::Write>(writer: &mut W) -> Result<()> {
 fn cmd_devices(json: bool, cmd: Option<cli::DevicesCommand>) -> Result<()> {
     match cmd {
         None => daemon::api::devices::run_list(json),
-        Some(cli::DevicesCommand::Pair { name, control }) => {
-            daemon::api::pairing::run_pair(&name, control)
-        }
-        Some(cli::DevicesCommand::Add { name, control }) => {
-            daemon::api::devices::run_add(&name, control)
-        }
+        Some(cli::DevicesCommand::Pair {
+            name,
+            control,
+            sessions,
+        }) => daemon::api::pairing::run_pair(&name, control, sessions),
+        Some(cli::DevicesCommand::Add {
+            name,
+            control,
+            sessions,
+        }) => daemon::api::devices::run_add(&name, control, sessions),
         Some(cli::DevicesCommand::Revoke { name }) => daemon::api::devices::run_revoke(&name),
+        Some(cli::DevicesCommand::AllowSessions { name }) => {
+            daemon::api::devices::run_allow_sessions(&name)
+        }
     }
 }
 

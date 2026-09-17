@@ -113,6 +113,10 @@ struct PairingFile {
     /// The device name the code mints.
     name: String,
     tier: Tier,
+    /// Whether the device the code mints may mint a session. A code written by
+    /// a build before the field existed reads `false`.
+    #[serde(default)]
+    sessions: bool,
     /// SHA-256 of the canonical code, lowercase hex.
     digest: String,
     /// ISO-8601, from which on the code redeems nothing.
@@ -177,13 +181,13 @@ impl Pending {
 
 /// Mint a code for `name`, replacing whatever code was live. Refused while a
 /// device already holds the name, so a redeemed code always adds a device.
-pub(crate) fn begin(name: &DeviceName, tier: Tier) -> Result<Pending> {
-    begin_at(name, tier, now_epoch_secs())
+pub(crate) fn begin(name: &DeviceName, tier: Tier, sessions: bool) -> Result<Pending> {
+    begin_at(name, tier, sessions, now_epoch_secs())
 }
 
 /// [`begin`] at an explicit instant, so a test can mint a code that is already
 /// past its expiry.
-pub(crate) fn begin_at(name: &DeviceName, tier: Tier, now: i64) -> Result<Pending> {
+pub(crate) fn begin_at(name: &DeviceName, tier: Tier, sessions: bool, now: i64) -> Result<Pending> {
     with_state_lock(|_| {
         devices::refuse_taken(&devices::read_store()?, name)?;
         let code = Code::generate()?;
@@ -192,6 +196,7 @@ pub(crate) fn begin_at(name: &DeviceName, tier: Tier, now: i64) -> Result<Pendin
             schema: SCHEMA,
             name: name.as_str().to_string(),
             tier,
+            sessions,
             digest: hex::encode(code.digest()),
             expires_at: epoch_secs_to_iso(expires_at),
             attempts_left: CODE_ATTEMPTS,
@@ -278,7 +283,7 @@ pub(crate) fn redeem_at(code: &Code, now: i64) -> Result<Redeemed> {
             }
             return Ok(Redeemed::Refused);
         }
-        let token = devices::append_paired(held, &live.name, live.tier.clone())?;
+        let token = devices::append_paired(held, &live.name, live.tier.clone(), live.sessions)?;
         discard(&path)?;
         match token {
             Some(token) => Ok(Redeemed::Paired {
@@ -394,15 +399,15 @@ pub(crate) fn wait_for(
     }
 }
 
-/// `clauth devices pair <name> [--control]`: the code alone on stdout, the wait
-/// on stderr.
-pub(crate) fn run_pair(name: &str, control: bool) -> Result<()> {
+/// `clauth devices pair <name> [--control] [--sessions]`: the code alone on
+/// stdout, the wait on stderr.
+pub(crate) fn run_pair(name: &str, control: bool, sessions: bool) -> Result<()> {
     let name = DeviceName::parse(name)?;
     let tier = Tier::chosen(control);
     // Installed before the code exists, so no signal lands between minting it
     // and being able to withdraw it.
     let interrupt = Interrupt::install()?;
-    let pending = begin(&name, tier.clone())?;
+    let pending = begin(&name, tier.clone(), sessions)?;
     let lost = match write_chunk_result(
         &mut std::io::stdout().lock(),
         format_args!("{}", pending.code()),
@@ -424,6 +429,12 @@ pub(crate) fn run_pair(name: &str, control: bool) -> Result<()> {
         errln!(
             "clauth: until it is used the code is a control credential: whoever enters it first \
              can switch this host's accounts"
+        );
+    }
+    if sessions {
+        errln!(
+            "clauth: until it is used the code also grants sessions: whoever enters it first \
+             can mint them through the API"
         );
     }
     if matches!(crate::daemon::singleton_held(), Ok(false)) {

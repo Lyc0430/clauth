@@ -1,9 +1,9 @@
 //! Paired devices: who may call `clauth daemon --listen`, and at which tier.
 //!
-//! `~/.clauth/devices.json` holds one row per device: its name, its tier, how
-//! it joined, and the SHA-256 of its bearer token. Never the token itself,
-//! which exists on the device and in the one response that mints it, so a read
-//! of the store yields nothing a client could present.
+//! `~/.clauth/devices.json` holds one row per device: its name, its tier, its
+//! sessions grant, how it joined, and the SHA-256 of its bearer token. Never
+//! the token itself, which exists on the device and in the one response that
+//! mints it, so a read of the store yields nothing a client could present.
 //!
 //! Every request re-reads the store, so a revoke or a new device reaches a
 //! running daemon at once. Every write runs under the state flock, through the
@@ -142,6 +142,11 @@ pub(crate) struct Device {
     /// ISO-8601, when the device joined.
     pub(crate) paired_at: String,
     pub(crate) joined: Joined,
+    /// The trusted-machine grant that lets this control device create sessions
+    /// through the API once `[serve] session_creation` is on. A store written
+    /// before the field existed loads `false`.
+    #[serde(default)]
+    pub(crate) sessions: bool,
     /// Fields a newer clauth added, kept through this build's rewrites.
     #[serde(flatten)]
     extra: serde_json::Map<String, serde_json::Value>,
@@ -156,18 +161,20 @@ impl std::fmt::Debug for Device {
             .field("tier", &self.tier)
             .field("paired_at", &self.paired_at)
             .field("joined", &self.joined)
+            .field("sessions", &self.sessions)
             .finish_non_exhaustive()
     }
 }
 
 impl Device {
-    fn minted(name: &str, tier: Tier, token: &str, joined: Joined) -> Self {
+    fn minted(name: &str, tier: Tier, sessions: bool, token: &str, joined: Joined) -> Self {
         Self {
             name: name.to_string(),
             tier,
             digest: digest_hex(token),
             paired_at: epoch_secs_to_iso(now_epoch_secs()),
             joined,
+            sessions,
             extra: serde_json::Map::new(),
         }
     }
@@ -209,12 +216,19 @@ impl Store {
         }
     }
 
-    /// The device holding `name`. Names are unique case-insensitively, so the
-    /// lookup folds case the same way.
-    pub(super) fn named(&self, name: &str) -> Option<&Device> {
+    /// The index of the device holding `name`. Names are unique
+    /// case-insensitively, so the lookup folds case and trims the same way, and
+    /// a padded argv still resolves.
+    fn index_named(&self, name: &str) -> Option<usize> {
+        let name = name.trim();
         self.devices
             .iter()
-            .find(|device| device.name.eq_ignore_ascii_case(name))
+            .position(|device| device.name.eq_ignore_ascii_case(name))
+    }
+
+    /// The device holding `name`.
+    pub(super) fn named(&self, name: &str) -> Option<&Device> {
+        self.index_named(name).map(|index| &self.devices[index])
     }
 }
 
@@ -334,7 +348,7 @@ pub(crate) fn seed_for_tests(name: &str, tier: Tier, token: &str) -> Result<()> 
         let mut store = read_store()?;
         store
             .devices
-            .push(Device::minted(name, tier, token, Joined::Add));
+            .push(Device::minted(name, tier, false, token, Joined::Add));
         write_store(held, &store)
     })
 }
@@ -379,15 +393,19 @@ pub(super) fn refuse_taken(store: &Store, name: &DeviceName) -> Result<()> {
 
 /// Mint a token for `name` on this machine and store its digest. The token is
 /// returned to be shown once; nothing can print it again.
-pub(crate) fn add(name: &DeviceName, tier: Tier) -> Result<String> {
+pub(crate) fn add(name: &DeviceName, tier: Tier, sessions: bool) -> Result<String> {
     with_state_lock(|held| {
         let mut store = read_store()?;
         refuse_taken(&store, name)?;
         super::pairing::refuse_pending(name)?;
         let token = generate()?;
-        store
-            .devices
-            .push(Device::minted(name.as_str(), tier, &token, Joined::Add));
+        store.devices.push(Device::minted(
+            name.as_str(),
+            tier,
+            sessions,
+            &token,
+            Joined::Add,
+        ));
         write_store(held, &store)?;
         Ok(token)
     })
@@ -399,6 +417,7 @@ pub(super) fn append_paired(
     held: &StateLockHeld,
     name: &str,
     tier: Tier,
+    sessions: bool,
 ) -> Result<Option<String>> {
     let mut store = read_store()?;
     if store.named(name).is_some() {
@@ -407,25 +426,52 @@ pub(super) fn append_paired(
     let token = generate()?;
     store
         .devices
-        .push(Device::minted(name, tier, &token, Joined::Pair));
+        .push(Device::minted(name, tier, sessions, &token, Joined::Pair));
     write_store(held, &store)?;
     Ok(Some(token))
+}
+
+/// The fixed sentence both name-lookup verbs use for a name the store does not
+/// hold, so the two cannot drift apart.
+fn missing_device(name: &str) -> anyhow::Error {
+    anyhow::anyhow!("no device named '{name}'; `clauth devices` lists the paired ones")
 }
 
 /// Remove the device named `name`; its next request finds no row to verify.
 pub(crate) fn revoke(name: &str) -> Result<Device> {
     with_state_lock(|held| {
         let mut store = read_store()?;
-        let Some(index) = store
-            .devices
-            .iter()
-            .position(|device| device.name.eq_ignore_ascii_case(name.trim()))
-        else {
-            bail!("no device named '{name}'; `clauth devices` lists the paired ones");
+        let Some(index) = store.index_named(name) else {
+            return Err(missing_device(name));
         };
         let removed = store.devices.remove(index);
         write_store(held, &store)?;
         Ok(removed)
+    })
+}
+
+/// Grant the sessions flag to the control device named `name`. Returns the
+/// device's canonical name and whether the grant was new (`false` = it already
+/// held the flag, so the runner can say the no-op).
+pub(crate) fn allow_sessions(name: &str) -> Result<(String, bool)> {
+    with_state_lock(|held| {
+        let mut store = read_store()?;
+        let Some(index) = store.index_named(name) else {
+            return Err(missing_device(name));
+        };
+        let canonical = store.devices[index].name.clone();
+        if store.devices[index].tier != Tier::Control {
+            bail!(
+                "a device without the control tier cannot mint sessions; revoke '{canonical}' \
+                 and re-pair it with --control"
+            );
+        }
+        if store.devices[index].sessions {
+            return Ok((canonical, false));
+        }
+        store.devices[index].sessions = true;
+        write_store(held, &store)?;
+        Ok((canonical, true))
     })
 }
 
@@ -497,15 +543,11 @@ pub(crate) fn import_legacy() -> Result<()> {
             }
         };
         let digest = digest_hex(&legacy.token);
-        let imported = match store
-            .devices
-            .iter_mut()
-            .find(|device| device.name.eq_ignore_ascii_case(LEGACY_NAME))
-        {
-            Some(device) if device.digest == digest => "already held its token",
-            Some(device) => {
-                device.digest = digest.clone();
-                device.paired_at = legacy.created_at;
+        let imported = match store.index_named(LEGACY_NAME) {
+            Some(index) if store.devices[index].digest == digest => "already held its token",
+            Some(index) => {
+                store.devices[index].digest = digest.clone();
+                store.devices[index].paired_at = legacy.created_at;
                 store.legacy_digest = Some(digest);
                 write_store(held, &store)?;
                 "now holds the token a downgraded clauth minted"
@@ -523,6 +565,7 @@ pub(crate) fn import_legacy() -> Result<()> {
                     digest: digest.clone(),
                     paired_at: legacy.created_at,
                     joined: Joined::Legacy,
+                    sessions: false,
                     extra: serde_json::Map::new(),
                 });
                 store.legacy_digest = Some(digest);
@@ -580,6 +623,7 @@ fn list_json(devices: &[Device]) -> String {
                 "tier": device.tier.as_str(),
                 "paired_at": device.paired_at,
                 "joined": device.joined.as_str(),
+                "sessions": device.sessions,
             })
         })
         .collect();
@@ -604,17 +648,19 @@ fn render_table(devices: &[Device], now: i64) -> String {
     let w_name = width("NAME", &mut devices.iter().map(|d| d.name.as_str()));
     let w_tier = width("TIER", &mut devices.iter().map(|d| d.tier.as_str()));
     let w_paired = width("PAIRED AT", &mut paired.iter().map(String::as_str));
+    let w_joined = width("JOINED", &mut devices.iter().map(|d| d.joined.as_str()));
     let mut out = format!(
-        "{:<w_name$}  {:<w_tier$}  {:<w_paired$}  JOINED\n",
-        "NAME", "TIER", "PAIRED AT"
+        "{:<w_name$}  {:<w_tier$}  {:<w_paired$}  {:<w_joined$}  SESSIONS\n",
+        "NAME", "TIER", "PAIRED AT", "JOINED"
     );
     for (device, paired) in devices.iter().zip(&paired) {
         out.push_str(&format!(
-            "{:<w_name$}  {:<w_tier$}  {:<w_paired$}  {}\n",
+            "{:<w_name$}  {:<w_tier$}  {:<w_paired$}  {:<w_joined$}  {}\n",
             device.name,
             device.tier.as_str(),
             paired,
             device.joined.as_str(),
+            if device.sessions { "yes" } else { "no" },
         ));
     }
     out
@@ -638,12 +684,12 @@ fn paired_cell(iso: &str, now: i64) -> String {
     }
 }
 
-/// `clauth devices add <name> [--control]`: the token alone on stdout, so a
-/// `$(...)` capture holds exactly it, and everything else on stderr.
-pub(crate) fn run_add(name: &str, control: bool) -> Result<()> {
+/// `clauth devices add <name> [--control] [--sessions]`: the token alone on
+/// stdout, so a `$(...)` capture holds exactly it, and everything else on stderr.
+pub(crate) fn run_add(name: &str, control: bool, sessions: bool) -> Result<()> {
     let name = DeviceName::parse(name)?;
     let tier = Tier::chosen(control);
-    let token = add(&name, tier.clone())?;
+    let token = add(&name, tier.clone(), sessions)?;
     let lost =
         match write_chunk_result(&mut std::io::stdout().lock(), format_args!("{token}"), true) {
             Ok(Wrote::Yes) => None,
@@ -657,6 +703,9 @@ pub(crate) fn run_add(name: &str, control: bool) -> Result<()> {
         "clauth: added device '{name}' ({tier}). That token is its only copy: clauth keeps just \
          a SHA-256 of it and cannot show it again."
     );
+    if sessions {
+        errln!("clauth: '{name}' may mint sessions");
+    }
     Ok(())
 }
 
@@ -695,6 +744,17 @@ pub(crate) fn run_revoke(name: &str) -> Result<()> {
         "clauth: revoked device '{}'; its next request is refused.",
         removed.name
     );
+    Ok(())
+}
+
+/// `clauth devices allow-sessions <name>`.
+pub(crate) fn run_allow_sessions(name: &str) -> Result<()> {
+    let (name, granted) = allow_sessions(name)?;
+    if granted {
+        outln!("clauth: '{name}' may now mint sessions");
+    } else {
+        outln!("clauth: '{name}' already may mint sessions");
+    }
     Ok(())
 }
 

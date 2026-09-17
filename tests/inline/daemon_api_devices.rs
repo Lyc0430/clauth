@@ -134,7 +134,7 @@ fn a_token_authenticates_only_as_itself() {
 #[test]
 fn the_store_holds_a_digest_and_never_the_token() {
     let _home = HomeSandbox::new();
-    let token = add(&name("tray"), Tier::View).expect("add");
+    let token = add(&name("tray"), Tier::View, false).expect("add");
     let body = std::fs::read_to_string(store_path().expect("path")).expect("read the store");
     assert!(
         !body.contains(&token),
@@ -148,7 +148,7 @@ fn the_store_holds_a_digest_and_never_the_token() {
 
 #[test]
 fn a_device_rows_debug_never_renders_its_digest() {
-    let device = Device::minted("tray", Tier::View, TOKEN, Joined::Add);
+    let device = Device::minted("tray", Tier::View, false, TOKEN, Joined::Add);
     let rendered = format!("{device:?}");
     assert!(!rendered.contains(&digest_hex(TOKEN)), "{rendered}");
     assert!(!rendered.contains(TOKEN), "{rendered}");
@@ -161,7 +161,7 @@ fn a_device_rows_debug_never_renders_its_digest() {
 #[test]
 fn the_store_and_its_dir_are_owner_only() {
     let _home = HomeSandbox::new();
-    add(&name("tray"), Tier::View).expect("add");
+    add(&name("tray"), Tier::View, false).expect("add");
     let dir = clauth_dir().expect("dir");
     assert!(
         store_path().expect("path").is_file(),
@@ -200,8 +200,8 @@ fn the_legacy_name_is_reserved_in_any_case() {
 #[test]
 fn add_refuses_a_taken_name_in_any_case() {
     let _home = HomeSandbox::new();
-    add(&name("Phone"), Tier::View).expect("first add");
-    let err = add(&name("phone"), Tier::Control).expect_err("the name is taken");
+    add(&name("Phone"), Tier::View, false).expect("first add");
+    let err = add(&name("phone"), Tier::Control, false).expect_err("the name is taken");
     assert_eq!(
         err.to_string(),
         "a device named 'Phone' already exists; revoke it first: clauth devices revoke Phone"
@@ -242,7 +242,7 @@ fn revoking_an_unknown_name_names_it() {
 #[test]
 fn a_lost_token_line_with_a_failed_revoke_names_the_remove_command() {
     let _home = HomeSandbox::new();
-    add(&name("tray"), Tier::View).expect("mint the device");
+    add(&name("tray"), Tier::View, false).expect("mint the device");
     fail_next_write();
     let err = revoke_lost(&name("tray"), None).expect_err("the revoke write fails");
     assert_eq!(
@@ -260,7 +260,7 @@ fn a_lost_token_line_with_a_failed_revoke_names_the_remove_command() {
 #[test]
 fn a_lost_token_line_with_a_write_error_and_a_failed_revoke_pins_its_sentence() {
     let _home = HomeSandbox::new();
-    add(&name("tray"), Tier::View).expect("mint the device");
+    add(&name("tray"), Tier::View, false).expect("mint the device");
     fail_next_write();
     let write_err = std::io::Error::other("full disk");
     let err = revoke_lost(&name("tray"), Some(write_err)).expect_err("the revoke write fails");
@@ -276,7 +276,7 @@ fn a_lost_token_line_with_a_write_error_and_a_failed_revoke_pins_its_sentence() 
 #[test]
 fn a_lost_token_line_with_a_removed_device_pins_its_sentence() {
     let _home = HomeSandbox::new();
-    add(&name("tray"), Tier::View).expect("mint the device");
+    add(&name("tray"), Tier::View, false).expect("mint the device");
     let err = revoke_lost(&name("tray"), None).expect_err("the revoke removes the device");
     assert_eq!(
         err.to_string(),
@@ -289,7 +289,7 @@ fn a_lost_token_line_with_a_removed_device_pins_its_sentence() {
 #[test]
 fn a_lost_token_line_with_a_write_error_pins_the_cause_and_removal() {
     let _home = HomeSandbox::new();
-    add(&name("tray"), Tier::View).expect("mint the device");
+    add(&name("tray"), Tier::View, false).expect("mint the device");
     let write_err = std::io::Error::other("full disk");
     let err =
         revoke_lost(&name("tray"), Some(write_err)).expect_err("the revoke removes the device");
@@ -312,7 +312,7 @@ fn an_unreadable_store_refuses_and_is_never_rewritten() {
     std::fs::write(&path, b"{ not json").expect("damage the store");
 
     assert!(authenticate(Some(TOKEN)).is_err());
-    assert!(add(&name("tray"), Tier::View).is_err());
+    assert!(add(&name("tray"), Tier::View, false).is_err());
     assert!(revoke("tray").is_err());
     assert_eq!(
         std::fs::read(&path).expect("read"),
@@ -343,7 +343,7 @@ fn what_a_newer_build_wrote_survives_a_rewrite() {
     });
     std::fs::write(&path, newer.to_string()).expect("seed");
 
-    add(&name("tray"), Tier::View).expect("add");
+    add(&name("tray"), Tier::View, false).expect("add");
 
     let back: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("json");
@@ -399,6 +399,10 @@ fn the_legacy_token_becomes_the_legacy_control_device() {
     assert!(
         !legacy_path().expect("path").exists(),
         "the plaintext token must not outlive the import"
+    );
+    assert!(
+        !device.sessions,
+        "the import never grants sessions: the grant's whole surface is the CLI verbs"
     );
     assert_eq!(logged, vec![IMPORTED]);
 }
@@ -593,6 +597,7 @@ fn the_json_list_is_a_fixed_field_set_with_no_digest() {
             "tier": "control",
             "paired_at": devices[0].paired_at,
             "joined": "add",
+            "sessions": false,
         }])
     );
 }
@@ -601,7 +606,7 @@ fn the_json_list_is_a_fixed_field_set_with_no_digest() {
 fn the_table_pairs_the_local_stamp_with_its_age() {
     let device = Device {
         paired_at: "2026-01-02T03:04:05+00:00".to_string(),
-        ..Device::minted("phone", Tier::View, TOKEN, Joined::Pair)
+        ..Device::minted("phone", Tier::View, false, TOKEN, Joined::Pair)
     };
     let epoch = iso_to_epoch_secs(&device.paired_at).expect("parse");
     let stamp = crate::format::local_stamp(epoch).expect("stamp");
@@ -610,10 +615,11 @@ fn the_table_pairs_the_local_stamp_with_its_age() {
     assert_eq!(
         table,
         format!(
-            "{:<5}  {:<4}  {:<width$}  JOINED\nphone  view  {cell}  pair\n",
+            "{:<5}  {:<4}  {:<width$}  {:<6}  SESSIONS\nphone  view  {cell}  pair    no\n",
             "NAME",
             "TIER",
             "PAIRED AT",
+            "JOINED",
             width = cell.chars().count()
         )
     );
@@ -730,4 +736,200 @@ fn a_revoked_token_a_downgrade_handed_legacy_is_not_imported_again() {
         "the revoked plaintext is deleted"
     );
     assert_eq!(logged, vec![REVOKED]);
+}
+
+// ── sessions grant ─────────────────────────────────────────────────────────
+
+/// A row written before the sessions field existed loads with the grant off,
+/// and the next rewrite writes the field typed — never swallowed into the
+/// row's carried-extra map.
+#[test]
+fn a_pre_sessions_row_loads_false_and_reserializes_the_field() {
+    let _home = HomeSandbox::new();
+    let path = store_path().expect("path");
+    crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
+    let older = serde_json::json!({
+        "schema": 1,
+        "devices": [{
+            "name": "wall",
+            "tier": "control",
+            "digest": digest_hex(TOKEN),
+            "paired_at": "2026-01-02T03:04:05+00:00",
+            "joined": "add",
+        }],
+    });
+    std::fs::write(&path, older.to_string()).expect("seed");
+
+    let device = authenticate(Some(TOKEN))
+        .expect("read")
+        .expect("the row still verifies");
+    assert!(!device.sessions, "a pre-field row loads with the grant off");
+    assert!(
+        !device.extra.contains_key("sessions"),
+        "the flatten map must not swallow the typed field"
+    );
+
+    add(&name("tray"), Tier::View, false).expect("add");
+
+    let back: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("json");
+    assert_eq!(
+        back["devices"][0]["sessions"],
+        serde_json::json!(false),
+        "the rewrite writes the field, typed"
+    );
+}
+
+#[test]
+fn add_with_sessions_persists_the_grant() {
+    let _home = HomeSandbox::new();
+    add(&name("tray"), Tier::Control, true).expect("add");
+    let store = read_store().expect("read");
+    assert_eq!(
+        (
+            store.devices[0].name.as_str(),
+            store.devices[0].tier.as_str(),
+            store.devices[0].sessions,
+        ),
+        ("tray", "control", true)
+    );
+}
+
+#[test]
+fn run_add_with_sessions_persists_the_grant() {
+    let _home = HomeSandbox::new();
+    run_add("tray", true, true).expect("run add");
+    let store = read_store().expect("read");
+    assert_eq!(
+        (store.devices[0].name.as_str(), store.devices[0].sessions),
+        ("tray", true)
+    );
+}
+
+#[test]
+fn allow_sessions_grants_a_control_device_and_persists() {
+    let _home = HomeSandbox::new();
+    seed("tray", Tier::Control, TOKEN);
+    let (name, granted) = allow_sessions("tray").expect("grant");
+    assert_eq!((name.as_str(), granted), ("tray", true));
+    let store = read_store().expect("read");
+    assert!(store.devices[0].sessions, "the grant persists");
+    let rows: serde_json::Value = serde_json::from_str(&list_json(&store.devices)).expect("json");
+    assert_eq!(rows[0]["sessions"], serde_json::json!(true));
+}
+
+#[test]
+fn allow_sessions_refuses_a_view_device() {
+    let _home = HomeSandbox::new();
+    seed("tray", Tier::View, TOKEN);
+    let err = allow_sessions("tray").expect_err("a view device cannot mint sessions");
+    assert_eq!(
+        err.to_string(),
+        "a device without the control tier cannot mint sessions; revoke 'tray' and re-pair it \
+         with --control"
+    );
+}
+
+/// A row a newer clauth paired carries a tier this build does not know; the
+/// refusal names the control tier, not "view", so it holds for both.
+#[test]
+fn allow_sessions_refuses_a_device_of_an_unknown_tier() {
+    let _home = HomeSandbox::new();
+    let path = store_path().expect("path");
+    crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
+    let store = serde_json::json!({
+        "schema": 1,
+        "devices": [{
+            "name": "future",
+            "tier": "admin",
+            "digest": digest_hex(TOKEN),
+            "paired_at": "2026-01-02T03:04:05+00:00",
+            "joined": "pair",
+        }],
+    });
+    std::fs::write(&path, store.to_string()).expect("seed");
+
+    let err = allow_sessions("future").expect_err("an unknown tier cannot mint sessions");
+    assert_eq!(
+        err.to_string(),
+        "a device without the control tier cannot mint sessions; revoke 'future' and re-pair it \
+         with --control"
+    );
+}
+
+/// The two verbs share one missing-name sentence, byte for byte, and both find
+/// a name whose argv is padded — the `trim()` and the sentence are one path.
+#[test]
+fn revoke_and_allow_sessions_share_the_missing_name_sentence_and_trim() {
+    let _home = HomeSandbox::new();
+    seed("tray", Tier::Control, TOKEN);
+
+    let from_revoke = revoke(" ghost ")
+        .expect_err("no device holds that name")
+        .to_string();
+    let from_allow = allow_sessions(" ghost ")
+        .expect_err("no device holds that name")
+        .to_string();
+    assert_eq!(
+        from_revoke, from_allow,
+        "both verbs share the missing-name sentence"
+    );
+    assert_eq!(
+        from_revoke,
+        "no device named ' ghost '; `clauth devices` lists the paired ones"
+    );
+
+    // A padded, case-folded name resolves on both verbs.
+    let (name, granted) = allow_sessions(" TRAY ").expect("padded grant");
+    assert_eq!((name.as_str(), granted), ("tray", true));
+}
+
+/// The already-granted arm is a no-op: no rewrite, so a write failure cannot
+/// turn the no-op's exit 0 into an exit 1. `fail_next_write` is the
+/// platform-free probe: armed before the call, still armed after it.
+#[test]
+fn allow_sessions_on_a_granted_device_is_a_no_op() {
+    let _home = HomeSandbox::new();
+    seed("tray", Tier::Control, TOKEN);
+    let (_, granted) = allow_sessions("tray").expect("grant");
+    assert!(granted);
+    let path = store_path().expect("path");
+    let before = std::fs::read(&path).expect("read");
+    fail_next_write();
+    let (name, granted) = allow_sessions("TRAY").expect("second grant");
+    assert_eq!((name.as_str(), granted), ("tray", false));
+    let after = std::fs::read(&path).expect("read");
+    assert_eq!(before, after, "the no-op must not rewrite the store");
+    assert!(
+        FAIL_NEXT_WRITE.swap(false, std::sync::atomic::Ordering::AcqRel),
+        "the no-op must not call write_store"
+    );
+}
+
+#[test]
+fn the_table_lists_sessions_yes_or_no() {
+    let mut granted = Device::minted("tray", Tier::Control, true, TOKEN, Joined::Add);
+    let mut ungranted_control = Device::minted("phone", Tier::Control, false, OTHER, Joined::Pair);
+    let mut ungranted_view = Device::minted("wall", Tier::View, false, TOKEN, Joined::Add);
+    let iso = "2026-01-02T03:04:05+00:00";
+    granted.paired_at = iso.to_string();
+    ungranted_control.paired_at = iso.to_string();
+    ungranted_view.paired_at = iso.to_string();
+    let now = iso_to_epoch_secs(iso).expect("parse") + 3 * 3600 + 300;
+    let cell = paired_cell(iso, now);
+    let table = render_table(&[granted, ungranted_control, ungranted_view], now);
+    assert_eq!(
+        table,
+        format!(
+            "{:<5}  {:<7}  {:<width$}  {:<6}  SESSIONS\n\
+             tray   control  {cell}  add     yes\n\
+             phone  control  {cell}  pair    no\n\
+             wall   view     {cell}  add     no\n",
+            "NAME",
+            "TIER",
+            "PAIRED AT",
+            "JOINED",
+            width = cell.chars().count()
+        )
+    );
 }

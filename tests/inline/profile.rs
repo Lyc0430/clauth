@@ -3355,3 +3355,101 @@ fn routing_endpoint_reads_env_first_and_a_blank_entry_is_no_override() {
         "a blank entry is no override"
     );
 }
+
+// ── [serve] ────────────────────────────────────────────────────────────────
+
+/// `[serve]` round-trips like `[herdr]`: a set key loads, a default state
+/// serializes no `[serve]` block, and a partial table fills from the default.
+#[test]
+fn a_serve_table_round_trips() {
+    let _home = HomeSandbox::new();
+    let path = app_state_path().expect("app_state_path");
+    crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&path, "profiles = []\n\n[serve]\nsession_creation = true\n")
+        .expect("write profiles.toml");
+
+    let loaded = load_app_state().expect("load");
+    assert!(loaded.serve.session_creation, "the [serve] key loads");
+
+    save_app_state(&AppState::default()).expect("save default");
+    let raw = std::fs::read_to_string(&path).expect("read");
+    assert!(
+        !raw.contains("[serve]"),
+        "a default [serve] is omitted:\n{raw}"
+    );
+
+    std::fs::write(&path, "profiles = []\n\n[serve]\n").expect("partial table");
+    let partial = load_app_state().expect("load partial");
+    assert!(
+        !partial.serve.session_creation,
+        "a missing key fills from the default"
+    );
+}
+
+/// A key inside `[serve]` that `ServeSettings` does not model is dropped on the
+/// next save WHILE the table renders (its modelled key is non-default), the
+/// same as a stray `[herdr]` key: the table is a closed struct, not a carried
+/// map. The default-table case carries the whole table — see the sibling test.
+#[test]
+fn a_stray_serve_key_is_dropped_while_the_table_renders_non_default() {
+    let _home = HomeSandbox::new();
+    let path = app_state_path().expect("app_state_path");
+    crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(
+        &path,
+        "profiles = []\n\n[serve]\nsession_creation = true\nstray = \"gone\"\n",
+    )
+    .expect("write");
+
+    let state = load_app_state().expect("load");
+    assert!(state.serve.session_creation, "the modelled key loads");
+    save_app_state(&state).expect("save");
+
+    let after = std::fs::read_to_string(&path).expect("read");
+    assert!(
+        !after.contains("stray"),
+        "the stray key is dropped:\n{after}"
+    );
+    assert!(
+        after.contains("session_creation = true"),
+        "the modelled key survives:\n{after}"
+    );
+}
+
+/// At its default on disk the whole `[serve]` table is itself unmodelled (the
+/// round-trip render omits it), so the carry keeps the table, stray included.
+#[test]
+fn a_default_serve_table_carries_a_stray_key() {
+    let _home = HomeSandbox::new();
+    let path = app_state_path().expect("app_state_path");
+    crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&path, "profiles = []\n\n[serve]\nstray = \"gone\"\n").expect("write");
+
+    let state = load_app_state().expect("load");
+    assert!(
+        !state.serve.session_creation,
+        "the table loads at its default"
+    );
+    save_app_state(&state).expect("save");
+
+    let after = std::fs::read_to_string(&path).expect("read");
+    let parsed: toml::Table = after.parse().expect("whole file parses as TOML");
+    assert_eq!(
+        parsed.get("serve").and_then(|serve| serve.get("stray")),
+        Some(&toml::Value::String("gone".into())),
+        "the carried key stays inside the [serve] table:\n{after}"
+    );
+    assert!(
+        parsed.get("stray").is_none(),
+        "the carried key must not be hoisted to the top level:\n{after}"
+    );
+    assert!(
+        after.contains(PRESERVED_KEYS_MARKER),
+        "the carry sits under the preserved-keys marker:\n{after}"
+    );
+    let marker = after.find(PRESERVED_KEYS_MARKER).expect("marker present");
+    assert!(
+        after[marker..].contains("[serve]"),
+        "the carried [serve] table lands after the marker:\n{after}"
+    );
+}

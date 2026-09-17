@@ -317,12 +317,14 @@ pub(crate) enum Command {
         dump_openapi: bool,
     },
 
-    /// Pair, list, and revoke the devices that may call the REST API
+    /// Pair, list, grant sessions to, and revoke the devices that may call the
+    /// REST API
     ///
     /// Every `clauth daemon --listen` request but a pairing authenticates as
     /// one named device, and each device holds a tier fixed here, on this
     /// machine: `view` reads the status feed, `control` may also switch
-    /// accounts.
+    /// accounts and, with the `sessions` grant, create sessions through the API
+    /// while `[serve] session_creation` is on.
     /// Bare, it lists the devices. No token is ever printed back: clauth keeps
     /// only a SHA-256 of each.
     #[command(args_conflicts_with_subcommands = true)]
@@ -638,7 +640,8 @@ pub(crate) enum HerdrConfigCommand {
     },
 }
 
-/// `clauth devices <cmd>`: the ways a device joins or leaves.
+/// `clauth devices <cmd>`: the ways a device joins, leaves, or gains the
+/// sessions grant.
 #[derive(Subcommand, Debug)]
 pub(crate) enum DevicesCommand {
     /// Print a one-time pairing code and wait until a device redeems it
@@ -656,6 +659,10 @@ pub(crate) enum DevicesCommand {
         /// read. Until the code is used, whoever enters it first gets control.
         #[arg(long)]
         control: bool,
+        /// Let the paired device mint sessions through the API. Requires
+        /// --control: a view device cannot mint sessions.
+        #[arg(long, requires = "control")]
+        sessions: bool,
     },
 
     /// Mint a token for a device on this machine and print it once
@@ -669,11 +676,22 @@ pub(crate) enum DevicesCommand {
         /// read.
         #[arg(long)]
         control: bool,
+        /// Let the added device mint sessions through the API. Requires
+        /// --control: a view device cannot mint sessions.
+        #[arg(long, requires = "control")]
+        sessions: bool,
     },
 
     /// Remove a device; its next request is refused
     Revoke {
         /// Device to remove.
+        name: String,
+    },
+
+    /// Grant a control device the sessions flag
+    AllowSessions {
+        /// Device to grant. Must be a control device; revoke and re-pair with
+        /// --control to change a view device.
         name: String,
     },
 }

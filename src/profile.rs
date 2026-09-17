@@ -703,6 +703,17 @@ impl Default for HerdrSettings {
     }
 }
 
+/// The daemon's session-creation knob, persisted under `[serve]` in
+/// profiles.toml. Like [`HerdrSettings`], the table may be absent (defaults) or
+/// partial: a missing field fills from [`Default`] rather than erroring.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct ServeSettings {
+    /// The daemon-wide switch: whether `POST /api/v1/sessions` is served at all
+    /// (default off). Each calling device also needs its own `sessions` grant.
+    pub(crate) session_creation: bool,
+}
+
 /// Stored at ~/.clauth/profiles.toml — ordering and active marker only.
 /// Credentials and endpoint config live in per-profile subdirectories.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -875,10 +886,19 @@ pub(crate) struct AppState {
     /// profiles.toml gains no `[herdr]` block on the next save.
     #[serde(default, skip_serializing_if = "herdr_is_default")]
     pub(crate) herdr: HerdrSettings,
+    /// The daemon's `[serve]` table. Omitted from the file while at its
+    /// default, so an untouched profiles.toml gains no `[serve]` block on the
+    /// next save.
+    #[serde(default, skip_serializing_if = "serve_is_default")]
+    pub(crate) serve: ServeSettings,
 }
 
 fn herdr_is_default(herdr: &HerdrSettings) -> bool {
     *herdr == HerdrSettings::default()
+}
+
+fn serve_is_default(serve: &ServeSettings) -> bool {
+    *serve == ServeSettings::default()
 }
 
 impl AppState {
@@ -1070,6 +1090,7 @@ impl Default for AppState {
             burn_switch_floor_pct: None,
             burn_horizon_cap_ms: None,
             herdr: HerdrSettings::default(),
+            serve: ServeSettings::default(),
         }
     }
 }
