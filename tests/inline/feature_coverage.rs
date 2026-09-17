@@ -168,6 +168,12 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
             "the_connection_cap_admits_up_to_the_limit",
             "a_content_length_that_is_not_bare_digits",
             "cert_source_is_explicit_only_when_both_files_are_named",
+            // the herdr panes, their terminal streams, the session history pages
+            // and the prompt/keys routes the bullet names since T20.
+            "the_fixture_panes_join_to_the_pinned_answer",
+            "a_frame_arrives_over_the_bridge",
+            "a_history_page_serves_the_records_verbatim_paged_backward",
+            "the_pane_id_is_the_path_segment_decoded_once",
             "a_missing_certificate_fails_in_prepare_not_after_the_claim",
             // rolling session token (#59): the daemon leg — the tick that
             // re-stamps the sidecar and the gate it goes through.

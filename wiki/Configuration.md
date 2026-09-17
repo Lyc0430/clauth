@@ -160,6 +160,8 @@ clauth keeps no file for the queue: it derives the last open from `usage_history
 | `[herdr] border_label` | bool | `false` | publish `--display-agent "$profile"` so split-pane borders name the account; off clears the stale label |
 | `[herdr] delegate_dot` | bool | `true` | report `clauth_delegate=working\|idle` pane metadata during delegate runs |
 | `[herdr] delegate_row_text` | bool | `false` | append `$clauth_delegate` to the sidebar row `install` writes |
+| `[serve]` | table | `{}` | the daemon-wide session-creation switch ([Daemon](Daemon)) |
+| `[serve] session_creation` | bool | `false` | whether `POST /api/v1/sessions` is served at all; each calling device also needs its own `sessions` grant (`clauth devices allow-sessions <name>`) |
 
 A key clauth does not know (written by a newer release, or added by hand) is kept verbatim across every rewrite, under a `# keys preserved from the previous file` marker. Nothing a newer version of clauth wrote into these files is lost by running an older one beside it.
 
@@ -210,7 +212,7 @@ A codex profile's own `config.toml` carries `harness = "codex"` and one optional
   ai_pricelog_v4_price_cache.json  # ai-pricelog model prices for the cost lens
   status_cache.json        # status.claude.com incident feed
   status.json              # the daemon's published snapshot (see Daemon)
-  devices.json             # devices paired with the REST API: name, tier, a SHA-256 of each token (0600)
+  devices.json             # devices paired with the REST API: name, tier, sessions grant, a SHA-256 of each token (0600)
   pairing.json             # the waiting pairing code's SHA-256 while `clauth devices pair` runs (0600)
   tls.json                 # REST API certificate directory, written on the first `--listen` start
   session_profiles.json    # which account each Claude Code session ran on

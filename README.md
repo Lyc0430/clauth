@@ -38,7 +38,7 @@ Most account tools do one half. clauth pairs instant **switching between multipl
 - 🤖 **Auto-switch** down a fallback chain the moment an account hits its limit, with weekly-window and spend-ceiling gates so a long run never stalls and never surprises you with a bill. Opted-in accounts queue their auto-start, opening 5h windows `5h / accounts` apart instead of all at once
 - 🧩 **Run in parallel**: several accounts at once in isolated config dirs, or a clean headless session with none of your global memory, plugins, or hooks
 - 🔌 **From inside Claude**: an MCP plugin lets a live session list, switch, or delegate a whole prompt (even headless) to another account, and tells a session when the account behind it changed
-- 🖥️ **Headless**: `clauth daemon` runs the refresh and auto-switch loop with no TUI and publishes `status.json` for a menu-bar app to read, or serves that feed and the account switch to another machine over HTTPS with `--listen`
+- 🖥️ **Headless**: `clauth daemon` runs the refresh and auto-switch loop with no TUI and publishes `status.json` for a menu-bar app to read, or serves that feed, the account switch, the herdr panes with their terminal streams, Claude Code session history, and prompts and key presses into a pane to another machine over HTTPS with `--listen`
 - 🔀 **Codex too**: adopt or mint a ChatGPT login as a codex profile, run `codex` under it in its own `CODEX_HOME`, and let a separate codex chain rotate accounts between sessions ([Codex](https://github.com/uwuclxdy/clauth/wiki/Codex))
 - 🛠️ **Quality-of-life**: browse and resume past sessions under any account, per-profile model routing, `start --auto` to pick the account by the models a session will run, shell completions, signed self-updates, multi-instance safe
 
