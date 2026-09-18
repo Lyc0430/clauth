@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Keep each live macOS Claude runtime authenticated with its rolling profile's current refresh-less bearer without overwriting a session-side login.
+**Goal:** Keep each live macOS Claude runtime authenticated with its rolling profile's current refresh-less bearer, with clauth as the sole account-switching authority for managed sessions.
 
 **Architecture:** The profile's `session-token.json` remains the source of truth. A focused reconciliation unit validates and updates a single namespaced Keychain item using a recorded installed-bearer fingerprint. Session start, fallback swap, and token re-stamp call that unit through a bounded per-session lock; the daemon runs multi-session reconciliation away from its watchdog-bounded tick. Per-session health is separate from profile auth health.
 
@@ -14,6 +14,7 @@
 
 - Do not modify the installed `/Users/landon/.local/bin/clauth` or live `~/.clauth` data during development.
 - Never distribute a refresh token to a rolling runtime, log a token, or overwrite an unrecognized non-empty Keychain login.
+- Set `DISABLE_LOGIN_COMMAND=1` and `DISABLE_LOGOUT_COMMAND=1` only on macOS rolling-token Claude children launched by clauth; do not change bare Claude, other platforms, or other profile types.
 - Never hold the global state flock across `/usr/bin/security` and never allow a Keychain stall to block the daemon's scheduler tick.
 - Preserve existing Linux/Windows, endpoint, static-token, and non-rolling paths.
 - A failed Claude turn or subagent is never automatically replayed.
@@ -66,7 +67,7 @@ assert!(item_refresh_token(&runtime)?.is_none());
 
 **Interfaces:** Consumes Tasks 1-2. Produces `reconcile_session(session_id: &str, expected_member: &str, new_bearer: &ClaudeCredentials) -> Result<RuntimeCredentialHealth>`; the function derives the existing runtime path and validates current membership under its session lock.
 
-- [ ] **Step 1: Write failing tests** for a rolling start with a proven stale item, an unproven pre-patch item, a foreign `/login`, and A→B swap racing with a B-side token change. Assert that a failed Keychain leg leaves an explicit degraded health verdict rather than `Ok`:
+- [ ] **Step 1: Write failing tests** for a rolling start with a proven stale item, an unproven pre-patch item, an out-of-band foreign login, A→B swap racing with a B-side token change, and managed-child-only `DISABLE_LOGIN_COMMAND=1` / `DISABLE_LOGOUT_COMMAND=1`. Assert that a failed Keychain leg leaves an explicit degraded health verdict rather than `Ok`:
 
 ```rust
 assert_eq!(row.current_member.as_deref(), Some("B"));
@@ -75,7 +76,7 @@ assert_ne!(row.installed_bearer_sha256, Some(sha256_hex("B-new")));
 ```
 
 - [ ] **Step 2: Run `cargo test runtime -- --nocapture`; verify the new tests fail.**
-- [ ] **Step 3: Replace rolling `SessionSeedArm::Skip` and `SwapItemArm::SignOut` call-site behavior with `reconcile_session`, preserving the existing non-rolling arms.** A pre-patch row with an unknown non-empty item is not silently adopted; report controlled restart/resume. Check the current member again after acquiring the session Keychain lock; a moved row is a retryable stale-enumeration result.
+- [ ] **Step 3: Replace rolling `SessionSeedArm::Skip` and `SwapItemArm::SignOut` call-site behavior with `reconcile_session`, preserving the existing non-rolling arms.** Set the two environment flags only on the rolling-token managed child spawn. A pre-patch row with an unknown non-empty item is not silently adopted; report the one-time controlled restart/resume. Check the current member again after acquiring the session Keychain lock; a moved row is a retryable stale-enumeration result.
 - [ ] **Step 4: Run runtime and Keychain tests, format, and commit.**
 
 ### Task 4: Off-tick re-stamp fan-out and health status

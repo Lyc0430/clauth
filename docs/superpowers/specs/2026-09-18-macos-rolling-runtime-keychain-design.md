@@ -10,13 +10,13 @@ The code currently makes a refresh-less sidecar a reason to skip a session-start
 
 ## Goal and scope
 
-Keep a live macOS `clauth start` session on the intended rolling profile as its bearer changes, without distributing a refresh token to Claude Code and without overwriting a genuine session-side `/login`. A failed reconciliation must be visible and actionable instead of allowing `auth_status: ok` to imply that every live runtime can authenticate.
+Keep a live macOS `clauth start` session on the intended rolling profile as its bearer changes, without distributing a refresh token to Claude Code. The managed Claude child must not perform its own account-switching commands: clauth sets `DISABLE_LOGIN_COMMAND=1` and `DISABLE_LOGOUT_COMMAND=1` for that child only. Operators reauthorize through `clauth login <profile>` outside the managed session. A failed reconciliation must be visible and actionable instead of allowing `auth_status: ok` to imply that every live runtime can authenticate.
 
-Scope is clauth's OAuth rolling-token path on macOS. No change to Linux/Windows, endpoint/API-key profiles, non-rolling OAuth profiles, billing choices, Claude Desktop, or transcript contents. This patch does not automatically replay a prompt or failed subagent: replaying side-effecting work is a separate workflow decision.
+Scope is clauth's OAuth rolling-token path on macOS. No change to Linux/Windows, endpoint/API-key profiles, non-rolling OAuth profiles, billing choices, Claude Desktop, or transcript contents. This patch does not automatically replay a prompt or failed subagent: replaying side-effecting work is a separate workflow decision. A one-time restart is required for pre-patch sessions to inherit the managed-session environment; subsequent bearer changes and fallback hops do not restart the Claude process.
 
 ## Approaches considered
 
-1. **Recommended: reconcile each live runtime Keychain item on rolling bearer changes.** Keep clauth's profile credential as the sole refresh-token owner. Install the current refresh-less bearer into each owned runtime item, preserving unrelated MCP logins. Serialize this with that runtime's swap/start Keychain operations, and refuse to overwrite a foreign login. This preserves hot switching if Claude Code re-reads the item on the next request.
+1. **Recommended: manage the account writer and reconcile each live runtime Keychain item on rolling bearer changes.** Keep clauth's profile credential as the sole refresh-token owner. Hide `/login` and `/logout` inside managed children, install the current refresh-less bearer into each owned runtime item, and preserve unrelated MCP logins. Serialize this with that runtime's swap/start Keychain operations. A non-clauth credential remains a divergence, not something to overwrite. This preserves hot switching if Claude Code re-reads the item on the next request.
 2. **Restart every Claude process on rotation.** Stronger against in-memory caching but interrupts tool calls and background agents roughly every token cycle. Useful as a recovery fallback, not the primary library behavior.
 3. **Rely on a static `claude setup-token`.** Avoids short access-token rotations but changes scopes and plan-gated behavior, requires another account-specific mint, and does not repair the rolling-token contract. Not the default fix.
 
@@ -24,9 +24,9 @@ Scope is clauth's OAuth rolling-token path on macOS. No change to Linux/Windows,
 
 For each live session, identify its existing runtime directory and namespaced Keychain service through clauth's own canonical-path derivation. `live_sessions` provides `current_member` and `launch_store`; the source of truth for a rolling member is its `session-token.json`. Persist a non-secret fingerprint of the last bearer clauth installed for that runtime. Never persist token bytes in the liveness record or logs.
 
-The per-runtime Keychain item may be absent, an empty account shell with MCP logins, equal to the previously installed bearer, equal to the newly current bearer, unreadable, corrupt, or contain another login. For a runtime created by this patch, the first four states are clauth-owned and eligible for reconciliation. An unrecognized non-empty login is treated as a possible intentional `/login`: leave it untouched and report divergence.
+The per-runtime Keychain item may be absent, an empty account shell with MCP logins, equal to the previously installed bearer, equal to the newly current bearer, unreadable, corrupt, or contain another login. For a runtime created by this patch, the first four states are clauth-owned and eligible for reconciliation. An unrecognized non-empty login is treated as an out-of-band write: leave it untouched and report divergence. The supported reauthorization path, `clauth login`, updates the profile store and sidecar rather than the child runtime item directly.
 
-Existing runtimes have no installed-bearer fingerprint. They cannot safely distinguish an old clauth bearer from an intentional session-side login if that bearer has already been revoked. Do not guess or overwrite them. Migrate such sessions by controlled termination and `--resume` into newly created runtime directories, preserving the transcript and never automatically resubmitting the last prompt. New runtime directory IDs must not reuse an old Keychain service while stale-runtime collection is pending.
+Existing runtimes have no installed-bearer fingerprint or disabled login commands. They cannot safely distinguish an old clauth bearer from an out-of-band login if that bearer has already been revoked. Do not guess or overwrite them. Migrate such sessions once by controlled termination and `--resume` into newly created runtime directories, preserving the transcript and never automatically resubmitting the last prompt. New runtime directory IDs must not reuse an old Keychain service while stale-runtime collection is pending.
 
 ## Transition and concurrency
 
@@ -34,7 +34,7 @@ On rolling sidecar re-stamp or refresh, capture the previous and new bearer iden
 
 The Keychain write must carry **only** the refresh-less session bearer, never the profile's refresh token. Preserve MCP-server credential siblings using the existing merge path. Verify the write by reading back the item's bearer identity. If the item already equals the current bearer, do nothing. A missing or empty item is installed rather than assuming the file will remain authoritative forever; the daemon then owns keeping that installed item current.
 
-Start and swap paths use the same reconciliation function. A refresh-less start must not silently `Skip` over an old non-empty Keychain item. A rolling swap must not report a healthy session solely because the credential-file symlink moved; completion includes the Keychain result or an explicit degraded verdict. Token rotation and swap may occur at any point while a Claude turn is running, so a brief server-side invalidation window cannot be eliminated entirely; the next request must see a current credential or a clear recovery instruction.
+Start and swap paths use the same reconciliation function. A refresh-less start must not silently `Skip` over an old non-empty Keychain item. A rolling swap must not report a healthy session solely because the credential-file symlink moved; completion includes the Keychain result or an explicit degraded verdict. The clauth-owned per-session lock serializes clauth's own writes; the managed child has no `/login` or `/logout` command with which to race an account change. Claude Code may still write credential metadata, so a read-back check and periodic reconciliation remain required. Token rotation and swap may occur at any point while a Claude turn is running, so a brief server-side invalidation window cannot be eliminated entirely; the next request must see a current credential or a clear recovery instruction.
 
 ## Failure behavior and visibility
 
@@ -47,6 +47,7 @@ If the Keychain is locked, times out, rejects the write, or read-back disagrees,
 Deterministic tests use a throwaway home and Keychain service, fake OAuth token endpoint, and mocked Claude child. Cover:
 
 - start with rolling sidecar plus a matching, proven old bearer: reconcile before Claude launches;
+- a managed Claude child has both `DISABLE_LOGIN_COMMAND=1` and `DISABLE_LOGOUT_COMMAND=1`, while bare Claude and unrelated shells do not;
 - start with an unknown non-empty item or a pre-patch runtime lacking provenance: refuse to overwrite and provide the controlled-resume path;
 - two live sessions on one member, T1 to T2 refresh: both items move to T2, neither contains a refresh token, profile chain advances once;
 - swap A to B racing with B's refresh: the session ends on B's latest bearer, never A or an older B bearer;
@@ -61,4 +62,4 @@ Run formatting, lint, Rust tests, and the macOS integration suite. A release can
 
 Acceptance requires an active rolling session to survive a T1→T2 rotation and subsequent request without `/login`, including two concurrent sessions and a child agent. No test may assert success solely from `clauth status --json`; it must inspect the credential Claude actually sends or the resulting authenticated request. In a forced Keychain failure, the session must surface a degraded state rather than silently claim health.
 
-This does not promise uninterrupted inference during network outages, complete account exhaustion, host restart, or a Keychain failure that prevents access. It does not solve automatic, exactly-once replay of in-flight tool calls.
+This does not promise uninterrupted inference during network outages, complete account exhaustion, host restart, or a Keychain failure that prevents access. It does not solve automatic, exactly-once replay of in-flight tool calls. It does not claim a universal atomic Keychain compare-and-swap: a throwaway Keychain probe showed that `SecItemUpdate` with an old `kSecValueData` in the query still updated an item whose data had already changed.
